@@ -64,12 +64,15 @@ BART_TEXTS = [
 FLORENCE_PROMPTS = ["<CAPTION>", "<OD>", "<REFERRING_EXPRESSION_SEGMENTATION>the car"]
 
 
-def _status(a, b):
+def _check_tokens(a, b, dtype):
     if a == b:
         return "OK"
     n = min(len(a), len(b))
     first = next((i for i in range(n) if a[i] != b[i]), n)
-    return f"MISMATCH (len {len(a)} vs {len(b)}, first diff at {first})"
+    message = f"len {len(a)} vs {len(b)}, first diff at {first}"
+    assert len(a) == len(b), message
+    assert dtype != torch.float32, message
+    return f"BF16 token differences ({message})"
 
 
 def bart(dtype, beams, max_tokens, device="cpu"):
@@ -116,8 +119,9 @@ def bart(dtype, beams, max_tokens, device="cpu"):
             no_repeat_ngram_size=3,
         )
     ref = [row.tolist()[1:] for row in ref]  # drop decoder-start
+    assert len(ours) == len(ref), (len(ours), len(ref))
     for i, (a, b) in enumerate(zip(ours, ref)):
-        print(f"[{_status(a, b)}] bart beams={beams} seq={i}")
+        print(f"[{_check_tokens(a, b, dtype)}] bart beams={beams} seq={i}")
 
 
 def florence(dtype, beams, max_tokens, device="cpu"):
@@ -181,8 +185,9 @@ def florence(dtype, beams, max_tokens, device="cpu"):
         while toks and toks[-1] == pad:
             toks.pop()
         ref.append(toks)
+    assert len(ours) == len(ref), (len(ours), len(ref))
     for i, (a, b) in enumerate(zip(ours, ref)):
-        print(f"[{_status(a, b)}] florence beams={beams} seq={i}")
+        print(f"[{_check_tokens(a, b, dtype)}] florence beams={beams} seq={i}")
 
 
 def main():

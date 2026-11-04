@@ -77,14 +77,18 @@ placeholders; the decoder is unchanged.
   silently keeps producing numbers.
 - HF models are cached locally (`facebook/bart-large-cnn`,
   `hf-internal-testing/tiny-random-BartForConditionalGeneration`,
-  `florence-community/Florence-2-base`, `hf-internal-testing/tiny-random-Florence2ForConditionalGeneration`).
+  `florence-community/Florence-2-base`, `hf-tiny-v2/tiny-random-Florence2ForConditionalGeneration`).
 - Run from the repo root with `PYTHONPATH=.`, or install it: `uv sync --extra
   cpu` (the project `.venv`, torch from the PyTorch CPU index) or `--extra
-  cu130` for CUDA.  **`uv lock` currently fails**: cpu-attention's own
-  `pyproject.toml` pins `torch` to the PyTorch CPU index in `[tool.uv.sources]`,
-  and uv applies a git dependency's sources, which collides with the `cu130`
-  extra's index.  Removing that table in cpu-attention makes this project
-  lock; until then `uv.lock` is the pre-switch one.
+  cu130` for CUDA. `cpu-attention` is a git source pinned to a commit by `uv.lock`.
+  Its own `[tool.uv.sources]` pins torch to the CPU index, which conflicts with
+  the CUDA extra, so `[[tool.uv.dependency-metadata]]` in `pyproject.toml`
+  overrides that metadata (keep its version in step with upstream).
+  `uv.lock` includes both kernel dependencies;
+  `uv lock --check --offline` and locked resolution of either extra work. A fresh
+  CPU sync also builds and installs the kernel successfully. After upstream
+  changes, refresh its lock entry with `uv lock --upgrade-package cpu-attention
+  --refresh-package cpu-attention`.
 
 ## 3. Layout
 
@@ -133,6 +137,9 @@ tests/test_attn_backend.py
 tests/test_florence2.py
 tests/test_beam.py
 tests/test_gpu_flash.py
+tests/test_engine.py
+tests/test_benchmarks.py
+tests/test_logits_processor.py
 ```
 
 ## 4. How a step works
@@ -167,7 +174,8 @@ what keeps decode from being launch/sync-bound (see the L4 beam rows).
 `decoder_self_attention` (paged growing cache) and `decoder_cross_attention`
 (fixed per-request encoder K/V).  Each op reads `utils/context.py` and picks its
 own kernel; the runner and the model never name a backend
-(`attention.set_backend` only overrides the choice for tests).  For the
+(`attention.set_backend` only overrides standalone ops for tests; each runner
+scopes its own preference during initialization and forwards). For the
 cpu-attention path the runner stages each layer's dense encoder K/V into a paged cache
 before the forward (`attention.stage_cross` -> `Context.cross_staged`); the
 opaque cross-attention op reads that per-step state at call time, so it stays
@@ -275,6 +283,10 @@ PYTHONPATH=. $P tests/test_florence2.py
 # CUDA flash backend parity (skips without a GPU + the flash-attn2 kernel)
 PYTHONPATH=. $P tests/test_gpu_flash.py
 
+# Engine lifetime/cache budgets, validation, loading, and benchmark regressions
+PYTHONPATH=. $P tests/test_engine.py
+PYTHONPATH=. $P tests/test_benchmarks.py
+
 # example
 PYTHONPATH=. $P examples/summarize.py
 PYTHONPATH=. $P examples/florence2.py
@@ -321,7 +333,7 @@ PYTHONPATH=. $P benchmarks/throughput.py --requests 64 --enc-len 512 --max-token
 # attention implementation: cpu-attention vs SDPA vs eager
 PYTHONPATH=. $P benchmarks/attn_backend.py                    # kernel + end-to-end
 PYTHONPATH=. $P benchmarks/attn_backend.py --mode kernel      # ops only, no weights
-PYTHONPATH=. $P benchmarks/attn_backend.py --mode e2e --device cuda
+PYTHONPATH=. $P benchmarks/attn_backend.py --mode e2e --device cpu
 
 # bf16 GEMM throughput at the engine's BART-large shapes (decode is GEMM-bound)
 PYTHONPATH=. $P benchmarks/gemm.py --threads 4,8
@@ -341,29 +353,22 @@ hand-edit or guess.**
 
 | config | ours ms | ours tok/s | hf ms | hf tok/s | speedup |
 |---|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3527 | 72.6 | 5870 | 43.6 | 1.66x |
-| batch=8, beams=1, bf16 | 4942 | 414.4 | 8981 | 228.0 | 1.82x |
-| batch=8, beams=4, bf16 | 7681 | 266.6 | 31660 | 64.7 | 4.12x |
-| batch=8, beams=1, fp32 | — | — | — | — | — |
+| batch=1, beams=1, bf16 | 3462 | 74.0 | 5630 | 45.5 | 1.63x |
+| batch=8, beams=1, bf16 | 4956 | 413.2 | 9087 | 225.4 | 1.83x |
+| batch=8, beams=4, bf16 | 7664 | 267.2 | 31808 | 64.4 | 4.15x |
+| batch=8, beams=1, fp32 | 8551 | 239.5 | 24730 | 82.8 | 2.89x |
 
-The fp32 row was not re-recorded with cpu-attention: the laptop had ~6 GB free
-and the fp32 phase (~7.5 GB RSS) was OOM-killed under a 6 GB cap in both runs.
-Run it when the box has the memory (the previous recording, vendored kernel,
-read 8942 / 24943 ms, 2.79x).
+Recorded on 2026-11-05 after the audit fixes, with cpu-attention active,
+torch 2.14.0+cpu, transformers 5.17.0, 8 inference threads, warmup 1 + repeat 1.
+`TORCHINDUCTOR_COMPILE_THREADS=1` limited compile memory; existing Inductor
+caches were kept. Raw results: `/tmp/fastencdec/baseline-final-{bf16,fp32}.json`.
+The fp32 row ran in its own process: in the same process it was OOM-killed at
+7.4 GB RSS with ~7 GB available. All four rows decoded the same token totals
+as HF. The CPU
+graphs use the default frozen, dynamic decoder + lm-head and encoder paths.
+The final fp32 parity run also passed all 12 real-checkpoint cases (BART beams
+1/4 and Florence-2 beams 1/3, three requests per configuration).
 
-Mean of two runs with a cold Inductor cache (`/tmp/torchinductor_*` and
-`~/.cache/torch_extensions` removed first).  This recording is the frozen
-`torch.compile` default: one dynamic decode graph
-(decoder + lm head), one dynamic encoder graph and, for Florence-2, a static
-vision-tower graph, with Inductor freezing packing every GEMM; the old manual
-`pack_weights` prepack is gone (see the CPU GEMM packing gotcha).  The fp32 row
-compiles too and verifies token-exact vs HF
-(`verify_parity.py --dtype float32`).  Absolute times shift between recordings
-(~5% with this laptop's clock, worst in the latency-bound `batch=1` row — the
-two runs read 3691/3765 ms there), so only the within-run speedup is meaningful;
-the `beams=4` win over HF (4x) is the stable feature of the table.
-
-Recorded with the vendored vLLM kernel, before the switch to `cpu-attention`.
 If `cpu-attention` is not installed `auto` falls back to SDPA and the compiled gate turns off with it, so
 every row reads like the old unpacked-eager numbers (0.75-1.38x), which is why
 `cpu_attn.module()` is worth checking before trusting any CPU number.  This
@@ -685,7 +690,7 @@ on this box with the same kind of workload.
   matters because GPU decode here is launch-bound. The BART encoder
   self-attention uses `flash_attn_func`. There is no per-backend flag: the ops
   in `layers/attention.py` choose the kernel from the tensor device/dtype/shape,
-  and `attention.set_backend` only overrides that for tests.  Dao-AILab's
+  and `attention.set_backend` only overrides standalone ops for tests. Dao-AILab's
   `flash-attn` package was tried as a replacement and measured identical on the
   L4 (0.97-1.02x on every `benchmark.py` row, same box, interleaved runs) — the
   hub kernel is a build of the same code — but 2.8.3 has no wheel past torch
@@ -754,6 +759,8 @@ on this box with the same kind of workload.
   capacity just rewrites the cross rows in place, so the capture survives across
   `generate()` calls.  (Rebuilding the buffers for every new request set
   re-captured all buckets on every call: ~100 ms of the L4's 176-641 ms rows.)
+  When new requests arrive, the active cross-cache rows are compacted before
+  sizing the buffer, so completed requests do not leave permanent holes.
 - **`torch.compile` does not pay off for BART on CUDA.** How nano-vllm uses it:
   not a whole-model compile, but `@torch.compile` on four tensor-only functions —
   `RMSNorm.rms_forward` / `add_rms_forward`, `SiluAndMul.forward`,
@@ -882,6 +889,7 @@ on this box with the same kind of workload.
 - After changes: run `python -m compileall fastencdec`,
   `tests/test_parity.py`, `tests/test_attn_backend.py`,
   `tests/test_florence2.py`, `tests/test_beam.py`,
+  `tests/test_engine.py`, `tests/test_benchmarks.py`, `tests/test_logits_processor.py`,
   `uvx ruff check` / `uvx ruff format --check`, and
   `benchmarks/benchmark.py --scenarios '256->256'`.
 - Every commit must update the "Benchmark baseline" table above with the real

@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+
 import torch
 import torch.nn.functional as F
 
@@ -11,11 +13,21 @@ _DERIVED: tuple = (None, None, None)
 
 
 def set_backend(name: str) -> None:
-    """Override the attention backend ('auto', 'cpu', 'flash', or 'sdpa')."""
+    """Override standalone attention calls; engines keep their own preference."""
     if name not in _BACKENDS:
         raise ValueError(f"attn_backend must be one of {_BACKENDS}, got {name!r}")
     global _PREFER
     _PREFER = name
+
+
+@contextmanager
+def use_backend(name: str):
+    previous = _PREFER
+    set_backend(name)
+    try:
+        yield
+    finally:
+        set_backend(previous)
 
 
 def _paged_backend(device, dtype, head_dim, block_size) -> str:

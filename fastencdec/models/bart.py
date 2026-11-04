@@ -2,16 +2,14 @@ import math
 from typing import ClassVar
 
 import torch
-import torch.nn.functional as F
 from torch import nn
+from transformers.activations import ACT2FN
 
 from ..layers.attention import (
     decoder_cross_attention,
     decoder_self_attention,
     encoder_self_attention,
 )
-
-ACT2FN = {"gelu": F.gelu}
 
 
 class BartLearnedPositionalEmbedding(nn.Embedding):
@@ -165,7 +163,7 @@ class BartEncoderLayer(nn.Module):
             layer_idx,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.activation_fn = ACT2FN.get(config.activation_function, F.gelu)
+        self.activation_fn = ACT2FN[config.activation_function]
         self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
         self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
@@ -189,7 +187,7 @@ class BartDecoderLayer(nn.Module):
             layer_idx,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.activation_fn = ACT2FN.get(config.activation_function, F.gelu)
+        self.activation_fn = ACT2FN[config.activation_function]
         self.encoder_attn = BartDecoderCrossAttention(
             self.embed_dim,
             config.decoder_attention_heads,

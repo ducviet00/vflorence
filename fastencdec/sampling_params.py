@@ -1,9 +1,11 @@
 from dataclasses import dataclass
+from math import isfinite
+from numbers import Real
 
 
 @dataclass(slots=True)
 class SamplingParams:
-    """Decoding parameters; temperature <= 0 uses greedy, num_beams > 1 uses beam search."""
+    """Decoding parameters; temperature 0 uses greedy, num_beams > 1 uses beam search."""
 
     max_tokens: int = 64
     num_beams: int = 1
@@ -16,9 +18,58 @@ class SamplingParams:
     no_repeat_ngram_size: int = 0
     min_length: int = 0
     forced_bos_token_id: int | None = None
-    forced_eos_token_id: int | None = None
+    forced_eos_token_id: int | list[int] | None = None
     suppress_tokens: list[int] | None = None
     begin_suppress_tokens: list[int] | None = None
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        for name in (
+            "max_tokens",
+            "num_beams",
+            "top_k",
+            "no_repeat_ngram_size",
+            "min_length",
+        ):
+            value = getattr(self, name)
+            minimum = 1 if name in ("max_tokens", "num_beams") else 0
+            if type(value) is not int or value < minimum:
+                raise ValueError(f"{name} must be an integer >= {minimum}")
+        for name in ("temperature", "top_p", "repetition_penalty", "length_penalty"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not isfinite(value)
+            ):
+                raise ValueError(f"{name} must be a finite number")
+        if self.temperature < 0:
+            raise ValueError("temperature must be >= 0")
+        if not 0 < self.top_p <= 1:
+            raise ValueError("top_p must be in (0, 1]")
+        if self.repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be positive")
+        for name in (
+            "eos_token_id",
+            "forced_bos_token_id",
+            "forced_eos_token_id",
+            "suppress_tokens",
+            "begin_suppress_tokens",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if name in ("suppress_tokens", "begin_suppress_tokens") and not isinstance(
+                value, list
+            ):
+                raise ValueError(f"{name} must be a list of token IDs")
+            ids = value if isinstance(value, list) else [value]
+            if any(type(token) is not int or token < 0 for token in ids):
+                raise ValueError(f"{name} must contain non-negative integer token IDs")
+            if name == "forced_bos_token_id" and isinstance(value, list):
+                raise ValueError(f"{name} must be a single token ID")
 
     def eos_ids(self) -> set[int]:
         """Return EOS token IDs normalized as a set."""
@@ -51,8 +102,9 @@ class SamplingParams:
             max_tokens=max_tokens,
             num_beams=val(config.num_beams, 1),
             temperature=temperature,
-            top_p=val(config.top_p, 1.0),
-            top_k=val(config.top_k, 0),
+            # HF ignores the sampling warpers when do_sample is off.
+            top_p=val(config.top_p, 1.0) if config.do_sample else 1.0,
+            top_k=val(config.top_k, 0) if config.do_sample else 0,
             repetition_penalty=val(config.repetition_penalty, 1.0),
             length_penalty=val(config.length_penalty, 1.0),
             no_repeat_ngram_size=val(config.no_repeat_ngram_size, 0),

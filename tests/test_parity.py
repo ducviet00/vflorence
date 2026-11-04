@@ -28,7 +28,7 @@ def main():
 
     for beams in (1, 2, 4):
         params = SamplingParams(max_tokens=12, num_beams=beams, temperature=0.0)
-        ours = llm.generate(TEXT, sampling_params=params)[0].outputs[0].text
+        ours = llm.generate(TEXT, sampling_params=params)[0].outputs[0].token_ids
         with torch.no_grad():
             ref = hf.generate(
                 **inputs,
@@ -38,9 +38,9 @@ def main():
                 forced_bos_token_id=None,
                 forced_eos_token_id=None,
             )
-        ref_text = tokenizer.decode(ref[0], skip_special_tokens=True)
-        status = "OK" if ours == ref_text else "MISMATCH"
-        print(f"[{status}] beams={beams}: {ours!r}")
+        ref_tokens = ref[0].tolist()[1:]
+        assert ours == ref_tokens, (beams, ours, ref_tokens)
+        print(f"[OK] beams={beams}: {ours!r}")
 
     # A batch must give the same tokens as running each prompt on its own
     # (exercises the batched encoder + cross-attn cache, and for beams > 1 the
@@ -58,8 +58,8 @@ def main():
             for text in BATCH
         ]
         for i, (b, s) in enumerate(zip(batched, single)):
-            status = "OK" if b == s else "MISMATCH"
-            print(f"[{status}] batch-vs-single beams={beams} seq={i}: {b!r}")
+            assert b == s, (beams, i, b, s)
+            print(f"[OK] batch-vs-single beams={beams} seq={i}: {b!r}")
 
 
 if __name__ == "__main__":
