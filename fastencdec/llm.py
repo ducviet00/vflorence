@@ -117,6 +117,10 @@ class LLM:
             decoder_ids = [self.decoder_start_token_id]
 
             if self.multimodal:
+                if encoder_ids is not None:
+                    raise ValueError(
+                        "Florence-2 requires a text prompt, not prompt_token_ids"
+                    )
                 if image is None:
                     raise ValueError(
                         "Florence-2 needs an image, e.g. "

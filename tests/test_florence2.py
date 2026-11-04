@@ -52,6 +52,7 @@ def main():
         ours, Config(num_blocks=64, block_size=16, max_num_seqs=8, compile=False)
     ).runner
     tower_eager = eager_runner.mm_step is None and eager_runner.decode_step is None
+    assert tower_eager, "compile=False compiled the vision tower or decoder"
     print(
         f"[{'OK' if tower_eager else 'MISMATCH'}] compile=False keeps the tower eager"
     )
@@ -76,6 +77,8 @@ def main():
     feat_diff = (feat_ref - feat_our).abs().max().item()
     hidden_diff = (hidden_ref - hidden_our).abs().max().item()
     tol = 1e-5
+    assert feat_diff <= tol, feat_diff
+    assert hidden_diff <= tol, hidden_diff
     print(
         f"[{'OK' if feat_diff <= tol else 'MISMATCH'}] image features: maxdiff={feat_diff}"
     )
@@ -112,8 +115,8 @@ def main():
                 forced_eos_token_id=None,
             )
         ref_tokens = ref[0].tolist()
-        status = "OK" if our_tokens[: len(ref_tokens)] == ref_tokens else "MISMATCH"
-        print(f"[{status}] beams={beams}: {our_tokens}")
+        assert our_tokens == ref_tokens, (beams, our_tokens, ref_tokens)
+        print(f"[OK] beams={beams}: {our_tokens}")
 
     # Different images/lengths must batch to the same tokens as single runs.
     batch = [(torch.randn(3, 32, 32), None), (torch.randn(3, 40, 40), None)]
@@ -144,8 +147,8 @@ def main():
     requests = engine.generate(engine_requests, params)
     for i, request in enumerate(requests):
         batched = [config.text_config.decoder_start_token_id] + engine.results[request]
-        status = "OK" if batched == singles[i] else "MISMATCH"
-        print(f"[{status}] batch-vs-single {i}: {batched}")
+        assert batched == singles[i], (i, batched, singles[i])
+        print(f"[OK] batch-vs-single {i}: {batched}")
 
 
 if __name__ == "__main__":

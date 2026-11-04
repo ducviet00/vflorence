@@ -50,14 +50,14 @@ class ModelRunner:
         self.dtype = dtype
         self.decoder_layers = list(model.decoder_layers)
 
-        attention.set_backend(attn_backend)
-
+        self.backend_preference = attn_backend
         self.cache_layers = [layer.self_attn for layer in self.decoder_layers]
         self.num_heads = self.cache_layers[0].num_heads
         self.head_dim = self.cache_layers[0].head_dim
-        self.attn_backend = attention.backend(
-            self.device, dtype, self.head_dim, self.block_size
-        )
+        with attention.use_backend(attn_backend):
+            self.attn_backend = attention.backend(
+                self.device, dtype, self.head_dim, self.block_size
+            )
         self.decoder = model.decoder
         self._setup_compile(compile, compile_mm_encoder)
         self.use_cudagraph = use_cudagraph and (
@@ -65,9 +65,10 @@ class ModelRunner:
         )
         # One extra cache row serves as scratch for padded CUDA-graph rows.
         rows = block_manager.num_blocks + int(self.use_cudagraph)
-        shape = attention.self_cache_shape(
-            rows, self.block_size, self.num_heads, self.head_dim, self.device, dtype
-        )
+        with attention.use_backend(attn_backend):
+            shape = attention.self_cache_shape(
+                rows, self.block_size, self.num_heads, self.head_dim, self.device, dtype
+            )
         for layer in self.cache_layers:
             layer.k_cache = torch.zeros(shape, dtype=dtype, device=self.device)
             layer.v_cache = torch.zeros(shape, dtype=dtype, device=self.device)
@@ -195,10 +196,9 @@ class ModelRunner:
         bs = self.block_size
         # Check the token count and block budget upfront so a full cache or a
         # malformed sequence raises before any state is mutated.
-        required = sum(
-            self.block_manager.required_new_blocks(seq, self._num_new_tokens(seq))
-            for seq in seqs
-        )
+        for seq in seqs:
+            self._num_new_tokens(seq)
+        required = self.block_manager.required_new_blocks(seqs)
         if required > self.block_manager.num_free_blocks:
             raise RuntimeError("KV cache is full; increase num_blocks")
 
@@ -234,46 +234,31 @@ class ModelRunner:
     @torch.no_grad()
     def run(self, seqs):
         """Encode any fresh sequences, run one decoder step, and return next-token logits."""
-        fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
-        if fresh:
-            self._encode(fresh)
+        with attention.use_backend(self.backend_preference):
+            fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
+            if fresh:
+                self._encode(fresh)
 
-        input_ids, positions, fields = self._prepare(seqs)
+            input_ids, positions, fields = self._prepare(seqs)
 
-        if self.graph is not None:
-            self.graph.stage(seqs)
-            if len(seqs) <= self.graph.max_bs and self.graph.ready():
-                self.graph.capture()
-                hidden = self.graph.replay(len(seqs), input_ids, positions, fields)
-                return self.model.compute_logits(hidden)
+            if self.graph is not None:
+                self.graph.stage(seqs)
+                if len(seqs) <= self.graph.max_bs and self.graph.ready():
+                    self.graph.capture()
+                    hidden = self.graph.replay(len(seqs), input_ids, positions, fields)
+                    return self.model.compute_logits(hidden)
 
-        # The ops resolve their backend from the global preference, which a
-        # benchmark can change after this runner was built.  Ask the attention
-        # layer what the ops will do *now*, so the staging and the eager
-        # fallback below agree with them.
-        backend = attention.backend(
-            self.device, self.dtype, self.head_dim, self.block_size
-        )
-        if backend == "cpu":
-            # Stage the paged encoder K/V outside the compiled graph; the opaque
-            # cross-attention op reads it from the Context at call time.
-            fields["cross_staged"] = attention.stage_cross(
-                self.decoder_layers, fields["request_ids"]
-            )
-        set_context(**fields)
-        # The compiled graph holds the cpu-attention ops, so it is only valid
-        # while the ops still resolve to them.  A backend override after this runner compiled
-        # (a benchmark comparing backends, or a second engine setting a new
-        # preference) must run this step eagerly: the SDPA path also reads the
-        # per-step Context, which must stay out of the graph.
-        if self.decode_step is None or backend != "cpu":
-            return self.model(input_ids, positions)
-        # Batch 1 is its own graph (Dynamo's 0/1 specialization), so it can be
-        # compiled without the packed weights the batched graph uses.
-        freeze = len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW
-        with self._inductor_ctx(freeze):
-            # model.forward is decoder + lm head, so freezing packs both.
-            return self.decode_step(input_ids, positions)
+            if self.attn_backend == "cpu":
+                # Per-step caches stay outside the compiled graph.
+                fields["cross_staged"] = attention.stage_cross(
+                    self.decoder_layers, fields["request_ids"]
+                )
+            set_context(**fields)
+            if self.decode_step is None:
+                return self.model(input_ids, positions)
+            freeze = len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW
+            with self._inductor_ctx(freeze):
+                return self.decode_step(input_ids, positions)
 
     def _inductor_ctx(self, freeze=True):
         """Patch Inductor freezing on for compiled calls (packing at compile)."""
