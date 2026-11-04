@@ -1,11 +1,13 @@
 """FlashAttention-2 backend parity on CUDA.
 
-Two checks, both skipped when there is no CUDA GPU or the kernel cannot load:
+Checks are skipped when there is no CUDA GPU or the kernel cannot load:
 
 1. paged self-attention: the flash paged-decode path and a plain SDPA reference,
    given the same page-major cache and metadata, must agree (bf16 tolerance).
 2. a tiny random BART (head dim 32, supported by the kernel) must decode the
    same greedy/beam tokens through the flash and SDPA backends.
+3. graph buckets cover the configured batch limit, and recycling cross-cache
+   pages preserves captured graphs and live-request logits.
 
 Run with:  PYTHONPATH=. python tests/test_gpu_flash.py
 """
@@ -167,6 +169,50 @@ def graph_buckets(device):
     return ok
 
 
+def graph_churn(device):
+    """Repacking cross-cache pages must preserve captured graphs and live outputs."""
+    from fastencdec.engine.sequence import Sequence
+    from fastencdec.sampling_params import SamplingParams
+
+    engines = [
+        LLMEngine(
+            build_model().to(torch.bfloat16).to(device),
+            Config(
+                num_blocks=16,
+                block_size=BLOCK_SIZE,
+                max_num_seqs=2,
+                dtype=torch.bfloat16,
+                attn_backend=backend,
+                device=device,
+            ),
+        )
+        for backend in ("flash", "sdpa")
+    ]
+    params = SamplingParams(max_tokens=8)
+    anchors = [Sequence(0, [1], [3] * 17, params) for _ in engines]
+    previous = [None, None]
+    captures = None
+    for step in range(6):
+        outputs = []
+        for i, (engine, anchor) in enumerate(zip(engines, anchors)):
+            if previous[i] is not None:
+                engine.runner.clear_request(previous[i].request_id)
+                engine.block_manager.deallocate(previous[i])
+            short = Sequence(step + 1, [1], [4 + step] * 31, params)
+            seqs = [short, anchor] if step == 0 else [anchor, short]
+            outputs.append(engine.runner.run(seqs))
+            anchor.append_token(4)
+            previous[i] = short
+        torch.testing.assert_close(outputs[0], outputs[1], atol=0.5, rtol=0.01)
+        graph = engines[0].runner.graph
+        assert graph.cross_capacity == 3
+        if captures is None:
+            captures = dict(graph.graphs)
+        assert all(graph.graphs[bs] is capture for bs, capture in captures.items())
+    print("[OK] cross-cache churn preserves graph captures and logits")
+    return True
+
+
 def main():
     if not torch.cuda.is_available():
         print("SKIP: no CUDA device")
@@ -180,6 +226,7 @@ def main():
     ok = paged_parity(device)
     ok &= model_parity(device)
     ok &= graph_buckets(device)
+    ok &= graph_churn(device)
     if not ok:
         raise SystemExit("flash parity failed")
 

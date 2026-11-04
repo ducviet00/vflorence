@@ -143,7 +143,7 @@ def mixed_batch(model, requests, block_size, dtype):
 
 
 def backend_switch(model, requests, block_size, dtype):
-    """A compiled engine must fall back to eager when the backend is overridden."""
+    """Standalone overrides must not change a compiled engine's backend."""
     config = Config(
         num_blocks=256,
         block_size=block_size,
@@ -157,7 +157,6 @@ def backend_switch(model, requests, block_size, dtype):
         return 0
     params = SamplingParams(max_tokens=6, temperature=0.0)
     first = [engine.results[i] for i in engine.generate(requests, params)]
-    # What benchmarks/attn_backend.py does to compare backends on one engine.
     attention.set_backend("sdpa")
     try:
         with mock.patch.object(
@@ -166,11 +165,9 @@ def backend_switch(model, requests, block_size, dtype):
             got = [engine.results[i] for i in engine.generate(requests, params)]
     finally:
         attention.set_backend("auto")
-    # The SDPA path reads the dense encoder K/V directly, so the runner must
-    # not stage a paged copy of it for a backend that will not read it.
-    ok = first == got and not staged.called
+    ok = first == got and staged.called
     print(
-        f"[{'OK' if ok else 'MISMATCH'}] backend switch after compile: {got} "
+        f"[{'OK' if ok else 'MISMATCH'}] standalone override after compile: {got} "
         f"(staged={staged.call_count})"
     )
     return 0 if ok else 1

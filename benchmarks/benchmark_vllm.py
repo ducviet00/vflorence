@@ -57,54 +57,17 @@ import gc
 import json
 import os
 import re
+import sys
 import time
 from functools import partial
 
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from benchmarks.benchmark import CONFIGS, SCENARIOS, make_prompt
+
 MODEL = "facebook/bart-large-cnn"
-
-SCENARIOS = (
-    ("128->512", 128, 512),
-    ("512->128", 512, 128),
-    ("256->256", 256, 256),
-)
-CONFIGS = (
-    ("batch=1, beams=1, bf16", 1, 1, "bfloat16"),
-    ("batch=8, beams=1, bf16", 8, 1, "bfloat16"),
-    ("batch=8, beams=4, bf16", 8, 4, "bfloat16"),
-    ("batch=8, beams=1, fp32", 8, 1, "float32"),
-)
-
-PARAGRAPHS = [
-    (
-        "The quick brown fox jumps over the lazy dog. It was a sunny afternoon and "
-        "the fox had been running through the meadow for hours, chasing butterflies "
-        "and enjoying the warm weather before returning to its den."
-    ),
-    (
-        "Scientists at the university announced on Monday that they had discovered "
-        "a new species of butterfly in the Amazon rainforest. The insect, which has "
-        "a wingspan of only two centimetres, was found near a river bank and has "
-        "been named after the researcher who first spotted it."
-    ),
-    (
-        "The city council approved the new transit plan after a long debate. The "
-        "plan adds two tram lines, extends the bus network to the outer districts "
-        "and introduces a single ticket for all modes of transport from next year."
-    ),
-]
-
-
-def make_prompt(tokenizer, target_tokens: int) -> str:
-    """A prompt whose encoder length is about ``target_tokens``."""
-    text = " ".join(PARAGRAPHS)
-    while len(tokenizer(text, add_special_tokens=False)["input_ids"]) < target_tokens:
-        text += " " + text
-    ids = tokenizer(
-        text, add_special_tokens=False, truncation=True, max_length=target_tokens
-    )["input_ids"]
-    return tokenizer.decode(ids)
 
 
 def _sync() -> None:

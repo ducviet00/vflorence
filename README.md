@@ -60,6 +60,16 @@ parsed = llm.processor.post_process_generation(
 )
 ```
 
+`SamplingParams` rejects invalid ranges; beam sampling is not supported.
+Missing or unexpected checkpoint weights are errors, not randomly initialized defaults.
+Florence-2 requires a text task prompt and an image, not `prompt_token_ids`.
+Each engine keeps its own attention backend. Calls must not overlap within one
+process because attention still uses a shared per-step context.
+
+The low-level `engine.results` holds only the latest batch; keep the returned
+`RequestOutput` objects if you need earlier outputs. A failed batch is discarded
+before the error is re-raised, so the engine can accept a new batch.
+
 ## How It Works
 
 * **Paged KV cache.** Keys and values live in fixed blocks; beams share blocks and
@@ -366,6 +376,8 @@ python tests/test_parity.py        # vs transformers, tiny random BART
 python tests/test_florence2.py     # vs transformers, tiny random Florence-2
 python tests/test_attn_backend.py  # cpu-attention vs SDPA (compiled path)
 python tests/test_gpu_flash.py     # FlashAttention-2 vs SDPA (CUDA only)
+PYTHONPATH=. python tests/test_engine.py      # lifetime, cache budgets, validation, loading
+PYTHONPATH=. python tests/test_benchmarks.py  # benchmark devices and parity failures
 ```
 
 ## Limitations

@@ -16,6 +16,12 @@ class BlockManager:
         self.blocks = [Block() for _ in range(num_blocks)]
         self.free_block_ids: deque[int] = deque(range(num_blocks))
 
+    def reset(self) -> None:
+        """Release every block after an aborted batch."""
+        for block in self.blocks:
+            block.ref_count = 0
+        self.free_block_ids = deque(range(self.num_blocks))
+
     @property
     def num_free_blocks(self) -> int:
         """Return the number of currently unallocated KV blocks."""
@@ -34,19 +40,23 @@ class BlockManager:
         self.blocks[block_id].ref_count = 0
         self.free_block_ids.append(block_id)
 
-    def required_new_blocks(self, seq, num_new_tokens: int) -> int:
-        """Return an upper bound on fresh blocks needed (growth + copy-on-write)."""
+    def required_new_blocks(self, seqs, num_new_tokens: int = 1) -> int:
+        """Count batch growth and copies, leaving the last writer on its shared page."""
         if num_new_tokens <= 0:
             return 0
         bs = self.block_size
-        start, end = seq.num_cached_tokens, seq.num_cached_tokens + num_new_tokens
-        old = len(seq.block_table)
-        new_blocks = max(0, (end + bs - 1) // bs - old)
-        cow_blocks = sum(
-            i < old and self.blocks[seq.block_table[i]].ref_count > 1
-            for i in range(start // bs, (end - 1) // bs + 1)
-        )
-        return new_blocks + cow_blocks
+        required, remaining = 0, {}
+        for seq in seqs:
+            start, end = seq.num_cached_tokens, seq.num_cached_tokens + num_new_tokens
+            old = len(seq.block_table)
+            required += max(0, (end + bs - 1) // bs - old)
+            for i in range(start // bs, min(old, (end - 1) // bs + 1)):
+                block_id = seq.block_table[i]
+                refs = remaining.get(block_id, self.blocks[block_id].ref_count)
+                if refs > 1:
+                    required += 1
+                    remaining[block_id] = refs - 1
+        return required
 
     def ensure_capacity(self, seq, num_new_tokens: int, copy_block) -> None:
         """Allocate new blocks for seq and copy-on-write any shared blocks to be written."""
@@ -59,7 +69,11 @@ class BlockManager:
             block_id = seq.block_table[i]
             if self.blocks[block_id].ref_count > 1:
                 new_block_id = self._allocate_block()
-                copy_block(block_id, new_block_id)
+                try:
+                    copy_block(block_id, new_block_id)
+                except BaseException:
+                    self._deallocate_block(new_block_id)
+                    raise
                 self.blocks[block_id].ref_count -= 1
                 seq.block_table[i] = new_block_id
 

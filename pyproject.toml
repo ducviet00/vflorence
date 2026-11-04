@@ -48,6 +48,12 @@ torchvision = [
 [tool.uv.extra-build-dependencies]
 cpu-attention = [{ requirement = "torch", match-runtime = true }]
 
+# shortcut: mirrors cpu-attention 0.1.0's runtime metadata; remove when its uv CPU-only source is removed upstream.
+[[tool.uv.dependency-metadata]]
+name = "cpu-attention"
+version = "0.1.0"
+requires-dist = ["torch>=2.0"]
+
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"

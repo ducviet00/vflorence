@@ -20,21 +20,19 @@ def load_hf_weights(model, model_path: str, hf_model_cls=None):
 
         hf_model_cls = AutoModelForSeq2SeqLM
 
-    hf_model = hf_model_cls.from_pretrained(model_path, dtype=torch.float32)
+    # HF fills missing weights before returning; strict state_dict loading alone misses them.
+    hf_model, info = hf_model_cls.from_pretrained(
+        model_path, dtype=torch.float32, output_loading_info=True
+    )
+    errors = {
+        key: info[key]
+        for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
+        if info.get(key)
+    }
+    if errors:
+        raise RuntimeError(f"incompatible checkpoint: {errors}")
     state_dict = hf_model.state_dict()
     fuse_projections(model, state_dict)
 
-    # state_dict() (unlike named_parameters()) keeps tied weight aliases.
-    targets = dict(model.state_dict())
-    unexpected = []
-    for name, tensor in state_dict.items():
-        target = targets.get(name)
-        if target is None:
-            unexpected.append(name)
-        else:
-            target.copy_(tensor)
-    del hf_model
-
-    if unexpected:
-        raise KeyError(f"unexpected checkpoint keys: {unexpected[:5]} ...")
+    model.load_state_dict(state_dict, strict=True)
     return model

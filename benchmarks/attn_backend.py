@@ -19,7 +19,7 @@ The three implementations are:
 
 Run:  PYTHONPATH=. python benchmarks/attn_backend.py                # both
       PYTHONPATH=. python benchmarks/attn_backend.py --mode kernel  # no weights
-      PYTHONPATH=. python benchmarks/attn_backend.py --mode e2e --device cuda
+      PYTHONPATH=. python benchmarks/attn_backend.py --mode e2e --device cpu
 """
 
 import argparse
@@ -52,13 +52,13 @@ def _timed(fn, iters: int, warmup: int = 5) -> float:
 
 def _call(variant, fn):
     """Run ``fn`` under the variant's backend (``eager`` pins SDPA to math)."""
-    attention.set_backend("cpu" if variant == "cpu" else "sdpa")
-    if variant == "eager":
-        from torch.nn.attention import SDPBackend, sdpa_kernel
+    with attention.use_backend("cpu" if variant == "cpu" else "sdpa"):
+        if variant == "eager":
+            from torch.nn.attention import SDPBackend, sdpa_kernel
 
-        with sdpa_kernel([SDPBackend.MATH]):
-            return fn()
-    return fn()
+            with sdpa_kernel([SDPBackend.MATH]):
+                return fn()
+        return fn()
 
 
 # --------------------------------------------------------------- kernel section
@@ -176,7 +176,6 @@ def kernel_section(dtype, block_size, iters):
             + " ".join(f"{times[v]:>9.1f}u" for v in VARIANTS)
             + f" {times['eager'] / times['cpu']:>13.1f}x"
         )
-    attention.set_backend("auto")
 
 
 # ---------------------------------------------------------------- e2e section
@@ -229,38 +228,39 @@ def e2e_section(args, dtype):
     from fastencdec import LLM
 
     tok = AutoTokenizer.from_pretrained(MODEL)
-    llm = LLM(
-        MODEL,
-        num_blocks=args.num_blocks,
-        dtype=dtype,
-        attn_backend="auto",
-        device=args.device,
-        use_cudagraph=args.cudagraph,
-    )
     hf = {
         impl: AutoModelForSeq2SeqLM.from_pretrained(
             MODEL, dtype=dtype, attn_implementation=impl
         ).eval()
         for impl in ("sdpa", "eager")
     }
-    if args.device.startswith("cuda"):
-        for model in hf.values():
-            model.to(args.device)
 
     for enc_len, out in ((args.enc_len, args.max_tokens), (64, 256)):
         prompts = [_prompt(tok, enc_len)] * args.batch
         enc = tok(prompts, return_tensors="pt", padding=True)
-        if args.device.startswith("cuda"):
-            enc = {k: v.to(args.device) for k, v in enc.items()}
         kind = "standard" if enc_len >= 128 else "decode-heavy"
         print(
             f"\n== e2e: batch={args.batch} enc~{enc['input_ids'].shape[1]} out={out} "
             f"({dtype}, {kind}) =="
         )
-        rows = [
-            (f"ours/{v}", _time_ours(llm, prompts, v, out, args.repeats) / 1e3)
-            for v in VARIANTS
-        ]
+        rows = []
+        for variant in VARIANTS:
+            llm = LLM(
+                MODEL,
+                num_blocks=args.num_blocks,
+                block_size=args.block_size or None,
+                dtype=dtype,
+                attn_backend="cpu" if variant == "cpu" else "sdpa",
+                device=args.device,
+            )
+            rows.append(
+                (
+                    f"ours/{variant}",
+                    _time_ours(llm, prompts, variant, out, args.repeats) / 1e3,
+                )
+            )
+            del llm
+            torch._dynamo.reset()
         rows += [
             (f"HF/{impl}", _time_hf(model, enc, out, args.repeats) / 1e3)
             for impl, model in hf.items()
@@ -272,7 +272,6 @@ def e2e_section(args, dtype):
             print(
                 f"{label:<16} {ms:>9.0f} {tokens / ms * 1e3:>9.1f} {ref / ms:>10.2f}x"
             )
-    attention.set_backend("auto")
 
 
 def main():
@@ -293,8 +292,9 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=48)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--iters", type=int, default=20, help="kernel-section iters")
-    ap.add_argument("--cudagraph", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()
+    if torch.device(args.device).type != "cpu":
+        ap.error("this CPU attention comparison requires --device cpu")
 
     if args.threads:
         torch.set_num_threads(args.threads)

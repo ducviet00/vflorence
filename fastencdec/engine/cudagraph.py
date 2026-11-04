@@ -36,8 +36,6 @@ class DecodeGraphRunner:
     def stage(self, seqs) -> None:
         """Stage per-request encoder K/V and block tables into static buffers when active requests change."""
         bs = self.block_size
-        if not self.req_blocks:
-            self.next_block = 0
         attn0 = self.runner.decoder_layers[0].encoder_attn
         added = False
         for seq in seqs:
@@ -45,13 +43,16 @@ class DecodeGraphRunner:
                 continue
             key = attn0.encoder_kv_cache[seq.request_id][0]
             pages = max(1, (key.shape[1] + bs - 1) // bs)
-            self.req_blocks[seq.request_id] = (self.next_block, pages, key.shape[1])
-            self.next_block += pages
-            added = True
-        if self.next_block + 1 > self.cross_capacity:
-            self._alloc_cross(max(2 * self.cross_capacity, self.next_block + 1))
+            self.req_blocks[seq.request_id] = (0, pages, key.shape[1])
             added = True
         if added:
+            # Repack active requests so completed requests leave no permanent holes.
+            self.next_block = 0
+            for request_id, (_, pages, length) in self.req_blocks.items():
+                self.req_blocks[request_id] = (self.next_block, pages, length)
+                self.next_block += pages
+            if self.next_block + 1 > self.cross_capacity:
+                self._alloc_cross(max(2 * self.cross_capacity, self.next_block + 1))
             self._write_cross()
             # Only rebuild static buffers/graphs when cross-cache capacity grows.
             if self.bufs is None:
@@ -63,18 +64,26 @@ class DecodeGraphRunner:
 
     def _alloc_cross(self, capacity: int) -> None:
         """Allocate fixed page-major cross-attention KV caches and invalidate captured graphs."""
-        self.cross_capacity = capacity
-        self.cross_scratch = capacity - 1
-        for layer in self.runner.decoder_layers:
-            attn = layer.encoder_attn
-            shape = (capacity, self.block_size, attn.num_heads, attn.head_dim)
-            attn.cross_cache = (
-                torch.zeros(shape, dtype=self.dtype, device=self.device),
-                torch.zeros(shape, dtype=self.dtype, device=self.device),
-            )
         self.bufs = None
         self.graphs.clear()
         self.pool = None
+        try:
+            for layer in self.runner.decoder_layers:
+                attn = layer.encoder_attn
+                shape = (capacity, self.block_size, attn.num_heads, attn.head_dim)
+                attn.cross_cache = (
+                    torch.zeros(shape, dtype=self.dtype, device=self.device),
+                    torch.zeros(shape, dtype=self.dtype, device=self.device),
+                )
+        except BaseException:
+            self.cross_capacity = self.cross_scratch = self.next_block = 0
+            self.req_blocks.clear()
+            self._staged_ids = self.cross_bt = self.cross_lens = None
+            for layer in self.runner.decoder_layers:
+                layer.encoder_attn.cross_cache = None
+            raise
+        self.cross_capacity = capacity
+        self.cross_scratch = capacity - 1
 
     def _write_cross(self) -> None:
         """Scatter each active request's dense encoder K/V into the static paged cross_cache."""
@@ -172,21 +181,26 @@ class DecodeGraphRunner:
             return
         b = self.bufs
         self._fill_sentinels()
-        for bs in reversed(self.graph_bs):
-            self._set_context(bs)
-            b["outputs"][:bs] = self.runner.decoder(
-                b["input_ids"][:bs], b["positions"][:bs]
-            )
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, self.pool):
+        try:
+            for bs in reversed(self.graph_bs):
+                self._set_context(bs)
                 b["outputs"][:bs] = self.runner.decoder(
                     b["input_ids"][:bs], b["positions"][:bs]
                 )
-            if self.pool is None:
-                self.pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-        self._fill_sentinels()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, self.pool):
+                    b["outputs"][:bs] = self.runner.decoder(
+                        b["input_ids"][:bs], b["positions"][:bs]
+                    )
+                if self.pool is None:
+                    self.pool = graph.pool()
+                self.graphs[bs] = graph
+                torch.cuda.synchronize()
+            self._fill_sentinels()
+        except BaseException:
+            self.graphs.clear()
+            self.pool = None
+            raise
 
     def replay(self, bs: int, input_ids, positions, fields):
         """Copy step inputs into the static buffers, replay the bucket graph, and return hidden states."""

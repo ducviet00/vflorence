@@ -6,6 +6,7 @@ import torch
 from ..config import Config
 from ..layers.logits_processor import LogitsProcessor
 from ..layers.sampler import Sampler
+from ..utils.context import set_context
 from .block_manager import BlockManager
 from .model_runner import ModelRunner
 from .scheduler import Scheduler
@@ -53,7 +54,18 @@ class LLMEngine:
 
     def generate(self, requests, params) -> list[int]:
         """Enqueue a batch of requests, run until all complete, and return their request IDs."""
+        if not self.is_finished():
+            raise RuntimeError("finish pending requests before calling generate")
+        params.validate()
+        if params.num_beams > 1 and params.temperature > 0:
+            raise ValueError(
+                "beam sampling is not supported; pass explicit SamplingParams "
+                "with temperature=0 or num_beams=1"
+            )
+        if params.num_beams > self.scheduler.max_num_seqs:
+            raise ValueError("num_beams exceeds max_num_seqs")
         requests = list(requests)
+        self.results.clear()
         if not requests:
             return []
         if params.eos_token_id is None and self.eos_token_id is not None:
@@ -75,21 +87,37 @@ class LLMEngine:
         )
 
         request_ids = []
-        for encoder_token_ids, decoder_token_ids, pixel_values in requests:
-            request_id = self._next_request_id
-            self._next_request_id += 1
-            self.scheduler.add(
-                Sequence(
-                    request_id=request_id,
-                    decoder_prompt_ids=decoder_token_ids,
-                    encoder_token_ids=encoder_token_ids,
-                    sampling=params,
-                    pixel_values=pixel_values,
+        try:
+            for encoder_token_ids, decoder_token_ids, pixel_values in requests:
+                request_id = self._next_request_id
+                self._next_request_id += 1
+                self.scheduler.add(
+                    Sequence(
+                        request_id=request_id,
+                        decoder_prompt_ids=decoder_token_ids,
+                        encoder_token_ids=encoder_token_ids,
+                        sampling=params,
+                        pixel_values=pixel_values,
+                    )
                 )
-            )
-            request_ids.append(request_id)
-        self.run()
+                request_ids.append(request_id)
+            self.run()
+        except BaseException:
+            self._abort(request_ids)
+            raise
         return request_ids
+
+    def _abort(self, request_ids) -> None:
+        """Discard a failed batch, including partially written decoder state."""
+        for request_id in request_ids:
+            self.runner.clear_request(request_id)
+        self.scheduler.waiting.clear()
+        self.scheduler.running.clear()
+        self._finished_beams.clear()
+        self.block_manager.reset()
+        self.results.clear()
+        self._logits_processor = None
+        set_context()
 
     def is_finished(self) -> bool:
         """Return True when all scheduled requests have completed."""

@@ -31,9 +31,6 @@ from functools import partial
 
 import torch
 
-from fastencdec import LLM, SamplingParams
-from fastencdec.config import default_block_size
-
 MODEL = "facebook/bart-large-cnn"
 DECODE = {"length_penalty": 2.0, "no_repeat_ngram_size": 3}
 
@@ -100,13 +97,15 @@ def timed(fn, warmup: int, repeats: int):
     return best, results
 
 
-def params_for(max_tokens: int, beams: int) -> SamplingParams:
+def params_for(max_tokens: int, beams: int):
     """Fixed-length decoding: ``min_length`` masks EOS for the whole run.
 
     The decoder prompt is one token, so ``max_tokens + 1`` is the length at which
     EOS becomes legal — i.e. it is never emitted.  Mirrors HF's
     ``min_new_tokens=max_tokens`` so both engines decode exactly ``max_tokens``.
     """
+    from fastencdec import SamplingParams
+
     return SamplingParams(
         max_tokens=max_tokens, num_beams=beams, min_length=max_tokens + 1, **DECODE
     )
@@ -168,6 +167,9 @@ def blocks_for(configs, enc_tokens: int, out_tokens: int, block_size: int) -> in
 
 
 def main():
+    from fastencdec import LLM
+    from fastencdec.config import default_block_size
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--device", default="cpu", help="cpu or cuda (cuda:N works)")

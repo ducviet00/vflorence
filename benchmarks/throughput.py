@@ -59,6 +59,7 @@ def main():
     ap.add_argument("--profile", action="store_true", help="torch.profiler breakdown")
     ap.add_argument("--rows", type=int, default=18)
     args = ap.parse_args()
+    on_cuda = torch.device(args.device).type == "cuda"
 
     dtype = getattr(torch, args.dtype)
     from transformers import AutoTokenizer
@@ -96,10 +97,12 @@ def main():
         run()
     best = float("inf")
     for _ in range(args.repeats):
-        torch.cuda.synchronize()
+        if on_cuda:
+            torch.cuda.synchronize(args.device)
         start = time.perf_counter()
         run()
-        torch.cuda.synchronize()
+        if on_cuda:
+            torch.cuda.synchronize(args.device)
         best = min(best, time.perf_counter() - start)
 
     generated = n * args.max_tokens
@@ -117,9 +120,13 @@ def main():
     if args.profile:
         from torch.profiler import ProfilerActivity, profile
 
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        activities = [ProfilerActivity.CPU]
+        if on_cuda:
+            activities.append(ProfilerActivity.CUDA)
+        with profile(activities=activities) as prof:
             run()
-        torch.cuda.synchronize()
+        if on_cuda:
+            torch.cuda.synchronize(args.device)
         events = prof.key_averages()
         counts = {e.key: e.count for e in events}
         print(
