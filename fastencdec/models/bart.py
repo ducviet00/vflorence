@@ -63,7 +63,6 @@ class BartEncoderSelfAttention(_BartAttentionBase):
         self,
         embed_dim: int,
         num_heads: int,
-        layer_idx: int,
         bias: bool = True,
     ):
         super().__init__(embed_dim, num_heads)
@@ -96,7 +95,6 @@ class BartDecoderSelfAttention(_BartAttentionBase):
         self,
         embed_dim: int,
         num_heads: int,
-        layer_idx: int,
         bias: bool = True,
     ):
         super().__init__(embed_dim, num_heads)
@@ -151,13 +149,12 @@ class BartDecoderCrossAttention(_BartAttentionBase):
 
 
 class BartEncoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config):
         super().__init__()
         self.embed_dim = config.d_model
         self.self_attn = BartEncoderSelfAttention(
             self.embed_dim,
             config.encoder_attention_heads,
-            layer_idx,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.activation_fn = ACT2FN[config.activation_function]
@@ -181,7 +178,6 @@ class BartDecoderLayer(nn.Module):
         self.self_attn = BartDecoderSelfAttention(
             self.embed_dim,
             config.decoder_attention_heads,
-            layer_idx,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.activation_fn = ACT2FN[config.activation_function]
@@ -220,10 +216,7 @@ class BartEncoder(nn.Module):
             config.max_position_embeddings, embed_dim
         )
         self.layers = nn.ModuleList(
-            [
-                BartEncoderLayer(config, layer_idx=i)
-                for i in range(config.encoder_layers)
-            ]
+            [BartEncoderLayer(config) for _ in range(config.encoder_layers)]
         )
         self.layernorm_embedding = nn.LayerNorm(embed_dim)
 
@@ -319,18 +312,12 @@ class BartForConditionalGeneration(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Run one decoder step and return logits [B, vocab] (the compiled decode graph)."""
-        return self.compute_logits(self.decoder(input_ids, positions))
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project decoder hidden states to vocabulary logits plus final_logits_bias."""
-        return self.lm_head(hidden_states) + self.final_logits_bias
+        return (
+            self.lm_head(self.model.decoder(input_ids, positions))
+            + self.final_logits_bias
+        )
 
     @property
     def decoder_layers(self):
         """Return the decoder layer list."""
         return self.model.decoder.layers
-
-    @property
-    def decoder(self):
-        """Return the paged decoder module."""
-        return self.model.decoder

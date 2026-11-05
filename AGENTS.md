@@ -99,7 +99,7 @@ ModelRunner.run(seqs)
     _prepare(seqs)                # input_ids/positions/slot_mapping/self_metadata; ensure blocks/CoW
     set_context(...)              # Context: context_lens, block_tables, slot_mapping,
                                   #   query_start_loc, self_metadata, isa, cross_staged
-    decoder forward               # compiled decoder + compute_logits; custom ops call vllm_cpu_attn
+    decoder forward               # compiled decoder + lm_head; custom ops call vllm_cpu_attn
 LLMEngine.step()                  # argmax (greedy) or beam-expand; append; free finished
 ```
 
@@ -130,10 +130,10 @@ compiled graph.
    feeds exactly one token per sequence.**
 2. **Positions** are absolute indices into `token_ids` (0-based).
    `BartLearnedPositionalEmbedding` adds the `+2` BART offset internally.
-3. **Paged KV cache.** Allocated via `vllm_cpu_attn.allocate_kv_cache` with shape
-   determined by the selected ISA (`vec` / `amx` on x86, `neon` on arm64) and
-   `block_size` (32 on x86, 16 on arm64; must be a multiple of 16).
-   `head_dim` must be in `{32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 512}`.
+3. **Paged KV cache.** Shape `[num_blocks, num_heads, block_size, head_dim]`
+   with internal layout determined by the selected ISA (`vec` / `amx` on x86,
+   `neon` on arm64) and `block_size` (32 on x86, 16 on arm64; must be a
+   multiple of 16). `head_dim` must be in `{32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 512}`.
 4. **Cross-attention staging.** Each `BartDecoderCrossAttention` holds
    `encoder_kv_cache: dict[request_id -> (k, v)]`, each
    `[enc_len, num_heads, head_dim]`, filled once in `_encode`, shared by all

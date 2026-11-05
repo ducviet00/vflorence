@@ -160,7 +160,7 @@ class EngineTests(unittest.TestCase):
         params = SamplingParams()
         parent = Sequence(0, [1], [3], params)
         blocks = llm.block_manager
-        blocks.ensure_capacity(parent, 1, llm.runner._copy_block)
+        blocks.ensure_capacity(parent, llm.runner._copy_block)
         parent.num_cached_tokens = 1
         children = [llm._fork(parent, 4, 0), llm._fork(parent, 5, 0)]
         self.assertEqual(blocks.required_new_blocks(children), 2)
@@ -171,13 +171,11 @@ class EngineTests(unittest.TestCase):
         llm = engine(num_blocks=2)
         parent = Sequence(0, [1], [3], SamplingParams())
         blocks = llm.block_manager
-        blocks.ensure_capacity(parent, 1, llm.runner._copy_block)
+        blocks.ensure_capacity(parent, llm.runner._copy_block)
         parent.num_cached_tokens = 1
         child = llm._fork(parent, 4, 0)
         with self.assertRaisesRegex(RuntimeError, "copy failed"):
-            blocks.ensure_capacity(
-                child, 1, Mock(side_effect=RuntimeError("copy failed"))
-            )
+            blocks.ensure_capacity(child, Mock(side_effect=RuntimeError("copy failed")))
         self.assertEqual(blocks.num_free_blocks, 1)
         self.assertEqual(blocks.blocks[parent.block_table[0]].ref_count, 2)
 

@@ -165,7 +165,7 @@ class LLMEngine:
     def _sample(self, seq: Sequence, params, token: int) -> None:
         """Append a sampled token to seq and finalize the request if it hit EOS or max_tokens."""
         seq.append_token(token)
-        if token in params.eos_ids() or seq.num_completion_tokens >= params.max_tokens:
+        if token in params.eos_ids() or seq.num_generated >= params.max_tokens:
             self.scheduler.remove(seq)
             self.block_manager.deallocate(seq)
             self.runner.clear_request(seq.request_id)

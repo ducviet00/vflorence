@@ -40,42 +40,38 @@ class BlockManager:
         self.blocks[block_id].ref_count = 0
         self.free_block_ids.append(block_id)
 
-    def required_new_blocks(self, seqs, num_new_tokens: int = 1) -> int:
-        """Count batch growth and copies, leaving the last writer on its shared page."""
-        if num_new_tokens <= 0:
-            return 0
+    def required_new_blocks(self, seqs) -> int:
+        """Count new blocks and copy-on-write blocks needed to append 1 token per sequence."""
         bs = self.block_size
         required, remaining = 0, {}
         for seq in seqs:
-            start, end = seq.num_cached_tokens, seq.num_cached_tokens + num_new_tokens
-            old = len(seq.block_table)
-            required += max(0, (end + bs - 1) // bs - old)
-            for i in range(start // bs, min(old, (end - 1) // bs + 1)):
-                block_id = seq.block_table[i]
+            idx = seq.num_cached_tokens // bs
+            if idx >= len(seq.block_table):
+                required += 1
+            else:
+                block_id = seq.block_table[idx]
                 refs = remaining.get(block_id, self.blocks[block_id].ref_count)
                 if refs > 1:
                     required += 1
                     remaining[block_id] = refs - 1
         return required
 
-    def ensure_capacity(self, seq, num_new_tokens: int, copy_block) -> None:
-        """Allocate new blocks for seq and copy-on-write any shared blocks to be written."""
-        bs = self.block_size
-        start, end = seq.num_cached_tokens, seq.num_cached_tokens + num_new_tokens
-        needed = (end + bs - 1) // bs
-        while len(seq.block_table) < needed:
+    def ensure_capacity(self, seq, copy_block) -> None:
+        """Allocate a new block or copy-on-write a shared block for seq's next token."""
+        idx = seq.num_cached_tokens // self.block_size
+        if idx >= len(seq.block_table):
             seq.block_table.append(self._allocate_block())
-        for i in range(start // bs, (end - 1) // bs + 1):
-            block_id = seq.block_table[i]
-            if self.blocks[block_id].ref_count > 1:
-                new_block_id = self._allocate_block()
-                try:
-                    copy_block(block_id, new_block_id)
-                except BaseException:
-                    self._deallocate_block(new_block_id)
-                    raise
-                self.blocks[block_id].ref_count -= 1
-                seq.block_table[i] = new_block_id
+            return
+        block_id = seq.block_table[idx]
+        if self.blocks[block_id].ref_count > 1:
+            new_block_id = self._allocate_block()
+            try:
+                copy_block(block_id, new_block_id)
+            except BaseException:
+                self._deallocate_block(new_block_id)
+                raise
+            self.blocks[block_id].ref_count -= 1
+            seq.block_table[idx] = new_block_id
 
     def fork(self, parent, child) -> None:
         """Share parent's block table with child by incrementing block refcounts."""
@@ -88,5 +84,5 @@ class BlockManager:
         for block_id in reversed(seq.block_table):
             self.blocks[block_id].ref_count -= 1
             if self.blocks[block_id].ref_count == 0:
-                self._deallocate_block(block_id)
+                self.free_block_ids.append(block_id)
         seq.block_table.clear()

@@ -35,8 +35,6 @@ class Sequence:
         """Return the number of tokens generated after the decoder prompt."""
         return len(self.token_ids) - len(self.decoder_prompt_ids)
 
-    num_completion_tokens = num_generated
-
     @property
     def completion_token_ids(self) -> list[int]:
         """Return the generated token IDs excluding the decoder prompt."""

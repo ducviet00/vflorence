@@ -41,7 +41,6 @@ class ModelRunner:
                 f"must be one of {sorted(attention.HEAD_DIMS)}"
             )
         self.isa = vllm_cpu_attn.get_isa(dtype, self.block_size, self.head_dim)
-        self.decoder = model.decoder
         self._setup_compile(compile, compile_mm_encoder)
 
         shape = (
@@ -100,10 +99,11 @@ class ModelRunner:
             else:
                 px = torch.stack([s.pixel_values for s in group])
                 with self._inductor_ctx():
-                    if self.mm_step is None:
-                        embeds = self.model.get_image_features(px)
-                    else:
-                        embeds = self.mm_step(px)
+                    embeds = (
+                        self.model.get_image_features(px)
+                        if self.mm_step is None
+                        else self.mm_step(px)
+                    )
                     hidden = encode(ids, image_embeds=embeds)
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
@@ -124,30 +124,25 @@ class ModelRunner:
             attn.cross_staged = None
             attn.cross_staged_key = None
 
-    @staticmethod
-    def _num_new_tokens(seq) -> int:
-        """Return how many tokens this step feeds for seq (always exactly one)."""
-        num_new = len(seq.token_ids) - seq.num_cached_tokens
-        if num_new != 1:
-            raise ValueError(
-                "each step must feed exactly one token per sequence, but "
-                f"request {seq.request_id} feeds {num_new}"
-            )
-        return num_new
-
     def _prepare(self, seqs):
         """Allocate KV blocks and build input_ids, positions, and Context tensors for the step."""
         bs = self.block_size
         for seq in seqs:
-            self._num_new_tokens(seq)
-        required = self.block_manager.required_new_blocks(seqs)
-        if required > self.block_manager.num_free_blocks:
+            num_new = len(seq.token_ids) - seq.num_cached_tokens
+            if num_new != 1:
+                raise ValueError(
+                    f"each step must feed 1 token per sequence, got {num_new}"
+                )
+        if (
+            self.block_manager.required_new_blocks(seqs)
+            > self.block_manager.num_free_blocks
+        ):
             raise RuntimeError("KV cache is full; increase num_blocks")
 
         input_ids, positions, new_slots = [], [], []
         context_lens, seq_block_tables = [], []
         for seq in seqs:
-            self.block_manager.ensure_capacity(seq, 1, self._copy_block)
+            self.block_manager.ensure_capacity(seq, self._copy_block)
             pos = seq.num_cached_tokens
             input_ids.append(seq.token_ids[pos])
             positions.append(pos)
@@ -180,7 +175,7 @@ class ModelRunner:
             "self_metadata": self_metadata,
             "isa": self.isa,
             "cross_staged": attention.stage_cross(
-                self.decoder_layers, [seq.request_id for seq in seqs], bs
+                self.decoder_layers, [seq.request_id for seq in seqs], bs, self.isa
             ),
         }
         return (

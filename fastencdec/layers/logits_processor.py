@@ -65,38 +65,22 @@ class LogitsProcessor:
         if p.no_repeat_ngram_size > 0:
             _no_repeat_ngram(scores, input_ids, p.no_repeat_ngram_size)
         if lengths is None:
-            cur = input_ids.shape[1]
-            if p.min_length > 0 and self.eos_ids and cur < p.min_length:
-                scores.masked_fill_(masks["eos"], _NEG_INF)
-            if p.forced_bos_token_id is not None and cur == 1:
-                scores.copy_(torch.where(masks["bos_only"], 0.0, _NEG_INF))
-            if p.forced_eos_token_id is not None and cur == self.max_length - 1:
-                scores.copy_(torch.where(masks["eos_only"], 0.0, _NEG_INF))
-            if p.suppress_tokens:
-                scores.masked_fill_(masks["suppress"], _NEG_INF)
-            if p.begin_suppress_tokens and cur == self.begin_index:
-                scores.masked_fill_(masks["begin_suppress"], _NEG_INF)
-        else:
-            if p.min_length > 0 and self.eos_ids:
-                sel = lengths < p.min_length
-                if sel.any():
-                    scores.masked_fill_(sel[:, None] & masks["eos"], _NEG_INF)
-            if p.forced_bos_token_id is not None:
-                sel = lengths == 1
-                if sel.any():
-                    fill = torch.where(masks["bos_only"], 0.0, _NEG_INF)
-                    scores = torch.where(sel[:, None], fill, scores)
-            if p.forced_eos_token_id is not None:
-                sel = lengths == self.max_length - 1
-                if sel.any():
-                    fill = torch.where(masks["eos_only"], 0.0, _NEG_INF)
-                    scores = torch.where(sel[:, None], fill, scores)
-            if p.suppress_tokens:
-                scores.masked_fill_(masks["suppress"], _NEG_INF)
-            if p.begin_suppress_tokens:
-                sel = lengths == self.begin_index
-                if sel.any():
-                    scores.masked_fill_(
-                        sel[:, None] & masks["begin_suppress"], _NEG_INF
-                    )
+            lengths = torch.full(
+                (input_ids.shape[0],), input_ids.shape[1], dtype=torch.long
+            )
+        col = lengths[:, None]
+        if p.min_length > 0 and self.eos_ids:
+            scores.masked_fill_((col < p.min_length) & masks["eos"], _NEG_INF)
+        if p.forced_bos_token_id is not None and (lengths == 1).any():
+            fill = torch.where(masks["bos_only"], 0.0, _NEG_INF)
+            scores.copy_(torch.where(col == 1, fill, scores))
+        if p.forced_eos_token_id is not None and (lengths == self.max_length - 1).any():
+            fill = torch.where(masks["eos_only"], 0.0, _NEG_INF)
+            scores.copy_(torch.where(col == self.max_length - 1, fill, scores))
+        if p.suppress_tokens:
+            scores.masked_fill_(masks["suppress"], _NEG_INF)
+        if p.begin_suppress_tokens:
+            scores.masked_fill_(
+                (col == self.begin_index) & masks["begin_suppress"], _NEG_INF
+            )
         return scores
