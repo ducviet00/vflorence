@@ -19,7 +19,7 @@ def _load_generation_config(model_path: str) -> GenerationConfig:
 
 
 class LLM:
-    """Offline inference entrypoint for BART and Florence-2 checkpoints."""
+    """Offline CPU inference entrypoint for BART and Florence-2 checkpoints."""
 
     def __init__(
         self,
@@ -29,12 +29,17 @@ class LLM:
         block_size: int | None = None,
         max_num_seqs: int = 32,
         dtype: torch.dtype = torch.float32,
-        attn_backend: str = "auto",
-        device: str = "cpu",
-        use_cudagraph: bool = True,
         compile: bool = True,
         compile_mm_encoder: bool = True,
     ):
+        config = Config(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            max_num_seqs=max_num_seqs,
+            dtype=dtype,
+            compile=compile,
+            compile_mm_encoder=compile_mm_encoder,
+        )
         hf_config = AutoConfig.from_pretrained(model_path)
         self.multimodal = hf_config.model_type == "florence2"
 
@@ -48,13 +53,13 @@ class LLM:
             self.tokenizer = self.processor.tokenizer
             self.model = Florence2ForConditionalGeneration(hf_config)
             load_hf_weights(self.model, model_path, hf_model_cls=HFFlorence2)
-            self.model.to(dtype).to(device)
+            self.model.to(dtype)
             text_config = hf_config.text_config
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(model_path)
             self.model = BartForConditionalGeneration(hf_config)
             load_hf_weights(self.model, model_path)
-            self.model.to(dtype).to(device)
+            self.model.to(dtype)
             text_config = hf_config
 
         self.decoder_start_token_id = text_config.decoder_start_token_id
@@ -63,17 +68,6 @@ class LLM:
         self.generation_config = _load_generation_config(model_path)
         self.default_sampling_params = SamplingParams.from_generation_config(
             self.generation_config, self.eos_token_id
-        )
-        config = Config(
-            num_blocks=num_blocks,
-            block_size=block_size,
-            max_num_seqs=max_num_seqs,
-            dtype=dtype,
-            attn_backend=attn_backend,
-            device=device,
-            use_cudagraph=use_cudagraph,
-            compile=compile,
-            compile_mm_encoder=compile_mm_encoder,
         )
         self.engine = LLMEngine(self.model, config, eos_token_id=self.eos_token_id)
 
@@ -99,7 +93,6 @@ class LLM:
         prompts,
         sampling_params: SamplingParams | None = None,
         *,
-        use_tqdm: bool = True,
         mm_processor_kwargs: dict | None = None,
     ) -> list[RequestOutput]:
         """Run batched generation on prompts and return one RequestOutput per prompt."""

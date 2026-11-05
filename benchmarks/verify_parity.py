@@ -34,9 +34,8 @@ IMAGE = "/tmp/fastencdec/florence2_bench.jpg"
 IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
 
 
-def block_config(device, tokens):
-    """Scale ``num_blocks`` so the KV token budget is device-independent."""
-    block_size = default_block_size(device)
+def block_config(tokens):
+    block_size = default_block_size()
     return max(1, tokens // block_size), block_size
 
 
@@ -75,26 +74,24 @@ def _check_tokens(a, b, dtype):
     return f"BF16 token differences ({message})"
 
 
-def bart(dtype, beams, max_tokens, device="cpu"):
+def bart(dtype, beams, max_tokens):
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     num_blocks, block_size = block_config(
-        device, 2048 * (16 if dtype is not torch.float32 else 4)
+        2048 * (16 if dtype is not torch.float32 else 4)
     )
     llm = LLM(
         BART,
         num_blocks=num_blocks,
         block_size=block_size,
         dtype=dtype,
-        device=device,
     )
     tokenizer = AutoTokenizer.from_pretrained(BART)
-    hf = AutoModelForSeq2SeqLM.from_pretrained(BART, dtype=dtype).eval().to(device)
+    hf = AutoModelForSeq2SeqLM.from_pretrained(BART, dtype=dtype).eval()
 
     params = SamplingParams(
         max_tokens=max_tokens,
         num_beams=beams,
-        temperature=0.0,
         min_length=max_tokens + 1,  # EOS suppressed: exactly max_tokens
         length_penalty=2.0,
         no_repeat_ngram_size=3,
@@ -104,7 +101,6 @@ def bart(dtype, beams, max_tokens, device="cpu"):
     ]
 
     enc = tokenizer(BART_TEXTS, return_tensors="pt", padding=True)
-    enc = {key: value.to(device) for key, value in enc.items()}
     with torch.no_grad():
         ref = hf.generate(
             **enc,
@@ -124,23 +120,22 @@ def bart(dtype, beams, max_tokens, device="cpu"):
         print(f"[{_check_tokens(a, b, dtype)}] bart beams={beams} seq={i}")
 
 
-def florence(dtype, beams, max_tokens, device="cpu"):
+def florence(dtype, beams, max_tokens):
     from transformers import AutoProcessor
     from transformers import Florence2ForConditionalGeneration as HFFlorence2
 
     image = load_image()
     num_blocks, block_size = block_config(
-        device, 4096 * (16 if dtype is not torch.float32 else 4)
+        4096 * (16 if dtype is not torch.float32 else 4)
     )
     llm = LLM(
         FLORENCE,
         num_blocks=num_blocks,
         block_size=block_size,
         dtype=dtype,
-        device=device,
     )
     processor = AutoProcessor.from_pretrained(FLORENCE)
-    hf = HFFlorence2.from_pretrained(FLORENCE, dtype=dtype).eval().to(device)
+    hf = HFFlorence2.from_pretrained(FLORENCE, dtype=dtype).eval()
 
     prepared = []
     for prompt in FLORENCE_PROMPTS:
@@ -150,7 +145,6 @@ def florence(dtype, beams, max_tokens, device="cpu"):
     params = SamplingParams(
         max_tokens=max_tokens,
         num_beams=beams,
-        temperature=0.0,
         eos_token_id=llm.eos_token_id,
     )
     engine_requests = [
@@ -165,7 +159,6 @@ def florence(dtype, beams, max_tokens, device="cpu"):
         padding=True,
         return_tensors="pt",
     )
-    inputs = {key: value.to(device) for key, value in inputs.items()}
     pad = processor.tokenizer.pad_token_id
     with torch.no_grad():
         out = hf.generate(
@@ -193,7 +186,6 @@ def florence(dtype, beams, max_tokens, device="cpu"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
-    ap.add_argument("--device", default="cpu", help="cpu or cuda (cuda:N works)")
     ap.add_argument("--max-tokens", type=int, default=32)
     ap.add_argument("--kind", default=None, help=argparse.SUPPRESS)  # internal
     ap.add_argument("--beams", type=int, default=0, help=argparse.SUPPRESS)  # internal
@@ -209,7 +201,6 @@ def main():
                 sys.executable,
                 __file__,
                 f"--dtype={args.dtype}",
-                f"--device={args.device}",
                 f"--max-tokens={args.max_tokens}",
                 f"--kind={kind}",
                 f"--beams={beams}",
@@ -221,9 +212,9 @@ def main():
                 raise SystemExit(f"phase {kind} beams={beams} failed")
         return
 
-    print(f"== {args.dtype} on {args.device} ==", flush=True)
+    print(f"== {args.dtype} ==", flush=True)
     phase = bart if args.kind == "bart" else florence
-    phase(dtype, args.beams, args.max_tokens, args.device)
+    phase(dtype, args.beams, args.max_tokens)
 
 
 if __name__ == "__main__":

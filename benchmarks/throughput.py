@@ -5,7 +5,6 @@ suppressed, so the whole run is decode-dominated and tokens/s is comparable
 across engines.
 
     PYTHONPATH=. python benchmarks/throughput.py --requests 64 --enc-len 512 --max-tokens 256
-    PYTHONPATH=. python benchmarks/throughput.py --requests 64 --enc-len 512 --max-tokens 256 --no-cudagraph
 """
 
 import argparse
@@ -44,29 +43,20 @@ def main():
     ap.add_argument("--requests", type=int, default=64)
     ap.add_argument("--enc-len", type=int, default=512)
     ap.add_argument("--max-tokens", type=int, default=256)
-    ap.add_argument("--block-size", type=int, default=0, help="0 = device default")
+    ap.add_argument("--block-size", type=int, default=0, help="0 = default")
     ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument(
-        "--cudagraph",
-        dest="use_cudagraph",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="decode CUDA graph (default on; CUDA + flash only)",
-    )
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--profile", action="store_true", help="torch.profiler breakdown")
     ap.add_argument("--rows", type=int, default=18)
     args = ap.parse_args()
-    on_cuda = torch.device(args.device).type == "cuda"
 
     dtype = getattr(torch, args.dtype)
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    block_size = args.block_size or default_block_size(args.device)
+    block_size = args.block_size or default_block_size()
     n = args.requests
     tokens_per_seq = args.enc_len + args.max_tokens
     num_blocks = n * ((tokens_per_seq + block_size - 1) // block_size) + 64
@@ -76,15 +66,12 @@ def main():
         block_size=block_size,
         max_num_seqs=n,
         dtype=dtype,
-        device=args.device,
-        use_cudagraph=args.use_cudagraph,
     )
     prompt = make_prompt(tokenizer, args.enc_len)
     prompts = [prompt] * n
     params = SamplingParams(
         max_tokens=args.max_tokens,
         num_beams=1,
-        temperature=0.0,
         min_length=args.max_tokens + 1,  # EOS suppressed -> exactly max_tokens
         length_penalty=2.0,
         no_repeat_ngram_size=3,
@@ -97,20 +84,15 @@ def main():
         run()
     best = float("inf")
     for _ in range(args.repeats):
-        if on_cuda:
-            torch.cuda.synchronize(args.device)
         start = time.perf_counter()
         run()
-        if on_cuda:
-            torch.cuda.synchronize(args.device)
         best = min(best, time.perf_counter() - start)
 
     generated = n * args.max_tokens
     print(
-        f"model={args.model} device={args.device} dtype={args.dtype} "
+        f"model={args.model} dtype={args.dtype} "
         f"requests={n} enc_len={args.enc_len} max_tokens={args.max_tokens} "
-        f"block_size={block_size} num_blocks={num_blocks} "
-        f"cudagraph={args.use_cudagraph}"
+        f"block_size={block_size} num_blocks={num_blocks}"
     )
     print(
         f"best {best * 1e3:8.0f} ms   {generated} tokens   "
@@ -120,30 +102,16 @@ def main():
     if args.profile:
         from torch.profiler import ProfilerActivity, profile
 
-        activities = [ProfilerActivity.CPU]
-        if on_cuda:
-            activities.append(ProfilerActivity.CUDA)
-        with profile(activities=activities) as prof:
+        with profile(activities=[ProfilerActivity.CPU]) as prof:
             run()
-        if on_cuda:
-            torch.cuda.synchronize(args.device)
         events = prof.key_averages()
-        counts = {e.key: e.count for e in events}
         print(
-            "totals: self_cpu_ms={:.0f}  syncs={}  launches={}  graph_launches={}".format(
-                sum(e.self_cpu_time_total for e in events) / 1e3,
-                counts.get("cudaStreamSynchronize", 0),
-                counts.get("cudaLaunchKernel", 0) + counts.get("cuLaunchKernel", 0),
-                counts.get("cudaGraphLaunch", 0),
-            )
+            f"totals: self_cpu_ms={sum(e.self_cpu_time_total for e in events) / 1e3:.0f}"
         )
         print(
             prof.key_averages().table(
                 sort_by="self_cpu_time_total", row_limit=args.rows
             )
-        )
-        print(
-            prof.key_averages().table(sort_by="device_time_total", row_limit=args.rows)
         )
 
 

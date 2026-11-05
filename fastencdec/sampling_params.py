@@ -5,13 +5,10 @@ from numbers import Real
 
 @dataclass(slots=True)
 class SamplingParams:
-    """Decoding parameters; temperature 0 uses greedy, num_beams > 1 uses beam search."""
+    """Decoding parameters; num_beams == 1 uses greedy, num_beams > 1 uses beam search."""
 
     max_tokens: int = 64
     num_beams: int = 1
-    temperature: float = 0.0
-    top_p: float = 1.0
-    top_k: int = 0
     repetition_penalty: float = 1.0
     eos_token_id: int | list[int] | None = None
     length_penalty: float = 1.0
@@ -26,18 +23,12 @@ class SamplingParams:
         self.validate()
 
     def validate(self) -> None:
-        for name in (
-            "max_tokens",
-            "num_beams",
-            "top_k",
-            "no_repeat_ngram_size",
-            "min_length",
-        ):
+        for name in ("max_tokens", "num_beams", "no_repeat_ngram_size", "min_length"):
             value = getattr(self, name)
             minimum = 1 if name in ("max_tokens", "num_beams") else 0
             if type(value) is not int or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
-        for name in ("temperature", "top_p", "repetition_penalty", "length_penalty"):
+        for name in ("repetition_penalty", "length_penalty"):
             value = getattr(self, name)
             if (
                 isinstance(value, bool)
@@ -45,10 +36,6 @@ class SamplingParams:
                 or not isfinite(value)
             ):
                 raise ValueError(f"{name} must be a finite number")
-        if self.temperature < 0:
-            raise ValueError("temperature must be >= 0")
-        if not 0 < self.top_p <= 1:
-            raise ValueError("top_p must be in (0, 1]")
         if self.repetition_penalty <= 0:
             raise ValueError("repetition_penalty must be positive")
         for name in (
@@ -90,7 +77,6 @@ class SamplingParams:
     ) -> "SamplingParams":
         """Build SamplingParams from a HuggingFace GenerationConfig."""
         val = lambda x, default: default if x is None else x
-        temperature = 0.0 if not config.do_sample else val(config.temperature, 1.0)
         if config.max_new_tokens is not None:
             max_tokens = config.max_new_tokens
         elif config.max_length is not None:
@@ -101,10 +87,6 @@ class SamplingParams:
         return cls(
             max_tokens=max_tokens,
             num_beams=val(config.num_beams, 1),
-            temperature=temperature,
-            # HF ignores the sampling warpers when do_sample is off.
-            top_p=val(config.top_p, 1.0) if config.do_sample else 1.0,
-            top_k=val(config.top_k, 0) if config.do_sample else 0,
             repetition_penalty=val(config.repetition_penalty, 1.0),
             length_penalty=val(config.length_penalty, 1.0),
             no_repeat_ngram_size=val(config.no_repeat_ngram_size, 0),

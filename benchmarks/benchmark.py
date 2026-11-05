@@ -19,9 +19,8 @@ Both engines run the same dtype, inputs and output length (EOS suppressed), so
 the speedup is engine-vs-engine; the tables report the throughput of each engine
 and the speedup.
 
-  PYTHONPATH=. python benchmarks/benchmark.py                 # cpu
-  PYTHONPATH=. python benchmarks/benchmark.py --device cuda
-  PYTHONPATH=. python benchmarks/benchmark.py --scenarios 256->256
+  PYTHONPATH=. python benchmarks/benchmark.py
+  PYTHONPATH=. python benchmarks/benchmark.py --scenarios '256->256'
 """
 
 import argparse
@@ -77,11 +76,6 @@ def make_prompt(tokenizer, target_tokens: int) -> str:
     return tokenizer.decode(ids)
 
 
-def _sync() -> None:
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
 def timed(fn, warmup: int, repeats: int):
     """Return (best_seconds, every result) so the caller can check consistency."""
     for _ in range(warmup):
@@ -89,10 +83,8 @@ def timed(fn, warmup: int, repeats: int):
     best = float("inf")
     results = []
     for _ in range(repeats):
-        _sync()
         start = time.perf_counter()
         results.append(fn())
-        _sync()
         best = min(best, time.perf_counter() - start)
     return best, results
 
@@ -130,8 +122,6 @@ def ours_run(llm, prompts, params):
 
 def hf_run(hf, tokenizer, prompts, tokens, beams, warmup, repeats):
     enc = tokenizer(prompts, return_tensors="pt", padding=True)
-    if next(hf.parameters()).is_cuda:
-        enc = {k: v.to("cuda") for k, v in enc.items()}
     kwargs = dict(
         max_new_tokens=tokens,
         min_new_tokens=tokens,  # fixed length: EOS suppressed until max_new
@@ -155,12 +145,7 @@ def hf_run(hf, tokenizer, prompts, tokens, beams, warmup, repeats):
 
 
 def blocks_for(configs, enc_tokens: int, out_tokens: int, block_size: int) -> int:
-    """``num_blocks`` covering the widest config of one scenario.
-
-    Every running sequence holds ``enc + out`` tokens, so 32 sequences x 1000
-    generated tokens is a lot of KV; sizing it per scenario keeps the footprint
-    down (and fits the fp32 row on a small box).
-    """
+    """``num_blocks`` covering the widest config of one scenario."""
     worst = max(batch * beams for _, batch, beams, _ in configs)
     tokens = worst * (enc_tokens + out_tokens + 8)
     return (tokens + block_size - 1) // block_size + 8
@@ -172,7 +157,6 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--device", default="cpu", help="cpu or cuda (cuda:N works)")
     ap.add_argument(
         "--threads",
         type=int,
@@ -183,7 +167,7 @@ def main():
         "--block-size",
         type=int,
         default=0,
-        help="0 = device default (256 cuda, 32 x86 cpu, 16 aarch64)",
+        help="0 = default (32 x86, 16 aarch64)",
     )
     ap.add_argument("--scenarios", default="", help="comma list, default all")
     ap.add_argument("--warmup", type=int, default=1)
@@ -196,7 +180,7 @@ def main():
 
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-    block_size = args.block_size or default_block_size(args.device)
+    block_size = args.block_size or default_block_size()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     wanted = {s.strip() for s in args.scenarios.split(",") if s.strip()}
     scenarios = [s for s in SCENARIOS if not wanted or s[0] in wanted]
@@ -207,10 +191,7 @@ def main():
         )
 
     print("# fast-encdec benchmark\n", flush=True)
-    print(
-        f"model={args.model}  device={args.device}  threads={torch.get_num_threads()}",
-        flush=True,
-    )
+    print(f"model={args.model}  threads={torch.get_num_threads()}", flush=True)
 
     results = {}
     for dtype_name in ("bfloat16", "float32"):
@@ -222,15 +203,11 @@ def main():
             prompt = make_prompt(tokenizer, enc_tokens)
             enc_len = len(tokenizer(prompt, add_special_tokens=False)["input_ids"])
             num_blocks = blocks_for(configs, enc_len, out_tokens, block_size)
-            # One engine in memory at a time: 32 sequences x 1000 generated tokens
-            # is ~4 GB of KV in fp32 across both engines, which a small box cannot
-            # hold (and HF's cache is freed between scenarios either way).
             llm = LLM(
                 args.model,
                 num_blocks=num_blocks,
                 block_size=block_size,
                 dtype=dtype,
-                device=args.device,
             )
             for label, batch, beams, _ in configs:
                 dt, toks = timed(
@@ -255,15 +232,9 @@ def main():
                 }
                 print(".", end="", flush=True)
             del llm
-            # Compiled engines are kept alive by Dynamo's frame caches (guards
-            # hold the module, freezing holds a packed copy of its weights), so
-            # a multi-engine run accumulates one engine's worth of memory per
-            # scenario. Drop that state before loading the reference model.
             torch._dynamo.reset()
 
             hf = AutoModelForSeq2SeqLM.from_pretrained(args.model, dtype=dtype).eval()
-            if args.device.startswith("cuda"):
-                hf = hf.to(args.device)
             for label, batch, beams, _ in configs:
                 dt, tok = hf_run(
                     hf,
@@ -275,8 +246,6 @@ def main():
                     args.repeats,
                 )
                 r = results[f"{name}|{label}"]
-                # Two checks: repeated runs of one engine agree with each other,
-                # and the two engines decode the same number of tokens.
                 if tok != r["ours_tok"]:
                     raise RuntimeError(
                         f"{name}/{label}: ours decoded {r['ours_tok']} tokens, "
@@ -287,7 +256,7 @@ def main():
                 r["ours_tok_s"] = r["ours_tok"] / (r["ours_ms"] / 1e3)
                 r["speedup"] = r["hf_ms"] / r["ours_ms"]
                 print(".", end="", flush=True)
-                if args.json:  # durable: a later OOM must not lose the run
+                if args.json:
                     with open(args.json, "w") as f:
                         json.dump(list(results.values()), f, indent=2)
             del hf

@@ -1,55 +1,8 @@
-"""BART benchmark: this engine vs vLLM, scenarios x configs.
-
-vLLM runs BART through two plugins (no fork, no source patch):
-
-- https://github.com/vllm-project/bart-plugin -- encoder-decoder model support
-- https://github.com/neuralmagic/vllm-beam-search-plugin -- beam scheduler +
-  sampler (``scheduler_cls=vllm_beam_search.scheduler.BeamSearchScheduler``;
-  per-request ``SamplingParams(extra_args={"beam_width": n})``)
+"""BART benchmark: this engine vs vLLM on CPU, scenarios x configs.
 
 Methodology mirrors ``benchmarks/benchmark.py``: both engines run the same
 dtype, prompts and output length, EOS suppressed, so the speedup is
-engine-vs-engine.  Two deviations, both deliberate:
-
-- No decoding heuristics (no ``length_penalty``/``no_repeat_ngram_size``).
-  vLLM's greedy path has no n-gram blocking parameter, so heuristics stay off
-  on both sides to keep the comparison like-for-like.
-- vLLM beam search appends a trailing EOS on top of ``min_tokens`` (N+1 tokens
-  per sequence vs our exactly-N); the extra token is <0.5% of a 256-token run,
-  and each engine's tok/s is computed from its own decoded count.
-
-The two engines live in different venvs, so run one process per engine::
-
-  PYTHONPATH=. .venv/bin/python benchmarks/benchmark_vllm.py --engine ours --json ours.json
-  # FlashInfer JIT needs nvcc (absent), so disable its sampler.
-  HF_HUB_OFFLINE=1 VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_PLUGINS=bart,beam_search \\
-      ~/vllmenv/bin/python benchmarks/benchmark_vllm.py --engine vllm --json vllm.json
-
-Then merge the two raw JSONs into the comparison table::
-
-  python benchmarks/benchmark_vllm.py --compare ours.json vllm.json
-
-``--batches`` overrides ``--configs`` with a greedy (``beams=1``) batch sweep, which
-is how the decode-scaling tables are produced::
-
-  ... --engine ours --batches 1,2,4,8,16,32 --json ours_greedy.json
-  python benchmarks/benchmark_vllm.py --compare ours_greedy.json vllm_greedy.json
-
-``--device cpu`` runs the same comparison on a CPU box (``VLLM_CPU_KVCACHE_SPACE``
-is defaulted to 8 GiB here).  The vLLM side then needs a vLLM whose CPU build
-still has the V1 model runner plus the *pre-MRV2* BART plugin, because vLLM gates
-the V2 model runner on Triton and Triton has no CPU backend::
-
-  # the CPU env: vllm 0.24.0+cpu (aarch64 wheel from the v0.24.0 GitHub release,
-  # deps from the PyTorch CPU index) + bart-plugin v0.5.0 + beam plugin 0.1.5
-  PYTHONPATH=. ~/venv/bin/python benchmarks/benchmark_vllm.py --engine ours --device cpu --json ours.json
-  HF_HUB_OFFLINE=1 ~/vllm024/bin/python benchmarks/benchmark_vllm.py --engine vllm --device cpu --json vllm.json
-  python benchmarks/benchmark_vllm.py --compare ours.json vllm.json
-
-Beam search is CUDA-only: ``BeamSearchScheduler`` raises unless vLLM uses the V2
-model runner *with async scheduling*, and BART's plugin requires V2 outright, so
-``--engine vllm --device cpu`` rejects ``beams > 1`` instead of silently running
-something else.
+engine-vs-engine.
 """
 
 import argparse
@@ -70,16 +23,6 @@ from benchmarks.benchmark import CONFIGS, SCENARIOS, make_prompt
 MODEL = "facebook/bart-large-cnn"
 
 
-def _sync() -> None:
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
-def _empty_cache() -> None:
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-
 def timed(fn, warmup: int, repeats: int):
     """Return (best_seconds, per-repeat token counts)."""
     for _ in range(warmup):
@@ -87,10 +30,8 @@ def timed(fn, warmup: int, repeats: int):
     best = float("inf")
     toks = []
     for _ in range(repeats):
-        _sync()
         start = time.perf_counter()
         toks.append(fn())
-        _sync()
         best = min(best, time.perf_counter() - start)
     return best, toks
 
@@ -111,7 +52,7 @@ def blocks_for(configs, enc_tokens: int, out_tokens: int, block_size: int) -> in
 
 def ours_run(llm, prompts, params) -> int:
     """One generate; returns the number of tokens the engine decoded."""
-    outs = llm.generate(prompts, params, use_tqdm=False)
+    outs = llm.generate(prompts, params)
     return sum(len(o.outputs[0].token_ids) for o in outs)
 
 
@@ -125,7 +66,7 @@ def run_ours(args, tokenizer, scenarios):
     from fastencdec import LLM, SamplingParams
     from fastencdec.config import default_block_size
 
-    block_size = default_block_size(args.device)
+    block_size = default_block_size()
     max_seqs = max(b * n for _, b, n, _ in args.configs)
     rows = []
     for dtype_name in ("bfloat16", "float32"):
@@ -141,11 +82,8 @@ def run_ours(args, tokenizer, scenarios):
                 block_size=block_size,
                 max_num_seqs=max_seqs,
                 dtype=getattr(torch, dtype_name),
-                device=args.device,
             )
             for label, batch, beams, _ in configs:
-                # min_length = out + 1 makes EOS illegal for the whole run, so
-                # the engine decodes exactly ``out_tokens`` (decoder prompt = 1 token).
                 params = SamplingParams(
                     max_tokens=out_tokens, num_beams=beams, min_length=out_tokens + 1
                 )
@@ -178,34 +116,21 @@ def run_ours(args, tokenizer, scenarios):
                 )
                 dump(args, rows)
             del llm
-            # Compiled engines stay alive in Dynamo's caches; drop them so a
-            # multi-engine benchmark does not accumulate packed weight copies.
             torch._dynamo.reset()
-            _empty_cache()
     return rows
 
 
 def run_vllm(args, tokenizer, scenarios):
     use_beam = any(beams > 1 for _, _, beams, _ in args.configs)
-    on_cpu = not str(args.device).startswith("cuda")
-    if on_cpu and use_beam:
-        # BeamSearchScheduler's ctor raises without MRV2 + async scheduling, and
-        # vLLM only implements MRV2 behind Triton, which has no CPU backend.
+    if use_beam:
         raise SystemExit(
             "vLLM cannot run BART beam search on CPU: BeamSearchScheduler needs "
             "the V2 model runner with async scheduling, which vLLM gates on "
-            "Triton.  Drop the beams>1 configs (or use --device cuda)."
+            "Triton.  Drop the beams>1 configs."
         )
-    # Read before importing vllm: no nvcc on this box, so FlashInfer's JIT sampler
-    # must be off.  The beam plugin replaces the scheduler with a custom one that
-    # disables async scheduling (and can slow plain greedy down), so load it only
-    # when a beam config is actually requested.
     os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-    os.environ.setdefault("VLLM_PLUGINS", "bart,beam_search" if use_beam else "bart")
-    if on_cpu:
-        # The CPU backend sizes its KV pool from the environment, not from
-        # ``gpu_memory_utilization``.
-        os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "8")
+    os.environ.setdefault("VLLM_PLUGINS", "bart")
+    os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "8")
     import vllm_bart_plugin  # noqa: F401  registers BART with vLLM
     from vllm import LLM, SamplingParams
 
@@ -214,10 +139,6 @@ def run_vllm(args, tokenizer, scenarios):
         "max_model_len": 1024,
         "max_num_seqs": max(b * n for _, b, n, _ in args.configs),
     }
-    if not on_cpu:
-        llm_kwargs["gpu_memory_utilization"] = 0.7
-    if use_beam:
-        llm_kwargs["scheduler_cls"] = "vllm_beam_search.scheduler.BeamSearchScheduler"
 
     rows = []
     for dtype_name in ("bfloat16", "float32"):
@@ -238,21 +159,15 @@ def run_vllm(args, tokenizer, scenarios):
                         "decoder_prompt": "<s>",
                     }
                 ] * batch
-                params_kwargs = {
-                    "temperature": 0.0,
-                    "max_tokens": out_tokens,
-                    "min_tokens": out_tokens,
-                }
-                if beams > 1:
-                    params_kwargs["extra_args"] = {"beam_width": beams}
-                params = SamplingParams(**params_kwargs)
-
+                params = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=out_tokens,
+                    min_tokens=out_tokens,
+                )
                 dt, toks = timed(
                     partial(vllm_run, llm, prompts, params), args.warmup, args.repeats
                 )
                 assert len(set(toks)) == 1, f"{name}/{label}: vllm decoded {set(toks)}"
-                # Beam search appends a trailing EOS on top of min_tokens;
-                # greedy is exact.
                 lo, hi = batch * out_tokens, batch * (out_tokens + 1)
                 assert lo <= toks[0] <= hi, (
                     f"{name}/{label}: vllm {toks[0]} not in [{lo},{hi}]"
@@ -277,7 +192,6 @@ def run_vllm(args, tokenizer, scenarios):
                 dump(args, rows)
         del llm
         gc.collect()
-        _empty_cache()
     return rows
 
 
@@ -317,7 +231,6 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--engine", choices=("ours", "vllm"))
-    ap.add_argument("--device", default="cuda", help="cuda or cpu (cuda:N works)")
     ap.add_argument(
         "--threads",
         type=int,
@@ -378,7 +291,7 @@ def main():
     rows = (
         run_ours(args, tokenizer, scenarios)
         if args.engine == "ours"
-        else (run_vllm(args, tokenizer, scenarios))
+        else run_vllm(args, tokenizer, scenarios)
     )
     if args.json:
         dump(args, rows)

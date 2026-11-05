@@ -1,4 +1,4 @@
-"""Device checks must work without downloading a model or calling CUDA on CPU."""
+"""Benchmark helper checks without downloading a model."""
 
 import contextlib
 import io
@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from benchmarks import (
-    attn_backend,
     benchmark,
     benchmark_vllm,
     throughput,
@@ -18,20 +17,7 @@ from benchmarks import (
 
 
 class BenchmarkTests(unittest.TestCase):
-    def test_cuda_attention_comparison_rejected_before_loading(self):
-        stderr = io.StringIO()
-        with (
-            patch.object(sys, "argv", ["attn_backend.py", "--device", "cuda"]),
-            patch("transformers.AutoTokenizer.from_pretrained") as load,
-            contextlib.redirect_stderr(stderr),
-            self.assertRaises(SystemExit) as error,
-        ):
-            attn_backend.main()
-        self.assertEqual(error.exception.code, 2)
-        self.assertIn("requires --device cpu", stderr.getvalue())
-        load.assert_not_called()
-
-    def test_cpu_throughput_never_synchronizes_cuda(self):
+    def test_cpu_throughput_profile(self):
         tokenizer = Mock(return_value={"input_ids": [3, 4, 5]})
         tokenizer.decode.return_value = "prompt"
         profiler = MagicMock()
@@ -41,8 +27,6 @@ class BenchmarkTests(unittest.TestCase):
                 "argv",
                 [
                     "throughput.py",
-                    "--device",
-                    "cpu",
                     "--requests",
                     "1",
                     "--max-tokens",
@@ -56,14 +40,10 @@ class BenchmarkTests(unittest.TestCase):
             ),
             patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer),
             patch.object(throughput, "LLM"),
-            patch(
-                "torch.cuda.synchronize", side_effect=AssertionError("CUDA on CPU")
-            ) as sync,
             patch("torch.profiler.profile", return_value=profiler) as profile,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             throughput.main()
-        sync.assert_not_called()
         from torch.profiler import ProfilerActivity
 
         self.assertEqual(profile.call_args.kwargs["activities"], [ProfilerActivity.CPU])

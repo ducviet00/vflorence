@@ -8,8 +8,7 @@ task and in total:
 * padding tokens
 * generated tokens/s, and the padded-token rate HF actually pays for
 
-    PYTHONPATH=. python benchmarks/florence2_tasks.py --device cpu
-    PYTHONPATH=. python benchmarks/florence2_tasks.py --device cuda
+    PYTHONPATH=. python benchmarks/florence2_tasks.py
 """
 
 import argparse
@@ -38,7 +37,6 @@ IMAGE_URL = (
 )
 IMAGE_PATH = "/tmp/fastencdec/florence2_bench.jpg"
 
-# (label, prompt). The order defines the task mix cycle.
 TASKS = [
     ("caption", "<CAPTION>"),
     ("ocr", "<OCR>"),
@@ -87,16 +85,10 @@ def load_images(n):
 def timed(fn, warmup, repeats):
     for _ in range(warmup):
         fn()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
     best, last = float("inf"), None
     for _ in range(repeats):
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
         start = time.perf_counter()
         last = fn()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
         best = min(best, time.perf_counter() - start)
     return best, last
 
@@ -115,7 +107,6 @@ def account_hf(out, pad):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
     ap.add_argument("--images", type=int, default=8)
     ap.add_argument("--max-tokens", type=int, default=128)
@@ -123,13 +114,6 @@ def main():
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=2)
     ap.add_argument("--compile-mm-encoder", action="store_true")
-    ap.add_argument(
-        "--cudagraph",
-        dest="use_cudagraph",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="decode CUDA graph (default on; CUDA + flash only)",
-    )
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
 
@@ -144,7 +128,7 @@ def main():
     from transformers import Florence2ForConditionalGeneration as HFFlorence2
 
     processor = AutoProcessor.from_pretrained(MODEL)
-    block_size = default_block_size(args.device)
+    block_size = default_block_size()
     num_blocks = max(1, args.num_blocks * 16 // block_size)
     llm = LLM(
         MODEL,
@@ -153,10 +137,8 @@ def main():
         max_num_seqs=n,
         dtype=dtype,
         compile_mm_encoder=args.compile_mm_encoder,
-        device=args.device,
-        use_cudagraph=args.use_cudagraph,
     )
-    hf = HFFlorence2.from_pretrained(MODEL, dtype=dtype).eval().to(args.device)
+    hf = HFFlorence2.from_pretrained(MODEL, dtype=dtype).eval()
 
     prepared = []
     for _, prompt, img in workload:
@@ -166,7 +148,6 @@ def main():
     params = SamplingParams(
         max_tokens=args.max_tokens,
         num_beams=1,
-        temperature=0.0,
         eos_token_id=llm.eos_token_id,
     )
 
@@ -184,7 +165,6 @@ def main():
         padding=True,
         return_tensors="pt",
     )
-    inputs = {k: v.to(args.device) for k, v in inputs.items()}
     pad = processor.tokenizer.pad_token_id
 
     def run_hf():
@@ -207,7 +187,6 @@ def main():
 
     names = [name for name, _, _ in workload]
     report = {
-        "device": args.device,
         "dtype": args.dtype,
         "requests": n,
         "max_new_tokens": args.max_tokens,
@@ -216,7 +195,7 @@ def main():
     }
 
     print(
-        f"\nmodel={MODEL}  device={args.device}  dtype={args.dtype}  "
+        f"\nmodel={MODEL}  dtype={args.dtype}  "
         f"requests={n} ({args.images} images x {len(TASKS)} tasks)  "
         f"max_new_tokens={args.max_tokens}  greedy  "
         f"compile_mm_encoder={args.compile_mm_encoder}"
