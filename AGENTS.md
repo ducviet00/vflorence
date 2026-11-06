@@ -75,7 +75,7 @@ examples/summarize.py
 examples/florence2.py
 benchmarks/stage_latency.py        per-stage ms vs HF (vision / encode / decode step)
 benchmarks/continuous_batching.py  mixed-length Florence-2 workload vs HF padded batches
-benchmarks/utils.py                shared timer, KV sizing, COCO images, HF decode kwargs
+benchmarks/utils.py                shared image loader and timer
 tests/verify_parity.py             real-checkpoint parity vs HF
 tests/test_parity.py
 tests/test_florence2.py
