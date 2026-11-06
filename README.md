@@ -18,6 +18,16 @@ uv pip install --no-build-isolation git+https://github.com/ducviet00/vllm-cpu-at
 uv pip install --no-build-isolation -e .
 ```
 
+**On x86, use tcmalloc.** glibc malloc hands large freed buffers back to the OS, so every
+Florence-2 vision forward page-faults them in again. On Xeon (c4-standard-8) tcmalloc makes
+the vision stage ~1.9x faster and end-to-end throughput ~10% higher; on Axion (aarch64) it
+makes no measurable difference.
+
+```bash
+sudo apt-get install -y libgoogle-perftools4t64   # older Ubuntu/Debian: libgoogle-perftools4
+export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
+```
+
 ## Quick Start
 
 See `examples/` for runnable scripts. `LLM` takes `dtype` (`torch.float32` or `torch.bfloat16`),
