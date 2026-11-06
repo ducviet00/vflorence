@@ -2,14 +2,11 @@ import math
 from typing import ClassVar
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers.activations import ACT2FN
 
-from ..layers.attention import (
-    decoder_cross_attention,
-    decoder_self_attention,
-    encoder_self_attention,
-)
+from ..layers.attention import decoder_cross_attention, decoder_self_attention
 
 
 class BartLearnedPositionalEmbedding(nn.Embedding):
@@ -66,7 +63,6 @@ class BartEncoderSelfAttention(_BartAttentionBase):
         self,
         embed_dim: int,
         num_heads: int,
-        layer_idx: int,
         bias: bool = True,
     ):
         super().__init__(embed_dim, num_heads)
@@ -76,15 +72,20 @@ class BartEncoderSelfAttention(_BartAttentionBase):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project QKV, run dense encoder self-attention, and project output."""
         shape = (*hidden_states.shape[:-1], -1, self.head_dim)
+        # .contiguous() avoids the ~20x slower non-contiguous BF16 SDPA path on aarch64.
         q, k, v = (
-            t.reshape(shape) for t in self.qkv_proj(hidden_states).chunk(3, dim=-1)
+            t.reshape(shape).transpose(1, 2).contiguous()
+            for t in self.qkv_proj(hidden_states).chunk(3, dim=-1)
         )
-        out = encoder_self_attention(q, k, v, self.scaling)
-        return self.out_proj(out.reshape(*hidden_states.shape[:-1], -1))
+        out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=False, scale=self.scaling
+        )
+        out = out.transpose(1, 2).reshape(*hidden_states.shape[:-1], -1)
+        return self.out_proj(out)
 
 
 class BartDecoderSelfAttention(_BartAttentionBase):
-    """Paged causal multi-head self-attention for the decoder."""
+    """Paged causal multi-head self-attention for the decoder (one new token per sequence)."""
 
     fused_projections: ClassVar[dict[str, tuple[str, ...]]] = {
         "qkv_proj": ("q_proj", "k_proj", "v_proj")
@@ -94,7 +95,6 @@ class BartDecoderSelfAttention(_BartAttentionBase):
         self,
         embed_dim: int,
         num_heads: int,
-        layer_idx: int,
         bias: bool = True,
     ):
         super().__init__(embed_dim, num_heads)
@@ -102,7 +102,6 @@ class BartDecoderSelfAttention(_BartAttentionBase):
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.k_cache = torch.empty([])
         self.v_cache = torch.empty([])
-        self.block_size = 16
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project QKV, update paged KV cache, and run causal self-attention."""
@@ -111,9 +110,7 @@ class BartDecoderSelfAttention(_BartAttentionBase):
         q, k, v = (
             t.reshape(shape) for t in self.qkv_proj(hidden_states).chunk(3, dim=-1)
         )
-        out = decoder_self_attention(
-            q, k, v, self.k_cache, self.v_cache, self.scaling, self.block_size
-        )
+        out = decoder_self_attention(q, k, v, self.k_cache, self.v_cache, self.scaling)
         return self.out_proj(out.reshape(num_tokens, self.embed_dim))
 
 
@@ -135,13 +132,9 @@ class BartDecoderCrossAttention(_BartAttentionBase):
         self.kv_proj = nn.Linear(embed_dim, 2 * embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        # request_id -> (key, value) [num_heads, enc_len, head_dim]
+        # request_id -> (key, value) [enc_len, num_heads, head_dim]
         self.encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.layer_idx = layer_idx
-        self.cross_cache = None
-        self.cross_staged = None
-        self.cross_staged_key = None
-        self.block_size = 16
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project decoder queries and attend over cached encoder K/V."""
@@ -149,18 +142,17 @@ class BartDecoderCrossAttention(_BartAttentionBase):
         query = self.q_proj(hidden_states).view(
             num_tokens, self.num_heads, self.head_dim
         )
-        out = decoder_cross_attention(query, self, self.scaling, self.block_size)
+        out = decoder_cross_attention(query, self.layer_idx, self.scaling)
         return self.out_proj(out.reshape(num_tokens, self.embed_dim))
 
 
 class BartEncoderLayer(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config):
         super().__init__()
         self.embed_dim = config.d_model
         self.self_attn = BartEncoderSelfAttention(
             self.embed_dim,
             config.encoder_attention_heads,
-            layer_idx,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.activation_fn = ACT2FN[config.activation_function]
@@ -184,7 +176,6 @@ class BartDecoderLayer(nn.Module):
         self.self_attn = BartDecoderSelfAttention(
             self.embed_dim,
             config.decoder_attention_heads,
-            layer_idx,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.activation_fn = ACT2FN[config.activation_function]
@@ -223,10 +214,7 @@ class BartEncoder(nn.Module):
             config.max_position_embeddings, embed_dim
         )
         self.layers = nn.ModuleList(
-            [
-                BartEncoderLayer(config, layer_idx=i)
-                for i in range(config.encoder_layers)
-            ]
+            [BartEncoderLayer(config) for _ in range(config.encoder_layers)]
         )
         self.layernorm_embedding = nn.LayerNorm(embed_dim)
 
@@ -314,7 +302,7 @@ class BartForConditionalGeneration(nn.Module):
     def encode(self, encoder_input_ids: torch.Tensor) -> torch.Tensor:
         """Run the encoder on a batch of token IDs [B, S] and return hidden states [B, S, D]."""
         positions = (
-            torch.arange(encoder_input_ids.shape[1], device=encoder_input_ids.device)
+            torch.arange(encoder_input_ids.shape[1])
             .unsqueeze(0)
             .expand_as(encoder_input_ids)
         )
@@ -322,18 +310,12 @@ class BartForConditionalGeneration(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Run one decoder step and return logits [B, vocab] (the compiled decode graph)."""
-        return self.compute_logits(self.decoder(input_ids, positions))
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project decoder hidden states to vocabulary logits plus final_logits_bias."""
-        return self.lm_head(hidden_states) + self.final_logits_bias
+        return (
+            self.lm_head(self.model.decoder(input_ids, positions))
+            + self.final_logits_bias
+        )
 
     @property
     def decoder_layers(self):
         """Return the decoder layer list."""
         return self.model.decoder.layers
-
-    @property
-    def decoder(self):
-        """Return the paged decoder module."""
-        return self.model.decoder

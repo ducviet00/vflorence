@@ -1,11 +1,10 @@
-from .block_manager import Block, BlockManager
+from .block_manager import BlockManager
 from .llm_engine import LLMEngine
 from .model_runner import ModelRunner
 from .scheduler import Scheduler
 from .sequence import Sequence
 
 __all__ = [
-    "Block",
     "BlockManager",
     "LLMEngine",
     "ModelRunner",

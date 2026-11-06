@@ -5,63 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fast-encdec"
 version = "0.1.0"
-description = "Tiny BART/Florence-2 inference: paged KV cache, continuous batching, beam search"
-requires-python = ">=3.10"
-dependencies = ["transformers", "Pillow"]
-
-[project.optional-dependencies]
-cpu = [
-  "torch>=2.11.0",
-  "torchvision>=0.26.0",
-  # The CPU attention kernels; without them the engine silently falls back to
-  # the slow SDPA path.
-  "cpu-attention",
-]
-cu130 = [
-  "torch>=2.11.0",
-  "torchvision>=0.26.0",
-  # Fetches the prebuilt kernels-community/flash-attn2 kernel on first CUDA use;
-  # without it the engine silently falls back to the slow SDPA path.
-  "kernels",
+description = "Tiny CPU inference for BART and Florence-2: paged KV cache, continuous batching, beam search"
+requires-python = ">=3.12"
+dependencies = [
+  "transformers",
+  "Pillow",
+  "torch>=2.4.0",
+  "torchvision",
+  "vllm-cpu-attn",
 ]
 
 [tool.uv]
-conflicts = [
-  [
-    { extra = "cpu" },
-    { extra = "cu130" },
-  ],
-]
+no-build-isolation-package = ["vllm-cpu-attn"]
 
 [tool.uv.sources]
-cpu-attention = { git = "https://github.com/ducviet00/cpu-attention.git" }
-torch = [
-  { index = "pytorch-cpu", extra = "cpu" },
-  { index = "pytorch-cu130", extra = "cu130" },
-]
-torchvision = [
-  { index = "pytorch-cpu", extra = "cpu" },
-  { index = "pytorch-cu130", extra = "cu130" },
-]
-
-# cpu-attention builds against (and links) the torch the project runs with.
-[tool.uv.extra-build-dependencies]
-cpu-attention = [{ requirement = "torch", match-runtime = true }]
-
-# shortcut: mirrors cpu-attention 0.1.0's runtime metadata; remove when its uv CPU-only source is removed upstream.
-[[tool.uv.dependency-metadata]]
-name = "cpu-attention"
-version = "0.1.0"
-requires-dist = ["torch>=2.0"]
+vllm-cpu-attn = { git = "https://github.com/ducviet00/vllm-cpu-attention.git" }
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.setuptools.packages.find]

@@ -45,31 +45,12 @@ class Florence2VisionConvEmbed(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply strided patch convolution with pre- or post-LayerNorm."""
-        # LayerNorm normalizes over the last dim (channels-last).
         if self.pre_norm:
             hidden_states = self.norm(hidden_states.movedim(1, -1)).movedim(-1, 1)
         hidden_states = self.conv(hidden_states)
         if not self.pre_norm:
             hidden_states = self.norm(hidden_states.movedim(1, -1)).movedim(-1, 1)
         return hidden_states
-
-
-class Florence2DropPath(nn.Module):
-    def __init__(self, drop_prob: float = 0.0):
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply stochastic depth during training (identity at eval time)."""
-        if self.drop_prob == 0.0 or not self.training:
-            return hidden_states
-        keep_prob = 1 - self.drop_prob
-        shape = (hidden_states.shape[0],) + (1,) * (hidden_states.ndim - 1)
-        rand = torch.floor(
-            torch.rand(shape, dtype=hidden_states.dtype, device=hidden_states.device)
-            + keep_prob
-        )
-        return hidden_states.div(keep_prob) * rand
 
 
 class Florence2VisionChannelAttention(nn.Module):
@@ -84,7 +65,6 @@ class Florence2VisionChannelAttention(nn.Module):
         """Run grouped channel self-attention over the head_dim axis."""
         batch_size, num_tokens, hidden_size = hidden_states.shape
         head_dim = hidden_size // self.groups
-        # Channel attention over head_dim (N is the key/value dim); contiguous for Flash SDPA.
         qkv = (
             self.qkv(hidden_states)
             .reshape(batch_size, num_tokens, 3, self.groups, head_dim)
@@ -122,7 +102,6 @@ class Florence2VisionWindowAttention(nn.Module):
             hidden_states = F.pad(hidden_states, (0, 0, 0, pad_right, 0, pad_bottom))
         padded_height, padded_width = height + pad_bottom, width + pad_right
 
-        # Partition into non-overlapping [num_windows, ws*ws, C] windows.
         windows = (
             hidden_states.view(
                 batch_size,
@@ -137,7 +116,6 @@ class Florence2VisionWindowAttention(nn.Module):
         )
         num_windows = windows.shape[0]
 
-        # Contiguous QKV avoids the ~5.5x slower non-contiguous BF16 SDPA path on aarch64.
         qkv = (
             self.qkv(windows)
             .reshape(
@@ -170,21 +148,15 @@ class Florence2VisionWindowAttention(nn.Module):
 
 
 class Florence2VisionSpatialBlock(nn.Module):
-    def __init__(self, config, stage_idx: int, drop_path_rate: float):
+    def __init__(self, config, stage_idx: int):
         super().__init__()
         dim = config.embed_dim[stage_idx]
         self.conv1 = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
         self.norm1 = nn.LayerNorm(dim)
         self.window_attn = Florence2VisionWindowAttention(config, stage_idx)
-        self.drop_path1 = (
-            Florence2DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
-        )
         self.conv2 = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = Florence2VisionMLP(config, stage_idx)
-        self.drop_path2 = (
-            Florence2DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
-        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run depthwise conv + local window attention + FFN on spatial features."""
@@ -196,7 +168,7 @@ class Florence2VisionSpatialBlock(nn.Module):
             self.norm1(residual).view(batch_size, height, width, embed_dim)
         )
         hidden_states = (
-            (residual + self.drop_path1(hidden_states))
+            (residual + hidden_states)
             .transpose(1, 2)
             .view(batch_size, embed_dim, height, width)
         )
@@ -205,28 +177,22 @@ class Florence2VisionSpatialBlock(nn.Module):
         residual = hidden_states.flatten(2).transpose(1, 2)
         hidden_states = self.ffn(self.norm2(residual))
         return (
-            (residual + self.drop_path2(hidden_states))
+            (residual + hidden_states)
             .transpose(1, 2)
             .view(batch_size, embed_dim, height, width)
         )
 
 
 class Florence2VisionChannelBlock(nn.Module):
-    def __init__(self, config, stage_idx: int, drop_path_rate: float):
+    def __init__(self, config, stage_idx: int):
         super().__init__()
         dim = config.embed_dim[stage_idx]
         self.conv1 = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
         self.norm1 = nn.LayerNorm(dim)
         self.channel_attn = Florence2VisionChannelAttention(config, stage_idx)
-        self.drop_path1 = (
-            Florence2DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
-        )
         self.conv2 = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = Florence2VisionMLP(config, stage_idx)
-        self.drop_path2 = (
-            Florence2DropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
-        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run depthwise conv + grouped channel attention + FFN on spatial features."""
@@ -236,7 +202,7 @@ class Florence2VisionChannelBlock(nn.Module):
         residual = hidden_states.flatten(2).transpose(1, 2)
         hidden_states = self.channel_attn(self.norm1(residual))
         hidden_states = (
-            (residual + self.drop_path1(hidden_states))
+            (residual + hidden_states)
             .transpose(1, 2)
             .view(batch_size, embed_dim, height, width)
         )
@@ -245,27 +211,17 @@ class Florence2VisionChannelBlock(nn.Module):
         residual = hidden_states.flatten(2).transpose(1, 2)
         hidden_states = self.ffn(self.norm2(residual))
         return (
-            (residual + self.drop_path2(hidden_states))
+            (residual + hidden_states)
             .transpose(1, 2)
             .view(batch_size, embed_dim, height, width)
         )
 
 
 class Florence2VisionBlock(nn.Module):
-    def __init__(
-        self,
-        config,
-        stage_idx: int,
-        spatial_drop_path_rate: float,
-        channel_drop_path_rate: float,
-    ):
+    def __init__(self, config, stage_idx: int):
         super().__init__()
-        self.spatial_block = Florence2VisionSpatialBlock(
-            config, stage_idx, spatial_drop_path_rate
-        )
-        self.channel_block = Florence2VisionChannelBlock(
-            config, stage_idx, channel_drop_path_rate
-        )
+        self.spatial_block = Florence2VisionSpatialBlock(config, stage_idx)
+        self.channel_block = Florence2VisionChannelBlock(config, stage_idx)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run one DaViT block (spatial window block followed by channel block)."""
@@ -281,26 +237,17 @@ class Florence2VisionBackbone(nn.Module):
         self.num_groups = config.num_groups
         self.num_stages = len(self.embed_dim)
 
-        dpr = torch.linspace(0, config.drop_path_rate, sum(config.depths) * 2).tolist()
-        depth_offset = 0
-        convs, blocks = [], []
-        for stage_idx in range(self.num_stages):
-            convs.append(Florence2VisionConvEmbed(config, stage_idx))
-            blocks.append(
+        self.convs = nn.ModuleList(
+            [Florence2VisionConvEmbed(config, i) for i in range(self.num_stages)]
+        )
+        self.blocks = nn.ModuleList(
+            [
                 nn.ModuleList(
-                    Florence2VisionBlock(
-                        config,
-                        stage_idx,
-                        spatial_drop_path_rate=dpr[depth_offset + block_idx * 2],
-                        channel_drop_path_rate=dpr[depth_offset + block_idx * 2 + 1],
-                    )
-                    for block_idx in range(config.depths[stage_idx])
+                    Florence2VisionBlock(config, i) for _ in range(config.depths[i])
                 )
-            )
-            depth_offset += config.depths[stage_idx] * 2
-
-        self.convs = nn.ModuleList(convs)
-        self.blocks = nn.ModuleList(blocks)
+                for i in range(self.num_stages)
+            ]
+        )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Encode images [B, 3, H, W] through the four DaViT stages into [B, C, H', W']."""
@@ -414,11 +361,6 @@ class Florence2ForConditionalGeneration(nn.Module):
         """Return the language model's decoder layer list."""
         return self.model.language_model.decoder.layers
 
-    @property
-    def decoder(self):
-        """Return the language model's paged decoder module."""
-        return self.model.language_model.decoder
-
     @torch.no_grad()
     def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Run the vision tower and multimodal projector to produce visual token embeddings."""
@@ -426,7 +368,7 @@ class Florence2ForConditionalGeneration(nn.Module):
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Run one decoder step and return logits [B, vocab] (the compiled decode graph)."""
-        return self.compute_logits(self.decoder(input_ids, positions))
+        return self.lm_head(self.model.language_model.decoder(input_ids, positions))
 
     @torch.no_grad()
     def encode(
@@ -435,11 +377,7 @@ class Florence2ForConditionalGeneration(nn.Module):
         pixel_values: torch.Tensor | None = None,
         image_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Scatter projected visual tokens into image_token_id slots and run the BART encoder.
-
-        ``image_embeds`` lets the runner pass features it already computed (the
-        tower compiles with static shapes, this graph with dynamic ones).
-        """
+        """Scatter projected visual tokens into image_token_id slots and run the BART encoder."""
         language_model = self.model.language_model
         positions = (
             torch.arange(encoder_input_ids.shape[1], device=encoder_input_ids.device)
@@ -456,7 +394,3 @@ class Florence2ForConditionalGeneration(nn.Module):
                 image_mask.unsqueeze(-1), image_embeds
             )
         return language_model.encoder(positions=positions, inputs_embeds=inputs_embeds)
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project decoder hidden states to vocabulary logits."""
-        return self.lm_head(hidden_states)

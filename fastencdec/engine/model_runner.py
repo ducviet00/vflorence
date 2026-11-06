@@ -3,27 +3,18 @@ from collections import defaultdict
 from contextlib import nullcontext
 
 import torch
+import vllm_cpu_attn
 
 from ..layers import attention
 from ..utils.context import set_context
-from .cudagraph import DecodeGraphRunner
 
-# Number of compiled runners in this process; each one costs Dynamo cache entries
-# (a new weight set and the batch-1 specialization), and the limit is per frame.
 _COMPILED_RUNNERS = 0
 
-# On aarch64, torch >= 2.15 runs a one-row GEMM outside oneDNN, straight from the
-# plain weight, while a packed weight keeps it on oneDNN, so the batch-1 decode
-# graph is compiled without freezing (which is what packs).  Older torch reorders
-# a plain weight inside oneDNN on every call, so there packing wins at batch 1
-# too; on x86 batch 1 ties either way.  (Per-graph `cpp.weight_prepack` does
-# not work: Inductor registers its packing patterns once per process.)
+# On aarch64 with torch >= 2.15, oneDNN runs a plain (unpacked) weight fastest for
+# one row, so the batch-1 decode graph is compiled without freezing (weight packing).
+# Batch 1 is its own graph anyway (Dynamo's 0/1 specialization).
 _UNFROZEN_SINGLE_ROW = (
-    platform.machine().lower()
-    in (
-        "arm64",
-        "aarch64",
-    )
+    platform.machine().lower() in ("arm64", "aarch64")
     and torch.torch_version.TorchVersion(torch.__version__) >= "2.15"
 )
 
@@ -36,97 +27,70 @@ class ModelRunner:
         model,
         block_manager,
         dtype=torch.float32,
-        attn_backend="auto",
-        device="cpu",
-        max_num_seqs=32,
-        use_cudagraph=True,
         compile=True,
         compile_mm_encoder=True,
     ):
-        self.device = torch.device(device)
         self.model = model.eval()
         self.block_manager = block_manager
         self.block_size = block_manager.block_size
         self.dtype = dtype
         self.decoder_layers = list(model.decoder_layers)
-
-        self.backend_preference = attn_backend
-        self.cache_layers = [layer.self_attn for layer in self.decoder_layers]
-        self.num_heads = self.cache_layers[0].num_heads
-        self.head_dim = self.cache_layers[0].head_dim
-        with attention.use_backend(attn_backend):
-            self.attn_backend = attention.backend(
-                self.device, dtype, self.head_dim, self.block_size
+        self.num_heads = self.decoder_layers[0].self_attn.num_heads
+        self.head_dim = self.decoder_layers[0].self_attn.head_dim
+        if self.head_dim not in attention.HEAD_DIMS:
+            raise ValueError(
+                f"vllm-cpu-attn does not support head_dim={self.head_dim}; "
+                f"must be one of {sorted(attention.HEAD_DIMS)}"
             )
-        self.decoder = model.decoder
-        self._setup_compile(compile, compile_mm_encoder)
-        self.use_cudagraph = use_cudagraph and (
-            self.device.type == "cuda" and self.attn_backend == "flash"
-        )
-        # One extra cache row serves as scratch for padded CUDA-graph rows.
-        rows = block_manager.num_blocks + int(self.use_cudagraph)
-        with attention.use_backend(attn_backend):
-            shape = attention.self_cache_shape(
-                rows, self.block_size, self.num_heads, self.head_dim, self.device, dtype
-            )
-        for layer in self.cache_layers:
-            layer.k_cache = torch.zeros(shape, dtype=dtype, device=self.device)
-            layer.v_cache = torch.zeros(shape, dtype=dtype, device=self.device)
-            layer.block_size = self.block_size
-        for layer in self.decoder_layers:
-            layer.encoder_attn.block_size = self.block_size
-        self.graph = (
-            DecodeGraphRunner(self, max_num_seqs) if self.use_cudagraph else None
-        )
-
-    def _setup_compile(self, compile: bool, compile_mm_encoder: bool) -> None:
-        """Build the frozen CPU graphs (and the vision tower) when enabled.
-
-        The paged attention ops are opaque custom ops, so Inductor traces the
-        decoder + lm head as one graph and freezing packs every GEMM. The SDPA
-        fallback reads the per-step Context and must not be compiled, hence the
-        ``cpu`` gate. See ``TORCH_COMPILE_FREEZING.md``.
-
-        ``compile=False`` is a full opt-out: it leaves the decoder, the encoder
-        and the vision tower eager. ``compile_mm_encoder`` only narrows the
-        tower further (it is meaningless without ``compile``).
-        """
-        self.compile_decoder = (
-            compile
-            and self.device.type == "cpu"
-            and self.dtype in (torch.float32, torch.bfloat16)
-            and self.attn_backend == "cpu"
-        )
-        self.decode_step = None
+        self.isa = vllm_cpu_attn.get_isa(dtype, self.block_size, self.head_dim)
+        # Eager by default; _compile swaps in compiled versions.
+        self.compiled = compile
+        self.decode_fn = self.model
         self.encode_fn = self.model.encode
-        self.mm_step = None
-        if self.compile_decoder:
-            global _COMPILED_RUNNERS
-            _COMPILED_RUNNERS += 1
-            # Every engine adds Dynamo cache entries (its weights and the batch-1
-            # specialization); grow the per-frame budget with the engine count.
-            torch._dynamo.config.recompile_limit = max(
-                torch._dynamo.config.recompile_limit, 2 * _COMPILED_RUNNERS + 4
-            )
-            # Four workers compile fast without the GB-scale memory spike of the
-            # default thread-count pool on small boxes.
-            torch._inductor.config.compile_threads = min(
-                4, torch._inductor.config.compile_threads
-            )
-            # Symbolic shapes keep one artifact per frame: freezing duplicates the
-            # packed weights per static shape. The Florence-2 tower is separate.
-            self.decode_step = torch.compile(self.model, dynamic=True)
-            self.encode_fn = torch.compile(self.model.encode, dynamic=True)
-        if compile and hasattr(self.model, "get_image_features") and compile_mm_encoder:
-            # Dynamic convs mis-stride DaViT's windowed maps, so the tower keeps
-            # static shapes (one graph per image shape, fixed in practice).
-            self.mm_step = torch.compile(self.model.get_image_features, dynamic=False)
+        self.image_fn = getattr(self.model, "get_image_features", None)
+        if compile:
+            self._compile(compile_mm_encoder)
+        # Cross-attention K/V staged for the current batch, keyed by its request ids.
+        self._cross_key = None
+        self._cross_staged = None
 
-    def _copy_block(self, src: int, dst: int) -> None:
-        """Copy KV cache contents from block src to dst across all decoder layers."""
-        for layer in self.cache_layers:
-            layer.k_cache[dst].copy_(layer.k_cache[src])
-            layer.v_cache[dst].copy_(layer.v_cache[src])
+        # Separate tensors per layer: views of one shared tensor break Inductor codegen.
+        # zeros, not empty: the kernel reads whole blocks, and 0 * NaN from garbage
+        # in a block's unused tail would poison the output.
+        shape = (
+            block_manager.num_blocks,
+            self.num_heads,
+            self.block_size,
+            self.head_dim,
+        )
+        for layer in self.decoder_layers:
+            layer.self_attn.k_cache = torch.zeros(shape, dtype=dtype)
+            layer.self_attn.v_cache = torch.zeros(shape, dtype=dtype)
+
+    def _compile(self, compile_mm_encoder: bool) -> None:
+        global _COMPILED_RUNNERS
+        _COMPILED_RUNNERS += 1
+        # Each engine adds ~4 Dynamo cache entries; past the limit Dynamo silently
+        # falls back to eager.
+        torch._dynamo.config.recompile_limit = max(
+            torch._dynamo.config.recompile_limit, 2 * _COMPILED_RUNNERS + 4
+        )
+        # Parallel C++ compile workers use GBs of RAM on small machines.
+        torch._inductor.config.compile_threads = min(
+            4, torch._inductor.config.compile_threads
+        )
+        # One dynamic graph covers every batch size / encoder length.
+        self.decode_fn = torch.compile(self.model, dynamic=True)
+        self.encode_fn = torch.compile(self.model.encode, dynamic=True)
+        if self.image_fn is not None and compile_mm_encoder:
+            self.image_fn = torch.compile(self.image_fn, dynamic=False)
+
+    def _copy_blocks(self, copies: list[tuple[int, int]]) -> None:
+        """Copy-on-write: copy KV blocks src -> dst in every decoder layer, one op per cache."""
+        src, dst = (torch.tensor(ids) for ids in zip(*copies))
+        for layer in self.decoder_layers:
+            for cache in (layer.self_attn.k_cache, layer.self_attn.v_cache):
+                cache[dst] = cache[src]
 
     @torch.no_grad()
     def _encode(self, seqs) -> None:
@@ -137,131 +101,115 @@ class ModelRunner:
                 None if seq.pixel_values is None else tuple(seq.pixel_values.shape)
             )
             groups[(len(seq.encoder_token_ids), px_shape)].append(seq)
-        encode = self.encode_fn
         for group in groups.values():
-            ids = torch.tensor(
-                [s.encoder_token_ids for s in group],
-                dtype=torch.long,
-                device=self.device,
+            ids = torch.tensor([s.encoder_token_ids for s in group], dtype=torch.long)
+            px = (
+                None
+                if group[0].pixel_values is None
+                else torch.stack([s.pixel_values for s in group])
             )
-            if group[0].pixel_values is None:
-                with self._inductor_ctx():
-                    hidden = encode(ids)
-            else:
-                px = torch.stack([s.pixel_values for s in group]).to(self.device)
-                with self._inductor_ctx():
-                    if self.mm_step is None:
-                        embeds = self.model.get_image_features(px)
-                    else:
-                        embeds = self.mm_step(px)
-                    hidden = encode(ids, image_embeds=embeds)
+            with self._inductor_ctx():
+                if px is None:
+                    hidden = self.encode_fn(ids)
+                else:
+                    hidden = self.encode_fn(ids, image_embeds=self.image_fn(px))
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
                 shape = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)
                 key, value = attn.kv_proj(hidden).chunk(2, dim=-1)
-                key, value = key.reshape(shape), value.reshape(shape)
+                key, value = (
+                    key.reshape(shape).contiguous(),
+                    value.reshape(shape).contiguous(),
+                )
                 for j, seq in enumerate(group):
-                    attn.encoder_kv_cache[seq.request_id] = (
-                        key[j].transpose(0, 1).contiguous(),
-                        value[j].transpose(0, 1).contiguous(),
-                    )
+                    attn.encoder_kv_cache[seq.request_id] = (key[j], value[j])
 
     def clear_request(self, request_id: int) -> None:
         """Release cached encoder K/V and staged cross-attention state for a finished request."""
-        if self.graph is not None:
-            self.graph.req_blocks.pop(request_id, None)
         for layer in self.decoder_layers:
-            attn = layer.encoder_attn
-            attn.encoder_kv_cache.pop(request_id, None)
-            attn.cross_staged = None
-            attn.cross_staged_key = None
-
-    @staticmethod
-    def _num_new_tokens(seq) -> int:
-        """Return how many tokens this step feeds for seq (always exactly one)."""
-        num_new = len(seq.token_ids) - seq.num_cached_tokens
-        if num_new != 1:
-            # The attention ops assume one query token per sequence per step
-            # (one query row per sequence in every kernel), so a
-            # longer decoder prompt cannot be prefilled in one step.  LLMEngine
-            # rejects it up front; this catches a hand-built Sequence too.
-            raise ValueError(
-                "each step must feed exactly one token per sequence, but "
-                f"request {seq.request_id} feeds {num_new}"
-            )
-        return num_new
+            layer.encoder_attn.encoder_kv_cache.pop(request_id, None)
+        self._cross_key = self._cross_staged = None
 
     def _prepare(self, seqs):
         """Allocate KV blocks and build input_ids, positions, and Context tensors for the step."""
         bs = self.block_size
-        # Check the token count and block budget upfront so a full cache or a
-        # malformed sequence raises before any state is mutated.
         for seq in seqs:
-            self._num_new_tokens(seq)
-        required = self.block_manager.required_new_blocks(seqs)
-        if required > self.block_manager.num_free_blocks:
+            num_new = len(seq.token_ids) - seq.num_cached_tokens
+            if num_new != 1:
+                raise ValueError(
+                    f"each step must feed 1 token per sequence, got {num_new}"
+                )
+        if (
+            self.block_manager.required_new_blocks(seqs)
+            > self.block_manager.num_free_blocks
+        ):
             raise RuntimeError("KV cache is full; increase num_blocks")
 
         input_ids, positions, new_slots = [], [], []
-        context_lens, seq_block_tables = [], []
+        context_lens, seq_block_tables, copies = [], [], []
         for seq in seqs:
-            num_new = self._num_new_tokens(seq)
-            self.block_manager.ensure_capacity(seq, num_new, self._copy_block)
-            start = seq.num_cached_tokens
-            for pos in range(start, start + num_new):
-                input_ids.append(seq.token_ids[pos])
-                positions.append(pos)
-                new_slots.append(seq.block_table[pos // bs] * bs + pos % bs)
-            seq.num_cached_tokens += num_new
-            context_lens.append(seq.num_cached_tokens)
+            if (copy := self.block_manager.ensure_capacity(seq)) is not None:
+                copies.append(copy)
+            pos = seq.num_cached_tokens
+            input_ids.append(seq.token_ids[pos])
+            positions.append(pos)
+            new_slots.append(seq.block_table[pos // bs] * bs + pos % bs)
+            seq.num_cached_tokens = pos + 1
+            context_lens.append(pos + 1)
             seq_block_tables.append(seq.block_table)
+        # Safe to copy after the loop: a dst is a fresh block, never another pair's src.
+        if copies:
+            self._copy_blocks(copies)
 
         max_blocks = max(len(t) for t in seq_block_tables)
         padded = [t + [0] * (max_blocks - len(t)) for t in seq_block_tables]
-        # Pinned host memory + non_blocking avoids stream syncs on CUDA.
-        pin = self.device.type == "cuda"
-        to_dev = lambda x, dtype: torch.tensor(x, dtype=dtype, pin_memory=pin).to(
-            self.device, non_blocking=True
+        context_lens_t = torch.tensor(context_lens, dtype=torch.int32)
+        query_start_loc = torch.arange(len(seqs) + 1, dtype=torch.int32)
+        self_metadata = vllm_cpu_attn.get_scheduler_metadata(
+            num_reqs=len(seqs),
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_heads,
+            head_dim=self.head_dim,
+            seq_lens=context_lens_t,
+            dtype=self.dtype,
+            query_start_loc=query_start_loc,
+            causal=False,
+            isa=self.isa,
+            block_size=bs,
         )
-        fields = {
-            "context_lens": to_dev(context_lens, torch.int32),
-            "block_tables": to_dev(padded, torch.int32),
-            "slot_mapping": to_dev(new_slots, torch.int64),
-            "request_ids": [seq.request_id for seq in seqs],
-        }
-        return to_dev(input_ids, torch.long), to_dev(positions, torch.long), fields
+        request_ids = tuple(seq.request_id for seq in seqs)
+        if request_ids != self._cross_key:
+            self._cross_staged = attention.stage_cross(
+                self.decoder_layers, request_ids, bs, self.isa
+            )
+            self._cross_key = request_ids
+        set_context(
+            context_lens=context_lens_t,
+            block_tables=torch.tensor(padded, dtype=torch.int32),
+            slot_mapping=torch.tensor(new_slots, dtype=torch.int64),
+            query_start_loc=query_start_loc,
+            self_metadata=self_metadata,
+            isa=self.isa,
+            cross_staged=self._cross_staged,
+        )
+        return (
+            torch.tensor(input_ids, dtype=torch.long),
+            torch.tensor(positions, dtype=torch.long),
+        )
 
     @torch.no_grad()
     def run(self, seqs):
         """Encode any fresh sequences, run one decoder step, and return next-token logits."""
-        with attention.use_backend(self.backend_preference):
-            fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
-            if fresh:
-                self._encode(fresh)
+        fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
+        if fresh:
+            self._encode(fresh)
 
-            input_ids, positions, fields = self._prepare(seqs)
-
-            if self.graph is not None:
-                self.graph.stage(seqs)
-                if len(seqs) <= self.graph.max_bs and self.graph.ready():
-                    self.graph.capture()
-                    hidden = self.graph.replay(len(seqs), input_ids, positions, fields)
-                    return self.model.compute_logits(hidden)
-
-            if self.attn_backend == "cpu":
-                # Per-step caches stay outside the compiled graph.
-                fields["cross_staged"] = attention.stage_cross(
-                    self.decoder_layers, fields["request_ids"]
-                )
-            set_context(**fields)
-            if self.decode_step is None:
-                return self.model(input_ids, positions)
-            freeze = len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW
-            with self._inductor_ctx(freeze):
-                return self.decode_step(input_ids, positions)
+        input_ids, positions = self._prepare(seqs)
+        with self._inductor_ctx(len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW):
+            return self.decode_fn(input_ids, positions)
 
     def _inductor_ctx(self, freeze=True):
-        """Patch Inductor freezing on for compiled calls (packing at compile)."""
-        if self.compile_decoder:
-            return torch._inductor.config.patch(freezing=freeze)
-        return nullcontext()
+        """Freezing lets Inductor pack weights into oneDNN layouts; it only applies when compiled."""
+        if not self.compiled:
+            return nullcontext()
+        return torch._inductor.config.patch(freezing=freeze)

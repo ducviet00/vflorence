@@ -21,7 +21,6 @@ def main():
     llm = LLM(
         "florence-community/Florence-2-base",
         dtype=torch.bfloat16,
-        device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
     start = time.perf_counter()
