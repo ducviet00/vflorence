@@ -10,7 +10,7 @@ class Sequence:
     """State and paged KV-cache bookkeeping for a single decoder hypothesis."""
 
     request_id: int
-    decoder_prompt_ids: list[int]
+    decoder_token_ids: list[int]
     encoder_token_ids: list[int]
     sampling: SamplingParams
     pixel_values: torch.Tensor | None = None
@@ -20,14 +20,14 @@ class Sequence:
     cum_logprob: float = 0.0
 
     def __post_init__(self) -> None:
-        self.decoder_prompt_ids = list(self.decoder_prompt_ids)
+        self.decoder_token_ids = list(self.decoder_token_ids)
         self.encoder_token_ids = list(self.encoder_token_ids)
-        self.token_ids = list(self.decoder_prompt_ids)
+        self.token_ids = list(self.decoder_token_ids)
 
     @property
     def num_generated(self) -> int:
-        return len(self.token_ids) - len(self.decoder_prompt_ids)
+        return len(self.token_ids) - len(self.decoder_token_ids)
 
     @property
     def completion_token_ids(self) -> list[int]:
-        return self.token_ids[len(self.decoder_prompt_ids) :]
+        return self.token_ids[len(self.decoder_token_ids) :]

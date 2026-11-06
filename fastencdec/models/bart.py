@@ -299,14 +299,14 @@ class BartForConditionalGeneration(nn.Module):
             self.lm_head.weight = self.model.shared.weight
 
     @torch.no_grad()
-    def encode(self, encoder_input_ids: torch.Tensor) -> torch.Tensor:
+    def encode(self, encoder_token_ids: torch.Tensor) -> torch.Tensor:
         """Run the encoder on a batch of token IDs [B, S] and return hidden states [B, S, D]."""
         positions = (
-            torch.arange(encoder_input_ids.shape[1])
+            torch.arange(encoder_token_ids.shape[1])
             .unsqueeze(0)
-            .expand_as(encoder_input_ids)
+            .expand_as(encoder_token_ids)
         )
-        return self.model.encoder(encoder_input_ids, positions)
+        return self.model.encoder(encoder_token_ids, positions)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Run one decoder step and return logits [B, vocab] (the compiled decode graph)."""

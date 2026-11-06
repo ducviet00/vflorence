@@ -101,13 +101,13 @@ class LLM:
         if sampling_params.eos_token_id is None and self.eos_token_id is not None:
             sampling_params = replace(sampling_params, eos_token_id=self.eos_token_id)
         eos_ids = sampling_params.eos_ids()
-        decoder_ids = [self.decoder_start_token_id]
+        decoder_token_ids = [self.decoder_start_token_id]
 
         records, engine_requests = [], []
         for item in prompts:
-            encoder_prompt, encoder_ids, image = self._parse_prompt(item)
+            encoder_prompt, encoder_token_ids, image = self._parse_prompt(item)
             if self.multimodal:
-                if encoder_ids is not None:
+                if encoder_token_ids is not None:
                     raise ValueError(
                         "Florence-2 requires a text prompt, not prompt_token_ids"
                     )
@@ -122,16 +122,16 @@ class LLM:
                     return_tensors="pt",
                     **(mm_processor_kwargs or {}),
                 )
-                encoder_ids = inputs["input_ids"][0].tolist()
+                encoder_token_ids = inputs["input_ids"][0].tolist()
                 pixel_values = inputs["pixel_values"][0]
             else:
                 if image is not None:
                     raise ValueError(
                         "images are only supported for Florence-2 checkpoints"
                     )
-                if encoder_ids is None:
+                if encoder_token_ids is None:
                     # Cut long text to the model's max length, like transformers pipelines.
-                    encoder_ids = self.tokenizer(
+                    encoder_token_ids = self.tokenizer(
                         encoder_prompt,
                         add_special_tokens=True,
                         padding=False,
@@ -139,13 +139,13 @@ class LLM:
                     )["input_ids"]
                 pixel_values = None
 
-            records.append((encoder_prompt, encoder_ids))
-            engine_requests.append((encoder_ids, decoder_ids, pixel_values))
+            records.append((encoder_prompt, encoder_token_ids))
+            engine_requests.append((encoder_token_ids, decoder_token_ids, pixel_values))
 
         completions = self.engine.generate(engine_requests, sampling_params)
-        prompt_text = self._decode(decoder_ids)
+        prompt_text = self._decode(decoder_token_ids)
         results = []
-        for (request_id, token_ids), (encoder_prompt, encoder_ids) in zip(
+        for (request_id, token_ids), (encoder_prompt, encoder_token_ids) in zip(
             completions.items(), records
         ):
             finished = bool(token_ids) and token_ids[-1] in eos_ids
@@ -153,7 +153,7 @@ class LLM:
                 RequestOutput(
                     request_id=request_id,
                     prompt=prompt_text,
-                    prompt_token_ids=decoder_ids,
+                    prompt_token_ids=decoder_token_ids,
                     outputs=[
                         CompletionOutput(
                             index=0,
@@ -164,7 +164,7 @@ class LLM:
                         )
                     ],
                     encoder_prompt=encoder_prompt,
-                    encoder_prompt_token_ids=encoder_ids,
+                    encoder_prompt_token_ids=encoder_token_ids,
                 )
             )
         return results

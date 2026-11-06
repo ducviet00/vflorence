@@ -49,7 +49,7 @@ class LLMEngine:
         self._next_request_id = 0
 
     def generate(self, requests, params) -> dict[int, list[int]]:
-        """Run a batch of (encoder_ids, decoder_ids, pixel_values) requests to completion.
+        """Run a batch of (encoder_token_ids, decoder_token_ids, pixel_values) requests to completion.
 
         Returns {request_id: generated token ids}, in request order.
         """
@@ -99,12 +99,12 @@ class LLMEngine:
                 f"max_tokens ({params.max_tokens}) exceeds the model's "
                 f"max_position_embeddings ({self.max_positions})"
             )
-        for encoder_ids, decoder_ids, _ in requests:
-            if len(decoder_ids) != 1:
+        for encoder_token_ids, decoder_token_ids, _ in requests:
+            if len(decoder_token_ids) != 1:
                 raise ValueError("the decoder prompt must be a single token")
-            if len(encoder_ids) > self.max_positions:
+            if len(encoder_token_ids) > self.max_positions:
                 raise ValueError(
-                    f"encoder prompt has {len(encoder_ids)} tokens; the model "
+                    f"encoder prompt has {len(encoder_token_ids)} tokens; the model "
                     f"supports at most {self.max_positions}"
                 )
         # shortcut: checks one request alone; a full batch can still run out.
@@ -222,7 +222,7 @@ class LLMEngine:
         """Create a child hypothesis with token appended, sharing parent's KV blocks."""
         child = Sequence(
             parent.request_id,
-            parent.decoder_prompt_ids,
+            parent.decoder_token_ids,
             parent.encoder_token_ids,
             parent.sampling,
             parent.pixel_values,
