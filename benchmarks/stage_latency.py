@@ -9,8 +9,8 @@ compare.  Works for Florence-2 (all three stages) and BART (no vision stage).
              (generate N tokens - generate 1 token) / (N - 1) with EOS suppressed,
              so it includes the per-step logits processing / beam bookkeeping
 
-  PYTHONPATH=. python benchmarks/simple_run.py --backend fast
-  PYTHONPATH=. python benchmarks/simple_run.py --backend hf --model facebook/bart-large-cnn --enc-len 512
+  PYTHONPATH=. python benchmarks/stage_latency.py --backend fast
+  PYTHONPATH=. python benchmarks/stage_latency.py --backend hf --model facebook/bart-large-cnn --enc-len 512
 """
 
 import argparse

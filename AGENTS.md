@@ -73,7 +73,7 @@ fastencdec/
     loader.py          HF checkpoint -> model weights (concatenates fused q/k/v)
 examples/summarize.py
 examples/florence2.py
-benchmarks/simple_run.py           per-stage ms vs HF (vision / encode / decode step)
+benchmarks/stage_latency.py        per-stage ms vs HF (vision / encode / decode step)
 benchmarks/continuous_batching.py  mixed-length Florence-2 workload vs HF padded batches
 benchmarks/utils.py                shared timer, KV sizing, COCO images, HF decode kwargs
 tests/verify_parity.py             real-checkpoint parity vs HF
@@ -173,7 +173,7 @@ PYTHONPATH=. $P examples/florence2.py
 
 # benchmarks (run on GCP spot VMs via spot-bench-gcp, not on the dev laptop)
 # one backend per run: repeat each with --backend hf
-PYTHONPATH=. $P benchmarks/simple_run.py --backend fast
-PYTHONPATH=. $P benchmarks/simple_run.py --backend fast --model facebook/bart-large-cnn --enc-len 512
+PYTHONPATH=. $P benchmarks/stage_latency.py --backend fast
+PYTHONPATH=. $P benchmarks/stage_latency.py --backend fast --model facebook/bart-large-cnn --enc-len 512
 PYTHONPATH=. $P benchmarks/continuous_batching.py --backend fast --beamsearch 1   # and 4
 ```

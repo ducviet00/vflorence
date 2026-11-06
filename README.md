@@ -90,7 +90,7 @@ of 8, and 68-75% of its decoded positions are padding.
 | greedy | 14.2 s / 30.7 s (**2.16x**) | 12.6 s / 47.8 s (**3.79x**) |
 | beams=4 | 22.6 s / 69.8 s (**3.08x**) | 22.0 s / 146.8 s (**6.67x**) |
 
-**Per stage** (`benchmarks/simple_run.py`): batch 8; Florence-2-base with
+**Per stage** (`benchmarks/stage_latency.py`): batch 8; Florence-2-base with
 `<DETAILED_CAPTION>` (590 encoder tokens), BART-large-cnn with 512 encoder tokens.
 The decode step is averaged over 128 steps with EOS suppressed.
 
@@ -116,7 +116,7 @@ PYTHONPATH=. python tests/test_benchmarks.py        # benchmark helpers
 PYTHONPATH=. python tests/verify_parity.py          # real checkpoints (BART + Florence-2)
 
 # one backend per run; run with --backend fast and --backend hf and compare
-PYTHONPATH=. python benchmarks/simple_run.py --backend fast            # Florence-2: vision / encode / decode-step ms
-PYTHONPATH=. python benchmarks/simple_run.py --backend fast --model facebook/bart-large-cnn
+PYTHONPATH=. python benchmarks/stage_latency.py --backend fast         # Florence-2: vision / encode / decode-step ms
+PYTHONPATH=. python benchmarks/stage_latency.py --backend fast --model facebook/bart-large-cnn
 PYTHONPATH=. python benchmarks/continuous_batching.py --backend fast   # 32 mixed Florence-2 requests, 8 in flight (hf: padded batches of 8)
 ```
