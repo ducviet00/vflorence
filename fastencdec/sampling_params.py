@@ -66,7 +66,7 @@ class SamplingParams:
     def from_generation_config(
         cls,
         config,
-        eos_token_id: int | None = None,
+        eos_token_id: int | list[int] | None = None,
         decoder_prompt_len: int = 1,
     ) -> "SamplingParams":
         val = lambda x, default: default if x is None else x

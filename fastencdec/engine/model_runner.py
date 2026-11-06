@@ -204,9 +204,12 @@ class ModelRunner:
         if fresh:
             self._encode(fresh)
 
-        input_ids, positions = self._prepare(seqs)
-        with self._inductor_ctx(len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW):
-            return self.decode_fn(input_ids, positions)
+        try:
+            input_ids, positions = self._prepare(seqs)
+            with self._inductor_ctx(len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW):
+                return self.decode_fn(input_ids, positions)
+        finally:
+            set_context()
 
     def _inductor_ctx(self, freeze=True):
         """Freezing lets Inductor pack weights into oneDNN layouts; it only applies when compiled."""
