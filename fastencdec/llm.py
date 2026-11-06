@@ -45,26 +45,25 @@ class LLM:
 
         if self.multimodal:
             from transformers import AutoProcessor
-            from transformers import (
-                Florence2ForConditionalGeneration as HFFlorence2,
-            )
+            from transformers import Florence2ForConditionalGeneration as HFFlorence2
 
             self.processor = AutoProcessor.from_pretrained(model_path)
             self.tokenizer = self.processor.tokenizer
-            self.model = Florence2ForConditionalGeneration(hf_config)
-            load_hf_weights(self.model, model_path, hf_model_cls=HFFlorence2)
-            self.model.to(dtype)
+            self.model = load_hf_weights(
+                Florence2ForConditionalGeneration(hf_config),
+                model_path,
+                hf_model_cls=HFFlorence2,
+            ).to(dtype)
             text_config = hf_config.text_config
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-            self.model = BartForConditionalGeneration(hf_config)
-            load_hf_weights(self.model, model_path)
-            self.model.to(dtype)
+            self.model = load_hf_weights(
+                BartForConditionalGeneration(hf_config), model_path
+            ).to(dtype)
             text_config = hf_config
 
         self.decoder_start_token_id = text_config.decoder_start_token_id
         self.eos_token_id = text_config.eos_token_id
-
         self.generation_config = _load_generation_config(model_path)
         self.default_sampling_params = SamplingParams.from_generation_config(
             self.generation_config, self.eos_token_id
@@ -72,11 +71,9 @@ class LLM:
         self.engine = LLMEngine(self.model, config, eos_token_id=self.eos_token_id)
 
     def _decode(self, token_ids: list[int]) -> str:
-        """Decode token IDs to text, keeping special tokens (<loc_...>) for Florence-2."""
         return self.tokenizer.decode(token_ids, skip_special_tokens=not self.multimodal)
 
     def _parse_prompt(self, item):
-        """Extract (text, prompt_token_ids, image) from a str or vLLM-style dict."""
         if isinstance(item, str):
             return item, None, None
         if not isinstance(item, dict):
@@ -84,8 +81,7 @@ class LLM:
         text, token_ids = item.get("prompt"), item.get("prompt_token_ids")
         if text is None and token_ids is None:
             raise ValueError("prompt dict needs 'prompt' or 'prompt_token_ids'")
-        image = (item.get("multi_modal_data") or {}).get("image")
-        return text, token_ids, image
+        return text, token_ids, (item.get("multi_modal_data") or {}).get("image")
 
     @torch.no_grad()
     def generate(
@@ -103,12 +99,11 @@ class LLM:
         eos_ids = sampling_params.eos_ids() or (
             {self.eos_token_id} if self.eos_token_id is not None else set()
         )
+        decoder_ids = [self.decoder_start_token_id]
 
         records, engine_requests = [], []
         for item in prompts:
             encoder_prompt, encoder_ids, image = self._parse_prompt(item)
-            decoder_ids = [self.decoder_start_token_id]
-
             if self.multimodal:
                 if encoder_ids is not None:
                     raise ValueError(
@@ -138,21 +133,19 @@ class LLM:
                     )["input_ids"]
                 pixel_values = None
 
-            records.append((encoder_prompt, encoder_ids, decoder_ids))
+            records.append((encoder_prompt, encoder_ids))
             engine_requests.append((encoder_ids, decoder_ids, pixel_values))
 
         request_ids = self.engine.generate(engine_requests, sampling_params)
-
+        prompt_text = self._decode(decoder_ids)
         results = []
-        for request_id, (encoder_prompt, encoder_ids, decoder_ids) in zip(
-            request_ids, records
-        ):
+        for request_id, (encoder_prompt, encoder_ids) in zip(request_ids, records):
             token_ids = self.engine.results[request_id]
             finished = bool(token_ids) and token_ids[-1] in eos_ids
             results.append(
                 RequestOutput(
                     request_id=request_id,
-                    prompt=self._decode(decoder_ids),
+                    prompt=prompt_text,
                     prompt_token_ids=decoder_ids,
                     outputs=[
                         CompletionOutput(

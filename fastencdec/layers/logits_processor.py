@@ -3,14 +3,22 @@ import torch
 _NEG_INF = float("-inf")
 
 
+def _valid(tokens, vocab_size: int) -> list[int]:
+    if tokens is None:
+        return []
+    ids = [tokens] if isinstance(tokens, int) else tokens
+    return [t for t in ids if 0 <= t < vocab_size]
+
+
 def _repetition_penalty(scores: torch.Tensor, input_ids: torch.Tensor, penalty: float):
-    valid = input_ids >= 0
-    if not valid.any():
-        return
-    full = torch.zeros((scores.shape[0], scores.shape[1] + 1), dtype=torch.bool)
-    full.scatter_(1, (input_ids + 1).clamp_min(0), valid)
-    penalized = torch.where(scores < 0, scores * penalty, scores / penalty)
-    scores.copy_(torch.where(full[:, 1:], penalized, scores))
+    ids = input_ids.clamp_min(0)
+    tok = scores.gather(1, ids)
+    tok = torch.where(tok < 0, tok * penalty, tok / penalty)
+    if (input_ids < 0).any():
+        b, t = torch.where(input_ids >= 0)
+        scores[b, ids[b, t]] = tok[b, t]
+    else:
+        scores.scatter_(1, ids, tok)
 
 
 def _no_repeat_ngram(scores: torch.Tensor, input_ids: torch.Tensor, n: int):
@@ -19,68 +27,64 @@ def _no_repeat_ngram(scores: torch.Tensor, input_ids: torch.Tensor, n: int):
         return
     grams = input_ids.unfold(1, n, 1)
     match = (grams[..., :-1] == input_ids[:, cur_len - n + 1 :].unsqueeze(1)).all(-1)
-    match = match & (grams[..., -1] >= 0)
-    banned = torch.zeros_like(scores).scatter_reduce(
-        1, grams[..., -1].clamp_min(0), match.float(), reduce="amax", include_self=True
-    )
-    scores.masked_fill_(banned > 0, _NEG_INF)
+    b, g = torch.where(match & (grams[..., -1] >= 0))
+    if b.numel():
+        scores[b, grams[b, g, -1]] = _NEG_INF
 
 
 class LogitsProcessor:
-    def __init__(
-        self,
-        params,
-        *,
-        vocab_size: int,
-        max_length: int,
-        begin_index: int,
-    ):
+    def __init__(self, params, *, vocab_size: int, max_length: int, begin_index: int):
         self.params = params
         self.max_length = max_length
         self.begin_index = begin_index
-        self.eos_ids = sorted(t for t in params.eos_ids() if 0 <= t < vocab_size)
-        self.masks = {
-            name: torch.zeros(vocab_size, dtype=torch.bool)
-            for name in ("eos", "suppress", "begin_suppress", "bos_only", "eos_only")
-        }
-        self.masks["eos"][self.eos_ids] = True
-        if params.suppress_tokens:
-            valid = [t for t in params.suppress_tokens if 0 <= t < vocab_size]
-            self.masks["suppress"][valid] = True
-        if params.begin_suppress_tokens:
-            valid = [t for t in params.begin_suppress_tokens if 0 <= t < vocab_size]
-            self.masks["begin_suppress"][valid] = True
-        if params.forced_bos_token_id is not None:
-            self.masks["bos_only"][params.forced_bos_token_id] = True
-        if params.forced_eos_token_id is not None:
-            self.masks["eos_only"][params.forced_eos_token_id] = True
+        self.eos = _valid(sorted(params.eos_ids()), vocab_size)
+        self.suppress = _valid(params.suppress_tokens, vocab_size)
+        self.begin_suppress = _valid(params.begin_suppress_tokens, vocab_size)
+        self.forced_bos = _valid(params.forced_bos_token_id, vocab_size)
+        self.forced_eos = _valid(params.forced_eos_token_id, vocab_size)
 
     def __call__(
         self, input_ids: torch.Tensor, scores: torch.Tensor, lengths=None
     ) -> torch.Tensor:
         p = self.params
-        masks = self.masks
         if p.repetition_penalty != 1.0:
             _repetition_penalty(scores, input_ids, p.repetition_penalty)
         if p.no_repeat_ngram_size > 0:
             _no_repeat_ngram(scores, input_ids, p.no_repeat_ngram_size)
-        if lengths is None:
-            lengths = torch.full(
-                (input_ids.shape[0],), input_ids.shape[1], dtype=torch.long
+        cur = input_ids.shape[1]
+
+        def rows(cond: bool, pred):
+            if lengths is None:
+                return slice(None) if cond else None
+            sel = pred(lengths)
+            return sel.nonzero(as_tuple=True)[0][:, None] if sel.any() else None
+
+        if (
+            p.min_length > 0
+            and self.eos
+            and (r := rows(cur < p.min_length, lambda l: l < p.min_length)) is not None
+        ):
+            scores[r, self.eos] = _NEG_INF
+        if self.forced_bos and (r := rows(cur == 1, lambda l: l == 1)) is not None:
+            scores[r, :] = _NEG_INF
+            scores[r, self.forced_bos] = 0.0
+        if (
+            self.forced_eos
+            and (
+                r := rows(
+                    cur == self.max_length - 1, lambda l: l == self.max_length - 1
+                )
             )
-        col = lengths[:, None]
-        if p.min_length > 0 and self.eos_ids:
-            scores.masked_fill_((col < p.min_length) & masks["eos"], _NEG_INF)
-        if p.forced_bos_token_id is not None and (lengths == 1).any():
-            fill = torch.where(masks["bos_only"], 0.0, _NEG_INF)
-            scores.copy_(torch.where(col == 1, fill, scores))
-        if p.forced_eos_token_id is not None and (lengths == self.max_length - 1).any():
-            fill = torch.where(masks["eos_only"], 0.0, _NEG_INF)
-            scores.copy_(torch.where(col == self.max_length - 1, fill, scores))
-        if p.suppress_tokens:
-            scores.masked_fill_(masks["suppress"], _NEG_INF)
-        if p.begin_suppress_tokens:
-            scores.masked_fill_(
-                (col == self.begin_index) & masks["begin_suppress"], _NEG_INF
-            )
+            is not None
+        ):
+            scores[r, :] = _NEG_INF
+            scores[r, self.forced_eos] = 0.0
+        if self.suppress:
+            scores[:, self.suppress] = _NEG_INF
+        if (
+            self.begin_suppress
+            and (r := rows(cur == self.begin_index, lambda l: l == self.begin_index))
+            is not None
+        ):
+            scores[r, self.begin_suppress] = _NEG_INF
         return scores

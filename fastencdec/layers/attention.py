@@ -27,23 +27,19 @@ def stage_cross(layers, request_ids, block_size: int, isa: str):
     _, num_heads, head_dim = key0.shape
 
     table = torch.zeros(len(rows), max_pages, dtype=torch.int32)
+    slots_per_req = []
     pid = 0
-    for i, page_num in enumerate(pages):
+    for i, (length, page_num) in enumerate(zip(enc_lens, pages)):
         table[i, :page_num] = torch.arange(pid, pid + page_num, dtype=torch.int32)
+        slots_per_req.append(
+            torch.arange(pid * block_size, pid * block_size + length, dtype=torch.long)
+        )
         pid += page_num
 
-    slots_per_req = [
-        table[i, torch.arange(length) // block_size].long() * block_size
-        + (torch.arange(length) % block_size)
-        for i, length in enumerate(enc_lens)
-    ]
-    block_table = table[
-        torch.tensor([seen[rid] for rid in request_ids], dtype=torch.long)
-    ]
-    seq_lens = torch.tensor(
-        [enc_lens[seen[rid]] for rid in request_ids], dtype=torch.int32
-    )
-    query_start_loc = torch.arange(len(request_ids) + 1, dtype=torch.int32)
+    slots = slots_per_req[0] if len(rows) == 1 else torch.cat(slots_per_req)
+    row_idx = torch.tensor([seen[rid] for rid in request_ids], dtype=torch.long)
+    block_table = table[row_idx]
+    seq_lens = torch.tensor([enc_lens[i] for i in row_idx], dtype=torch.int32)
     metadata = vllm_cpu_attn.get_scheduler_metadata(
         num_reqs=len(request_ids),
         num_heads=num_heads,
@@ -51,7 +47,7 @@ def stage_cross(layers, request_ids, block_size: int, isa: str):
         head_dim=head_dim,
         seq_lens=seq_lens,
         dtype=dtype,
-        query_start_loc=query_start_loc,
+        query_start_loc=torch.arange(len(request_ids) + 1, dtype=torch.int32),
         causal=False,
         isa=isa,
         block_size=block_size,
@@ -63,9 +59,12 @@ def stage_cross(layers, request_ids, block_size: int, isa: str):
         attn = layer.encoder_attn
         k_cache = torch.zeros(shape, dtype=dtype)
         v_cache = torch.zeros(shape, dtype=dtype)
-        for rid, slots in zip(rows, slots_per_req):
-            k, v = attn.encoder_kv_cache[rid]
-            vllm_cpu_attn.reshape_and_cache(k, v, k_cache, v_cache, slots, isa=isa)
+        if len(rows) == 1:
+            k, v = attn.encoder_kv_cache[rows[0]]
+        else:
+            k = torch.cat([attn.encoder_kv_cache[r][0] for r in rows])
+            v = torch.cat([attn.encoder_kv_cache[r][1] for r in rows])
+        vllm_cpu_attn.reshape_and_cache(k, v, k_cache, v_cache, slots, isa=isa)
         attn.cross_staged = (k_cache, v_cache, block_table, seq_lens, metadata)
         attn.cross_staged_key = key
         staged.append(attn.cross_staged)

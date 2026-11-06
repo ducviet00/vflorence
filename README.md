@@ -74,22 +74,22 @@ and `vllm-cpu-attn 0.1.0` (`benchmarks/benchmark.py` and `benchmarks/benchmark_f
 
 | point | config | c4a-standard-8 (Axion) | c4-standard-8 (Xeon 8581C) |
 |---|---|---:|---:|
-| 128->512 | batch=1, beams=1, bf16 | 1.49x (128.6 / 86.2 tok/s) | 1.21x (74.6 / 61.6 tok/s) |
-| 128->512 | batch=8, beams=1, bf16 | 1.95x (545.1 / 279.7 tok/s) | 1.65x (428.6 / 260.2 tok/s) |
-| 128->512 | batch=8, beams=4, bf16 | 2.20x (263.9 / 119.7 tok/s) | 2.91x (235.0 / 80.7 tok/s) |
-| 128->512 | batch=8, beams=1, fp32 | 1.50x (334.6 / 223.0 tok/s) | 1.74x (220.6 / 127.0 tok/s) |
-| 512->128 | batch=1, beams=1, bf16 | 1.28x (111.5 / 87.2 tok/s) | 1.16x (68.4 / 58.8 tok/s) |
-| 512->128 | batch=8, beams=1, bf16 | 1.28x (294.6 / 229.8 tok/s) | 1.28x (301.9 / 235.3 tok/s) |
-| 512->128 | batch=8, beams=4, bf16 | 1.95x (207.4 / 106.4 tok/s) | 4.49x (191.1 / 42.5 tok/s) |
-| 512->128 | batch=8, beams=1, fp32 | 1.05x (156.6 / 149.9 tok/s) | 1.17x (118.8 / 101.9 tok/s) |
-| 256->256 | batch=1, beams=1, bf16 | 1.40x (126.6 / 90.1 tok/s) | 1.19x (72.9 / 61.3 tok/s) |
-| 256->256 | batch=8, beams=1, bf16 | 1.78x (506.5 / 284.3 tok/s) | 1.46x (388.1 / 266.0 tok/s) |
-| 256->256 | batch=8, beams=4, bf16 | 2.17x (264.4 / 121.7 tok/s) | 2.51x (223.9 / 89.3 tok/s) |
-| 256->256 | batch=8, beams=1, fp32 | 1.38x (290.3 / 209.9 tok/s) | 1.57x (202.6 / 128.7 tok/s) |
-| Florence-2 | batch=1, beams=1, bf16 | 2.28x (36.1 / 15.8 tok/s) | 3.12x (40.5 / 13.0 tok/s) |
-| Florence-2 | batch=8, beams=1, bf16 | 1.45x (156.2 / 107.9 tok/s) | 2.36x (175.6 / 74.4 tok/s) |
-| Florence-2 | batch=8, beams=4, bf16 | 2.10x (121.9 / 57.9 tok/s) | 3.95x (129.0 / 32.3 tok/s) |
-| Florence-2 | batch=8, beams=1, fp32 | 1.23x (76.0 / 62.0 tok/s) | 1.80x (63.2 / 35.1 tok/s) |
+| 128->512 | batch=1, beams=1, bf16 | 1.41x (127.2 / 90.4 tok/s) | 1.19x (73.4 / 61.7 tok/s) |
+| 128->512 | batch=8, beams=1, bf16 | 2.02x (545.7 / 270.0 tok/s) | 1.64x (422.8 / 258.3 tok/s) |
+| 128->512 | batch=8, beams=4, bf16 | 2.27x (267.4 / 117.8 tok/s) | 3.00x (240.8 / 80.2 tok/s) |
+| 128->512 | batch=8, beams=1, fp32 | 1.49x (320.3 / 215.2 tok/s) | 1.73x (215.5 / 124.7 tok/s) |
+| 512->128 | batch=1, beams=1, bf16 | 1.32x (113.7 / 85.9 tok/s) | 0.85x (49.0 / 57.9 tok/s) |
+| 512->128 | batch=8, beams=1, bf16 | 1.64x (364.2 / 222.7 tok/s) | 1.38x (317.6 / 229.3 tok/s) |
+| 512->128 | batch=8, beams=4, bf16 | 2.11x (210.2 / 99.8 tok/s) | 5.19x (206.0 / 39.7 tok/s) |
+| 512->128 | batch=8, beams=1, fp32 | 1.20x (185.2 / 153.8 tok/s) | 1.18x (116.9 / 98.9 tok/s) |
+| 256->256 | batch=1, beams=1, bf16 | 1.42x (127.3 / 89.5 tok/s) | 1.22x (71.7 / 58.5 tok/s) |
+| 256->256 | batch=8, beams=1, bf16 | 1.85x (506.3 / 273.9 tok/s) | 1.56x (412.0 / 264.2 tok/s) |
+| 256->256 | batch=8, beams=4, bf16 | 2.19x (260.7 / 118.9 tok/s) | 2.61x (230.3 / 88.1 tok/s) |
+| 256->256 | batch=8, beams=1, fp32 | 1.36x (307.2 / 225.2 tok/s) | 1.55x (195.6 / 126.4 tok/s) |
+| Florence-2 | batch=1, beams=1, bf16 | 2.02x (37.4 / 18.5 tok/s) | 3.20x (40.0 / 12.5 tok/s) |
+| Florence-2 | batch=8, beams=1, bf16 | 1.42x (164.7 / 116.1 tok/s) | 2.52x (179.2 / 71.2 tok/s) |
+| Florence-2 | batch=8, beams=4, bf16 | 2.11x (126.1 / 59.9 tok/s) | 3.97x (129.0 / 32.1 tok/s) |
+| Florence-2 | batch=8, beams=1, fp32 | 1.22x (78.3 / 64.1 tok/s) | 1.73x (59.3 / 34.2 tok/s) |
 
 ## Tests & Benchmarks
 

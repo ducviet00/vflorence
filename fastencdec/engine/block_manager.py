@@ -14,7 +14,7 @@ class BlockManager:
         self.num_blocks = num_blocks
         self.block_size = block_size
         self.blocks = [Block() for _ in range(num_blocks)]
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        self.reset()
 
     def reset(self) -> None:
         """Release every block after an aborted batch."""
@@ -24,21 +24,14 @@ class BlockManager:
 
     @property
     def num_free_blocks(self) -> int:
-        """Return the number of currently unallocated KV blocks."""
         return len(self.free_block_ids)
 
     def _allocate_block(self) -> int:
-        """Pop a free block ID and initialize its reference count to 1."""
         if not self.free_block_ids:
             raise RuntimeError("KV cache is full; increase num_blocks")
         block_id = self.free_block_ids.popleft()
         self.blocks[block_id].ref_count = 1
         return block_id
-
-    def _deallocate_block(self, block_id: int) -> None:
-        """Return a block with zero references back to the free pool."""
-        self.blocks[block_id].ref_count = 0
-        self.free_block_ids.append(block_id)
 
     def required_new_blocks(self, seqs) -> int:
         """Count new blocks and copy-on-write blocks needed to append 1 token per sequence."""
@@ -68,7 +61,8 @@ class BlockManager:
             try:
                 copy_block(block_id, new_block_id)
             except BaseException:
-                self._deallocate_block(new_block_id)
+                self.blocks[new_block_id].ref_count = 0
+                self.free_block_ids.append(new_block_id)
                 raise
             self.blocks[block_id].ref_count -= 1
             seq.block_table[idx] = new_block_id

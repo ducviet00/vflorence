@@ -50,8 +50,6 @@ class LLMEngine:
         if not self.is_finished():
             raise RuntimeError("finish pending requests before calling generate")
         params.validate()
-        if params.num_beams > self.scheduler.max_num_seqs:
-            raise ValueError("num_beams exceeds max_num_seqs")
         requests = list(requests)
         self.results.clear()
         if not requests:
@@ -64,12 +62,11 @@ class LLMEngine:
             raise ValueError("decoder prompt length must be uniform across the batch")
         if prompt_len != 1:
             raise ValueError("the decoder prompt must be a single token")
-        begin_index = prompt_len + int(params.forced_bos_token_id is not None)
         self._logits_processor = LogitsProcessor(
             params,
             vocab_size=self.runner.model.lm_head.out_features,
             max_length=prompt_len + params.max_tokens,
-            begin_index=begin_index,
+            begin_index=prompt_len + int(params.forced_bos_token_id is not None),
         )
 
         request_ids = []
@@ -79,11 +76,11 @@ class LLMEngine:
                 self._next_request_id += 1
                 self.scheduler.add(
                     Sequence(
-                        request_id=request_id,
-                        decoder_prompt_ids=decoder_token_ids,
-                        encoder_token_ids=encoder_token_ids,
-                        sampling=params,
-                        pixel_values=pixel_values,
+                        request_id,
+                        decoder_token_ids,
+                        encoder_token_ids,
+                        params,
+                        pixel_values,
                     )
                 )
                 request_ids.append(request_id)
@@ -106,22 +103,18 @@ class LLMEngine:
         set_context()
 
     def is_finished(self) -> bool:
-        """Return True when all scheduled requests have completed."""
         return self.scheduler.is_finished()
 
     def step(self) -> None:
-        """Schedule the active batch, run one model forward pass, and postprocess outputs."""
         seqs = self.scheduler.schedule()
         logits = self.runner.run(seqs)
         self._postprocess(seqs, logits)
 
     def run(self) -> None:
-        """Step the engine in a loop until all requests finish."""
         while not self.is_finished():
             self.step()
 
     def _postprocess(self, seqs, logits) -> None:
-        """Apply logits processors and advance greedy or beam-search sequences."""
         if not seqs:
             return
         if seqs[0].sampling.num_beams > 1:
@@ -130,27 +123,26 @@ class LLMEngine:
             self._postprocess_greedy(seqs, logits)
 
     def _postprocess_greedy(self, seqs, logits) -> None:
-        """Apply the logits processor and pick the argmax token per greedy sequence."""
         params = seqs[0].sampling
-        lens = [len(seq.token_ids) for seq in seqs]
-        width = max(lens)
-        if min(lens) == width:
-            histories = [seq.token_ids for seq in seqs]
-            lengths = None
-        else:
-            histories = [
-                [-1] * (width - len(seq.token_ids)) + seq.token_ids for seq in seqs
-            ]
-            lengths = torch.tensor(lens, dtype=torch.long)
-        input_ids = torch.tensor(histories, dtype=torch.long)
-        scores = self._logits_processor(input_ids, logits.float(), lengths)
+        lens = [len(s.token_ids) for s in seqs]
+        w = max(lens)
+        histories = [[-1] * (w - len(s.token_ids)) + s.token_ids for s in seqs]
+        lengths = None if min(lens) == w else torch.tensor(lens, dtype=torch.long)
+        scores = self._logits_processor(
+            torch.tensor(histories, dtype=torch.long), logits.float(), lengths
+        )
         for seq, token in zip(seqs, scores.argmax(dim=-1).tolist()):
-            self._sample(seq, params, token)
+            seq.token_ids.append(token)
+            if token in params.eos_ids() or seq.num_generated >= params.max_tokens:
+                self.scheduler.remove(seq)
+                self.block_manager.deallocate(seq)
+                self.runner.clear_request(seq.request_id)
+                self.results[seq.request_id] = seq.completion_token_ids
 
     def _postprocess_beam(self, seqs, logits) -> None:
         """Group beam requests by shape and run one batched topk per group."""
-        processor = self._logits_processor
         num_beams = seqs[0].sampling.num_beams
+        vocab = logits.shape[-1]
         by_request: dict[int, list[int]] = defaultdict(list)
         for index, seq in enumerate(seqs):
             by_request[seq.request_id].append(index)
@@ -160,66 +152,57 @@ class LLMEngine:
                 (request_id, indices)
             )
         for (beam_count, _), group in groups.items():
-            self._beam_group(seqs, group, num_beams, beam_count, processor, logits)
-
-    def _sample(self, seq: Sequence, params, token: int) -> None:
-        """Append a sampled token to seq and finalize the request if it hit EOS or max_tokens."""
-        seq.append_token(token)
-        if token in params.eos_ids() or seq.num_generated >= params.max_tokens:
-            self.scheduler.remove(seq)
-            self.block_manager.deallocate(seq)
-            self.runner.clear_request(seq.request_id)
-            self.results[seq.request_id] = seq.completion_token_ids
+            rows = [i for _, seq_indices in group for i in seq_indices]
+            input_ids = torch.tensor(
+                [seqs[i].token_ids for i in rows], dtype=torch.long
+            )
+            logprobs = self._logits_processor(
+                input_ids, torch.log_softmax(logits[rows].float(), dim=-1)
+            )
+            cumulative = torch.tensor(
+                [
+                    [seqs[i].cum_logprob for i in seq_indices]
+                    for _, seq_indices in group
+                ],
+                dtype=torch.float32,
+            ).unsqueeze(-1)
+            scores = (
+                logprobs.reshape(len(group), beam_count, vocab) + cumulative
+            ).reshape(len(group), -1)
+            params = seqs[group[0][1][0]].sampling
+            keep = min(max(2, 1 + len(params.eos_ids())) * num_beams, scores.shape[-1])
+            top_values, top_indices = torch.topk(scores, keep, dim=-1)
+            for (request_id, seq_indices), vals, idxs in zip(
+                group, top_values.tolist(), top_indices.tolist()
+            ):
+                self._beam_advance(
+                    request_id,
+                    [seqs[i] for i in seq_indices],
+                    params,
+                    [k // vocab for k in idxs],
+                    [k % vocab for k in idxs],
+                    vals,
+                )
 
     def _fork(self, parent: Sequence, token: int, score: float) -> Sequence:
         """Create a child beam hypothesis sharing parent's KV blocks with token appended."""
         child = Sequence(
-            request_id=parent.request_id,
-            decoder_prompt_ids=parent.decoder_prompt_ids,
-            encoder_token_ids=parent.encoder_token_ids,
-            sampling=parent.sampling,
-            pixel_values=parent.pixel_values,
+            parent.request_id,
+            parent.decoder_prompt_ids,
+            parent.encoder_token_ids,
+            parent.sampling,
+            parent.pixel_values,
         )
-        child.token_ids = parent.token_ids + [token]
+        child.token_ids = [*parent.token_ids, token]
         child.num_cached_tokens = parent.num_cached_tokens
         child.cum_logprob = score
         self.block_manager.fork(parent, child)
         return child
 
-    def _beam_group(
-        self, seqs, group, num_beams, beam_count, processor, logits
-    ) -> None:
-        """Run batched log_softmax, logits processing, and topk for same-shape beam requests."""
-        vocab = logits.shape[-1]
-        rows = [i for _, seq_indices in group for i in seq_indices]
-        input_ids = torch.tensor([seqs[i].token_ids for i in rows], dtype=torch.long)
-        logprobs = processor(input_ids, torch.log_softmax(logits[rows].float(), dim=-1))
-        cumulative = torch.tensor(
-            [[seqs[i].cum_logprob for i in seq_indices] for _, seq_indices in group],
-            dtype=torch.float32,
-        ).unsqueeze(-1)
-        scores = (logprobs.reshape(len(group), beam_count, vocab) + cumulative).reshape(
-            len(group), -1
-        )
-        params = seqs[group[0][1][0]].sampling
-        keep = min(max(2, 1 + len(params.eos_ids())) * num_beams, scores.shape[-1])
-        top_values, top_indices = torch.topk(scores, keep, dim=-1)
-        values, indices = top_values.tolist(), top_indices.tolist()
-        for row, (request_id, seq_indices) in enumerate(group):
-            self._beam_advance(
-                request_id,
-                [seqs[i] for i in seq_indices],
-                params,
-                [k // vocab for k in indices[row]],
-                [k % vocab for k in indices[row]],
-                values[row],
-            )
-
     def _beam_advance(self, request_id, beams, params, parents, tokens, top_values):
         """Fork winning finished/live beam continuations, free parents, and check stopping."""
         num_beams = params.num_beams
         eos_ids = params.eos_ids()
-
         stopped = [
             token in eos_ids or beams[parent].num_generated + 1 >= params.max_tokens
             for parent, token in zip(parents, tokens)
@@ -234,58 +217,31 @@ class LLMEngine:
         live = [
             self._fork(beams[parents[r]], tokens[r], top_values[r]) for r in live_ranks
         ]
-
         for beam in beams:
             self.scheduler.remove(beam)
             self.block_manager.deallocate(beam)
 
-        self._finished_beams[request_id].extend(new_finished)
-        self._prune_finished(request_id, params)
-        for child in live:
-            self.scheduler.add_running(child)
-
-        if not live or self._should_stop(request_id, params, live):
-            self._finish_beam_request(request_id, params)
-
-    def _prune_finished(self, request_id: int, params) -> None:
-        """Retain only the top num_beams finished hypotheses by length-penalized score."""
         finished = self._finished_beams[request_id]
-        if len(finished) <= params.num_beams:
-            return
-        finished.sort(
-            key=lambda seq: _length_penalized(seq, params.length_penalty), reverse=True
-        )
-        for seq in finished[params.num_beams :]:
-            self.block_manager.deallocate(seq)
-        del finished[params.num_beams :]
+        if new_finished:
+            finished.extend(new_finished)
+            finished.sort(
+                key=lambda s: _length_penalized(s, params.length_penalty), reverse=True
+            )
+            for s in finished[num_beams:]:
+                self.block_manager.deallocate(s)
+            del finished[num_beams:]
 
-    def _should_stop(self, request_id: int, params, live) -> bool:
-        """Return True when no live beam can beat the worst finished hypothesis (early_stopping=False)."""
-        finished = self._finished_beams[request_id]
-        if len(finished) < params.num_beams:
-            return False
-        worst_finished = min(
-            _length_penalized(seq, params.length_penalty) for seq in finished
-        )
-        best_possible = max(seq.cum_logprob for seq in live) / (
-            max(live[0].num_generated, 1) ** params.length_penalty
-        )
-        return worst_finished >= best_possible
-
-    def _finish_beam_request(self, request_id: int, params) -> None:
-        """Record the best finished beam for request_id and release all remaining resources."""
-        finished = self._finished_beams.pop(request_id, [])
-        live = [s for s in list(self.scheduler.running) if s.request_id == request_id]
-
-        best = max(
-            finished,
-            key=lambda seq: _length_penalized(seq, params.length_penalty),
-            default=None,
-        )
-
-        for seq in live:
-            self.scheduler.remove(seq)
-        for seq in finished + live:
-            self.block_manager.deallocate(seq)
-        self.runner.clear_request(request_id)
-        self.results[request_id] = best.completion_token_ids if best else []
+        if not live or (
+            len(finished) >= num_beams
+            and _length_penalized(finished[-1], params.length_penalty)
+            >= max(s.cum_logprob for s in live)
+            / (max(live[0].num_generated, 1) ** params.length_penalty)
+        ):
+            for s in self._finished_beams.pop(request_id, []) + live:
+                self.block_manager.deallocate(s)
+            self.runner.clear_request(request_id)
+            self.results[request_id] = (
+                finished[0].completion_token_ids if finished else []
+            )
+        else:
+            self.scheduler.running.extend(live)

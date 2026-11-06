@@ -32,30 +32,14 @@ class ModelRunner:
         self.block_size = block_manager.block_size
         self.dtype = dtype
         self.decoder_layers = list(model.decoder_layers)
-        self.cache_layers = [layer.self_attn for layer in self.decoder_layers]
-        self.num_heads = self.cache_layers[0].num_heads
-        self.head_dim = self.cache_layers[0].head_dim
+        self.num_heads = self.decoder_layers[0].self_attn.num_heads
+        self.head_dim = self.decoder_layers[0].self_attn.head_dim
         if self.head_dim not in attention.HEAD_DIMS:
             raise ValueError(
                 f"vllm-cpu-attn does not support head_dim={self.head_dim}; "
                 f"must be one of {sorted(attention.HEAD_DIMS)}"
             )
         self.isa = vllm_cpu_attn.get_isa(dtype, self.block_size, self.head_dim)
-        self._setup_compile(compile, compile_mm_encoder)
-
-        shape = (
-            block_manager.num_blocks,
-            self.num_heads,
-            self.block_size,
-            self.head_dim,
-        )
-        for layer in self.cache_layers:
-            layer.k_cache = torch.zeros(shape, dtype=dtype)
-            layer.v_cache = torch.zeros(shape, dtype=dtype)
-
-    def _setup_compile(self, compile: bool, compile_mm_encoder: bool) -> None:
-        """Build the frozen CPU graphs (and the vision tower) when enabled."""
-        self.compile_decoder = compile
         self.decode_step = None
         self.encode_fn = self.model.encode
         self.mm_step = None
@@ -75,11 +59,21 @@ class ModelRunner:
                     self.model.get_image_features, dynamic=False
                 )
 
+        shape = (
+            block_manager.num_blocks,
+            self.num_heads,
+            self.block_size,
+            self.head_dim,
+        )
+        for layer in self.decoder_layers:
+            layer.self_attn.k_cache = torch.zeros(shape, dtype=dtype)
+            layer.self_attn.v_cache = torch.zeros(shape, dtype=dtype)
+
     def _copy_block(self, src: int, dst: int) -> None:
         """Copy KV cache contents from block src to dst across all decoder layers."""
-        for layer in self.cache_layers:
-            layer.k_cache[dst].copy_(layer.k_cache[src])
-            layer.v_cache[dst].copy_(layer.v_cache[src])
+        for layer in self.decoder_layers:
+            layer.self_attn.k_cache[dst].copy_(layer.self_attn.k_cache[src])
+            layer.self_attn.v_cache[dst].copy_(layer.self_attn.v_cache[src])
 
     @torch.no_grad()
     def _encode(self, seqs) -> None:
@@ -93,18 +87,20 @@ class ModelRunner:
         encode = self.encode_fn
         for group in groups.values():
             ids = torch.tensor([s.encoder_token_ids for s in group], dtype=torch.long)
-            if group[0].pixel_values is None:
-                with self._inductor_ctx():
-                    hidden = encode(ids)
-            else:
-                px = torch.stack([s.pixel_values for s in group])
-                with self._inductor_ctx():
-                    embeds = (
-                        self.model.get_image_features(px)
-                        if self.mm_step is None
-                        else self.mm_step(px)
-                    )
-                    hidden = encode(ids, image_embeds=embeds)
+            px = (
+                None
+                if group[0].pixel_values is None
+                else torch.stack([s.pixel_values for s in group])
+            )
+            with self._inductor_ctx():
+                embeds = (
+                    None
+                    if px is None
+                    else (self.mm_step or self.model.get_image_features)(px)
+                )
+                hidden = (
+                    encode(ids) if embeds is None else encode(ids, image_embeds=embeds)
+                )
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
                 shape = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)
@@ -167,21 +163,20 @@ class ModelRunner:
             isa=self.isa,
             block_size=bs,
         )
-        fields = {
-            "context_lens": context_lens_t,
-            "block_tables": torch.tensor(padded, dtype=torch.int32),
-            "slot_mapping": torch.tensor(new_slots, dtype=torch.int64),
-            "query_start_loc": query_start_loc,
-            "self_metadata": self_metadata,
-            "isa": self.isa,
-            "cross_staged": attention.stage_cross(
+        set_context(
+            context_lens=context_lens_t,
+            block_tables=torch.tensor(padded, dtype=torch.int32),
+            slot_mapping=torch.tensor(new_slots, dtype=torch.int64),
+            query_start_loc=query_start_loc,
+            self_metadata=self_metadata,
+            isa=self.isa,
+            cross_staged=attention.stage_cross(
                 self.decoder_layers, [seq.request_id for seq in seqs], bs, self.isa
             ),
-        }
+        )
         return (
             torch.tensor(input_ids, dtype=torch.long),
             torch.tensor(positions, dtype=torch.long),
-            fields,
         )
 
     @torch.no_grad()
@@ -191,16 +186,15 @@ class ModelRunner:
         if fresh:
             self._encode(fresh)
 
-        input_ids, positions, fields = self._prepare(seqs)
-        set_context(**fields)
+        input_ids, positions = self._prepare(seqs)
         if self.decode_step is None:
             return self.model(input_ids, positions)
-        freeze = len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW
-        with self._inductor_ctx(freeze):
+        with self._inductor_ctx(len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW):
             return self.decode_step(input_ids, positions)
 
     def _inductor_ctx(self, freeze=True):
-        """Patch Inductor freezing on for compiled calls (packing at compile)."""
-        if self.compile_decoder:
-            return torch._inductor.config.patch(freezing=freeze)
-        return nullcontext()
+        return (
+            torch._inductor.config.patch(freezing=freeze)
+            if self.decode_step is not None
+            else nullcontext()
+        )

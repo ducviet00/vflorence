@@ -13,11 +13,9 @@ class Scheduler:
         self.running: list[Sequence] = []
 
     def is_finished(self) -> bool:
-        """Return True when both waiting and running queues are empty."""
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence) -> None:
-        """Enqueue a new request sequence into the waiting queue."""
         if seq.sampling.num_beams > self.max_num_seqs:
             raise ValueError(
                 f"num_beams ({seq.sampling.num_beams}) exceeds "
@@ -25,12 +23,7 @@ class Scheduler:
             )
         self.waiting.append(seq)
 
-    def add_running(self, seq: Sequence) -> None:
-        """Append a live beam hypothesis directly to the running batch."""
-        self.running.append(seq)
-
     def remove(self, seq: Sequence) -> None:
-        """Remove a finished or pruned sequence from the running batch."""
         self.running.remove(seq)
 
     def schedule(self) -> list[Sequence]:

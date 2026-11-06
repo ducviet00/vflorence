@@ -23,9 +23,13 @@ class SamplingParams:
         self.validate()
 
     def validate(self) -> None:
-        for name in ("max_tokens", "num_beams", "no_repeat_ngram_size", "min_length"):
+        for name, minimum in (
+            ("max_tokens", 1),
+            ("num_beams", 1),
+            ("no_repeat_ngram_size", 0),
+            ("min_length", 0),
+        ):
             value = getattr(self, name)
-            minimum = 1 if name in ("max_tokens", "num_beams") else 0
             if type(value) is not int or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
         for name in ("repetition_penalty", "length_penalty"):
@@ -59,7 +63,6 @@ class SamplingParams:
                 raise ValueError(f"{name} must be a single token ID")
 
     def eos_ids(self) -> set[int]:
-        """Return EOS token IDs normalized as a set."""
         if self.eos_token_id is None:
             return set()
         return (
@@ -75,14 +78,13 @@ class SamplingParams:
         eos_token_id: int | None = None,
         decoder_prompt_len: int = 1,
     ) -> "SamplingParams":
-        """Build SamplingParams from a HuggingFace GenerationConfig."""
         val = lambda x, default: default if x is None else x
-        if config.max_new_tokens is not None:
-            max_tokens = config.max_new_tokens
-        elif config.max_length is not None:
-            max_tokens = config.max_length - decoder_prompt_len
-        else:
-            max_tokens = 64
+        max_tokens = val(
+            config.max_new_tokens,
+            config.max_length - decoder_prompt_len
+            if config.max_length is not None
+            else 64,
+        )
 
         return cls(
             max_tokens=max_tokens,
