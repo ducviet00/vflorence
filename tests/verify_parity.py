@@ -9,8 +9,8 @@ element-by-element against ``generate``.
 BART uses fixed-length decoding (EOS suppressed) so both engines emit exactly
 ``--max-tokens`` tokens.  Florence-2 uses neutral decoding and stops at EOS.
 
-    PYTHONPATH=. python benchmarks/verify_parity.py
-    PYTHONPATH=. python benchmarks/verify_parity.py --dtype float32
+    PYTHONPATH=. python tests/verify_parity.py
+    PYTHONPATH=. python tests/verify_parity.py --dtype float32
 """
 
 import argparse

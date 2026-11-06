@@ -73,29 +73,36 @@ Reading order: `engine/sequence.py` -> `engine/block_manager.py` ->
 
 ## Benchmark
 
-Measured on GCP `c4a-standard-8` / `c4a-standard-16` (Arm Neoverse-V2, 8 / 16 cores) and
-`c4-standard-8` / `c4-standard-16` (Intel Xeon 8581C, 4 / 8 cores, AMX) with
-`torch 2.15.0+cpu`, `transformers 5.22.1`, and `vllm-cpu-attn 0.1.0`
-(`benchmarks/benchmark.py` and `benchmarks/benchmark_florence2.py`):
+Measured on GCP `c4a-standard-8` (Arm Neoverse-V2, 8 physical cores) and
+`c4-standard-8` (Intel Xeon 8581C, **4** physical cores, AMX) with
+`torch 2.15.0+cpu`, `transformers 5.22.1` and `vllm-cpu-attn 0.1.0`, bf16.
+Wall times are not like-for-like across the two machines: the Xeon box has
+half the physical cores. Cells are fast-encdec / HF (speedup).
 
-| point | config | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
-|---|---|---:|---:|---:|---:|
-| 128->512 | batch=1, beams=1, bf16 | 1.41x (127.2 / 90.4 tok/s) | 1.19x (73.4 / 61.7 tok/s) | 1.45x (166.5 / 114.8 tok/s) | 1.29x (118.6 / 91.9 tok/s) |
-| 128->512 | batch=8, beams=1, bf16 | 2.02x (545.7 / 270.0 tok/s) | 1.64x (422.8 / 258.3 tok/s) | 1.94x (679.3 / 349.9 tok/s) | 1.65x (707.3 / 429.9 tok/s) |
-| 128->512 | batch=8, beams=4, bf16 | 2.27x (267.4 / 117.8 tok/s) | 3.00x (240.8 / 80.2 tok/s) | 2.36x (369.3 / 156.6 tok/s) | 3.31x (403.4 / 121.8 tok/s) |
-| 128->512 | batch=8, beams=1, fp32 | 1.49x (320.3 / 215.2 tok/s) | 1.73x (215.5 / 124.7 tok/s) | 1.62x (494.0 / 305.3 tok/s) | 1.67x (388.0 / 232.5 tok/s) |
-| 512->128 | batch=1, beams=1, bf16 | 1.32x (113.7 / 85.9 tok/s) | 0.85x (49.0 / 57.9 tok/s) | 1.44x (155.4 / 108.2 tok/s) | 0.89x (77.0 / 86.9 tok/s) |
-| 512->128 | batch=8, beams=1, bf16 | 1.64x (364.2 / 222.7 tok/s) | 1.38x (317.6 / 229.3 tok/s) | 1.76x (544.4 / 308.5 tok/s) | 1.48x (569.0 / 385.6 tok/s) |
-| 512->128 | batch=8, beams=4, bf16 | 2.11x (210.2 / 99.8 tok/s) | 5.19x (206.0 / 39.7 tok/s) | 2.29x (329.4 / 143.8 tok/s) | 7.46x (380.0 / 50.9 tok/s) |
-| 512->128 | batch=8, beams=1, fp32 | 1.20x (185.2 / 153.8 tok/s) | 1.18x (116.9 / 98.9 tok/s) | 1.08x (254.1 / 234.3 tok/s) | 1.14x (213.1 / 187.4 tok/s) |
-| 256->256 | batch=1, beams=1, bf16 | 1.42x (127.3 / 89.5 tok/s) | 1.22x (71.7 / 58.5 tok/s) | 1.47x (166.8 / 113.5 tok/s) | 1.29x (116.1 / 89.9 tok/s) |
-| 256->256 | batch=8, beams=1, bf16 | 1.85x (506.3 / 273.9 tok/s) | 1.56x (412.0 / 264.2 tok/s) | 1.88x (663.3 / 352.7 tok/s) | 1.48x (661.4 / 446.2 tok/s) |
-| 256->256 | batch=8, beams=4, bf16 | 2.19x (260.7 / 118.9 tok/s) | 2.61x (230.3 / 88.1 tok/s) | 2.40x (377.2 / 157.4 tok/s) | 2.95x (398.5 / 134.9 tok/s) |
-| 256->256 | batch=8, beams=1, fp32 | 1.36x (307.2 / 225.2 tok/s) | 1.55x (195.6 / 126.4 tok/s) | 1.49x (453.7 / 304.7 tok/s) | 1.52x (357.6 / 235.2 tok/s) |
-| Florence-2 | batch=1, beams=1, bf16 | 2.02x (37.4 / 18.5 tok/s) | 3.20x (40.0 / 12.5 tok/s) | 2.63x (62.7 / 23.8 tok/s) | 3.87x (70.0 / 18.1 tok/s) |
-| Florence-2 | batch=8, beams=1, bf16 | 1.42x (164.7 / 116.1 tok/s) | 2.52x (179.2 / 71.2 tok/s) | 1.48x (243.3 / 164.2 tok/s) | 2.40x (305.5 / 127.1 tok/s) |
-| Florence-2 | batch=8, beams=4, bf16 | 2.11x (126.1 / 59.9 tok/s) | 3.97x (129.0 / 32.1 tok/s) | 2.15x (171.8 / 80.0 tok/s) | 3.87x (202.4 / 52.2 tok/s) |
-| Florence-2 | batch=8, beams=1, fp32 | 1.22x (78.3 / 64.1 tok/s) | 1.73x (59.3 / 34.2 tok/s) | 1.19x (133.3 / 111.9 tok/s) | 1.88x (121.2 / 64.5 tok/s) |
+**Continuous batching** (`benchmarks/continuous_batching.py`): 32 Florence-2-base
+requests (8 COCO images x `<OD>`, `<OCR>`, `<DETAILED_CAPTION>`,
+`<REFERRING_EXPRESSION_SEGMENTATION>`), 8 requests in flight, up to 512 tokens.
+fast-encdec refills a slot as soon as a request finishes; HF runs 4 padded batches
+of 8, and 68-75% of its decoded positions are padding.
+
+| config | c4a-standard-8 | c4-standard-8 |
+|---|---:|---:|
+| greedy | 14.2 s / 30.7 s (**2.16x**) | 12.6 s / 47.8 s (**3.79x**) |
+| beams=4 | 22.6 s / 69.8 s (**3.08x**) | 22.0 s / 146.8 s (**6.67x**) |
+
+**Per stage** (`benchmarks/simple_run.py`): batch 8; Florence-2-base with
+`<DETAILED_CAPTION>` (590 encoder tokens), BART-large-cnn with 512 encoder tokens.
+The decode step is averaged over 128 steps with EOS suppressed.
+
+| stage | c4a-standard-8 | c4-standard-8 |
+|---|---:|---:|
+| Florence-2 vision | 2195 / 2236 ms (1.02x) | 2771 / 4818 ms (1.74x) |
+| Florence-2 encode | 265 / 265 ms (1.00x) | 176 / 250 ms (1.42x) |
+| Florence-2 decode step, greedy | 6.74 / 11.46 ms (1.70x) | 7.49 / 12.77 ms (1.70x) |
+| Florence-2 decode step, beams=4 | 13.22 / 25.18 ms (1.90x) | 16.60 / 51.41 ms (3.10x) |
+| BART encode | 712 / 711 ms (1.00x) | 562 / 672 ms (1.20x) |
+| BART decode step, greedy | 13.30 / 24.92 ms (1.87x) | 19.76 / 28.44 ms (1.44x) |
+| BART decode step, beams=4 | 27.22 / 54.72 ms (2.01x) | 32.58 / 207.98 ms (6.38x) |
 
 ## Tests & Benchmarks
 
@@ -106,7 +113,10 @@ PYTHONPATH=. python tests/test_beam.py              # beam candidate selection
 PYTHONPATH=. python tests/test_logits_processor.py  # LogitsProcessor parity vs transformers
 PYTHONPATH=. python tests/test_engine.py            # lifetime, cache budgets, validation, loading
 PYTHONPATH=. python tests/test_benchmarks.py        # benchmark helpers
-PYTHONPATH=. python benchmarks/verify_parity.py     # real checkpoints (BART + Florence-2)
-PYTHONPATH=. python benchmarks/benchmark.py         # BART benchmark vs transformers
-PYTHONPATH=. python benchmarks/benchmark_florence2.py  # Florence-2 benchmark vs transformers
+PYTHONPATH=. python tests/verify_parity.py          # real checkpoints (BART + Florence-2)
+
+# one backend per run; run with --backend fast and --backend hf and compare
+PYTHONPATH=. python benchmarks/simple_run.py --backend fast            # Florence-2: vision / encode / decode-step ms
+PYTHONPATH=. python benchmarks/simple_run.py --backend fast --model facebook/bart-large-cnn
+PYTHONPATH=. python benchmarks/continuous_batching.py --backend fast   # 32 mixed Florence-2 requests, 8 in flight (hf: padded batches of 8)
 ```

@@ -73,14 +73,10 @@ fastencdec/
     loader.py          HF checkpoint -> model weights (concatenates fused q/k/v)
 examples/summarize.py
 examples/florence2.py
-benchmarks/benchmark.py
-benchmarks/benchmark_vllm.py
-benchmarks/benchmark_florence2.py
-benchmarks/verify_parity.py
-benchmarks/throughput.py
-benchmarks/gemm.py
-benchmarks/florence2_tasks.py
-benchmarks/profile_florence2.py
+benchmarks/simple_run.py           per-stage ms vs HF (vision / encode / decode step)
+benchmarks/continuous_batching.py  mixed-length Florence-2 workload vs HF padded batches
+benchmarks/utils.py                shared timer, KV sizing, COCO images, HF decode kwargs
+tests/verify_parity.py             real-checkpoint parity vs HF
 tests/test_parity.py
 tests/test_florence2.py
 tests/test_beam.py
@@ -168,14 +164,16 @@ PYTHONPATH=. $P tests/test_engine.py
 PYTHONPATH=. $P tests/test_benchmarks.py
 
 # real-checkpoint parity (fp32 exact; bf16 same length)
-PYTHONPATH=. $P benchmarks/verify_parity.py --dtype bfloat16
-TORCHINDUCTOR_COMPILE_THREADS=1 PYTHONPATH=. $P benchmarks/verify_parity.py --dtype float32
+PYTHONPATH=. $P tests/verify_parity.py --dtype bfloat16
+TORCHINDUCTOR_COMPILE_THREADS=1 PYTHONPATH=. $P tests/verify_parity.py --dtype float32
 
 # examples
 PYTHONPATH=. $P examples/summarize.py
 PYTHONPATH=. $P examples/florence2.py
 
 # benchmarks (run on GCP spot VMs via spot-bench-gcp, not on the dev laptop)
-PYTHONPATH=. $P benchmarks/benchmark.py --json bart.json
-PYTHONPATH=. $P benchmarks/benchmark_florence2.py --json florence2.json
+# one backend per run: repeat each with --backend hf
+PYTHONPATH=. $P benchmarks/simple_run.py --backend fast
+PYTHONPATH=. $P benchmarks/simple_run.py --backend fast --model facebook/bart-large-cnn --enc-len 512
+PYTHONPATH=. $P benchmarks/continuous_batching.py --backend fast --beamsearch 1   # and 4
 ```
