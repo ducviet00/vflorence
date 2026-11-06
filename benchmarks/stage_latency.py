@@ -17,122 +17,155 @@ import argparse
 
 import torch
 
-from benchmarks.utils import (
-    FLORENCE,
-    HF_DECODE,
-    IMAGES,
-    bart_prompt,
-    blocks_for,
-    load_image,
-    timed,
+from benchmarks.utils import load_image, timed
+
+PARAGRAPH = (
+    "Scientists at the university announced on Monday that they had discovered a "
+    "new species of butterfly in the Amazon rainforest. The insect has bright blue "
+    "wings and a wingspan of nearly ten centimetres. The city council approved the "
+    "new transit plan after a long debate. The plan adds two tram lines, extends "
+    "the bus network to the outer districts and introduces a single ticket for all "
+    "modes of transport from next year."
 )
 
 
-def make_inputs(args, florence: bool):
-    """Processor/tokenizer outputs for ``--batch`` identical-length requests."""
+def prepare_inputs(args, florence, dtype):
+    """Prepare token IDs and optional image pixels before any stage is timed."""
     from transformers import AutoProcessor, AutoTokenizer
 
     if florence:
         processor = AutoProcessor.from_pretrained(args.model)
-        images = [load_image(IMAGES[i % len(IMAGES)][0]) for i in range(args.batch)]
-        return processor(
+        image_urls = [
+            "http://images.cocodataset.org/val2017/000000039769.jpg",
+            "http://images.cocodataset.org/val2017/000000000139.jpg",
+            "http://images.cocodataset.org/val2017/000000000285.jpg",
+            "http://images.cocodataset.org/val2017/000000000632.jpg",
+            "http://images.cocodataset.org/val2017/000000000724.jpg",
+            "http://images.cocodataset.org/val2017/000000000776.jpg",
+            "http://images.cocodataset.org/val2017/000000000785.jpg",
+            "http://images.cocodataset.org/val2017/000000000802.jpg",
+        ]
+        images = [
+            load_image(image_urls[i % len(image_urls)]) for i in range(args.batch)
+        ]
+        inputs = processor(
             text=[args.prompt] * args.batch, images=images, return_tensors="pt"
         )
+        return inputs["input_ids"], inputs["pixel_values"].to(dtype)
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    text = bart_prompt(tokenizer, args.enc_len - 2)  # + BOS/EOS
-    return tokenizer([text] * args.batch, return_tensors="pt")
+    # Repeat token IDs directly, reserving space for BART's BOS and EOS tokens.
+    paragraph_ids = tokenizer(PARAGRAPH, add_special_tokens=False)["input_ids"]
+    content_length = args.enc_len - 2
+    copies = (content_length + len(paragraph_ids) - 1) // len(paragraph_ids)
+    token_ids = tokenizer.build_inputs_with_special_tokens(
+        (paragraph_ids * copies)[:content_length]
+    )
+    return torch.tensor([token_ids] * args.batch), None
 
 
-def fast_stages(args, inputs, florence, dtype):
+def fast_stages(args, input_token_ids, pixels, dtype):
     """Return {stage: callable} for fast-encdec."""
     from fastencdec import LLM, SamplingParams
     from fastencdec.config import default_block_size
 
     block_size = default_block_size()
-    seqs = args.batch * args.beams
+    num_sequences = args.batch * args.beams
+    # Decoder start token plus one copy-on-write block per sequence.
+    blocks_per_sequence = (args.max_tokens + 1 + block_size - 1) // block_size + 1
     llm = LLM(
         args.model,
-        num_blocks=blocks_for(seqs, args.max_tokens, block_size),
+        num_blocks=num_sequences * blocks_per_sequence,
         block_size=block_size,
-        max_num_seqs=seqs,
+        max_num_seqs=num_sequences,
         dtype=dtype,
     )
     runner = llm.engine.runner
-    ids = inputs["input_ids"]
-    px = inputs["pixel_values"].to(dtype) if florence else None
 
     @torch.no_grad()
     def vision():
         with runner._inductor_ctx():
-            return runner.image_fn(px)
+            return runner.image_fn(pixels)
 
-    image_embeds = vision() if florence else None
+    image_embeds = vision() if pixels is not None else None
 
     @torch.no_grad()
     def encode():
         with runner._inductor_ctx():
-            if florence:
-                return runner.encode_fn(ids, image_embeds=image_embeds)
-            return runner.encode_fn(ids)
+            if pixels is not None:
+                return runner.encode_fn(input_token_ids, image_embeds=image_embeds)
+            return runner.encode_fn(input_token_ids)
 
     requests = [
-        (row.tolist(), [llm.decoder_start_token_id], px[i] if florence else None)
-        for i, row in enumerate(ids)
+        (
+            row.tolist(),
+            [llm.decoder_start_token_id],
+            pixels[i] if pixels is not None else None,
+        )
+        for i, row in enumerate(input_token_ids)
     ]
 
+    @torch.no_grad()
     def generate(tokens):
         # min_length > max_tokens masks EOS for the whole run -> exactly ``tokens``
         params = SamplingParams(
             max_tokens=tokens, num_beams=args.beams, min_length=tokens + 1
         )
-        return lambda: llm.engine.generate(requests, params)
+        return llm.engine.generate(requests, params)
 
     stages = {"encode": encode}
-    if florence:
+    if pixels is not None:
         stages = {"vision": vision, **stages}
     return stages, generate
 
 
-def hf_stages(args, inputs, florence, dtype):
+def hf_stages(args, input_token_ids, pixels, dtype):
     """Return {stage: callable} for HuggingFace transformers."""
     from transformers import AutoModelForSeq2SeqLM, Florence2ForConditionalGeneration
 
-    cls = Florence2ForConditionalGeneration if florence else AutoModelForSeq2SeqLM
-    model = cls.from_pretrained(args.model, dtype=dtype).eval()
-    ids = inputs["input_ids"]
-    px = inputs["pixel_values"].to(dtype) if florence else None
+    model_class = (
+        Florence2ForConditionalGeneration
+        if pixels is not None
+        else AutoModelForSeq2SeqLM
+    )
+    model = model_class.from_pretrained(args.model, dtype=dtype).eval()
+    inputs = {"input_ids": input_token_ids}
+    if pixels is not None:
+        inputs["pixel_values"] = pixels
 
     @torch.no_grad()
     def vision():
-        return model.model.get_image_features(px).pooler_output
+        return model.model.get_image_features(pixels).pooler_output
 
-    image_embeds = vision() if florence else None
+    image_embeds = vision() if pixels is not None else None
 
     @torch.no_grad()
     def encode():
-        if not florence:
-            return model.model.encoder(input_ids=ids)
+        if pixels is None:
+            return model.model.encoder(input_ids=input_token_ids)
         # mirrors Florence2Model.forward: splice image features into prompt embeddings
-        embeds = model.model.get_input_embeddings()(ids)
-        mask = model.model.get_placeholder_mask(ids, embeds, image_embeds)
+        embeds = model.model.get_input_embeddings()(input_token_ids)
+        mask = model.model.get_placeholder_mask(input_token_ids, embeds, image_embeds)
         embeds = embeds.masked_scatter(mask, image_embeds.to(embeds.dtype))
         return model.model.language_model.encoder(inputs_embeds=embeds)
 
+    @torch.no_grad()
     def generate(tokens):
-        def run():
-            with torch.no_grad():
-                return model.generate(
-                    **inputs,
-                    max_new_tokens=tokens,
-                    min_new_tokens=tokens,  # EOS suppressed -> exactly ``tokens``
-                    num_beams=args.beams,
-                    **HF_DECODE,
-                )
-
-        return run
+        return model.generate(
+            **inputs,
+            max_new_tokens=tokens,
+            min_new_tokens=tokens,  # Suppress EOS so every request generates exactly N tokens.
+            num_beams=args.beams,
+            do_sample=False,
+            forced_bos_token_id=None,
+            forced_eos_token_id=None,
+            early_stopping=False,
+            length_penalty=1.0,
+            no_repeat_ngram_size=0,
+        )
 
     stages = {"encode": encode}
-    if florence:
+    if pixels is not None:
         stages = {"vision": vision, **stages}
     return stages, generate
 
@@ -140,7 +173,7 @@ def hf_stages(args, inputs, florence, dtype):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--backend", required=True, choices=["fast", "hf"])
-    ap.add_argument("--model", default=FLORENCE)
+    ap.add_argument("--model", default="florence-community/Florence-2-base")
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--beams", type=int, default=1, help="1 = greedy")
     ap.add_argument("--max-tokens", type=int, default=128, help="decode steps timed")
@@ -151,10 +184,15 @@ def main():
     ap.add_argument("--repeats", type=int, default=3)
     args = ap.parse_args()
     if (
-        min(args.batch, args.beams, args.warmup + args.repeats) < 1
+        min(args.batch, args.beams, args.repeats) < 1
+        or args.warmup < 0
+        or args.enc_len < 2
         or args.max_tokens < 2
     ):
-        ap.error("need --batch/--beams >= 1, --max-tokens >= 2, warmup+repeats >= 1")
+        ap.error(
+            "need --batch/--beams/--repeats >= 1, --max-tokens/--enc-len >= 2, "
+            "--warmup >= 0"
+        )
 
     import transformers
     from transformers import AutoConfig
@@ -162,21 +200,23 @@ def main():
     transformers.logging.set_verbosity_error()
     florence = AutoConfig.from_pretrained(args.model).model_type == "florence2"
     dtype = getattr(torch, args.dtype)
-    inputs = make_inputs(args, florence)
-    build = fast_stages if args.backend == "fast" else hf_stages
-    stages, generate = build(args, inputs, florence, dtype)
+    input_token_ids, pixels = prepare_inputs(args, florence, dtype)
+    if args.backend == "fast":
+        stages, generate = fast_stages(args, input_token_ids, pixels, dtype)
+    else:
+        stages, generate = hf_stages(args, input_token_ids, pixels, dtype)
 
     results = {
         name: timed(fn, args.warmup, args.repeats)[0] for name, fn in stages.items()
     }
-    first, _ = timed(generate(1), args.warmup, args.repeats)
-    full, _ = timed(generate(args.max_tokens), args.warmup, args.repeats)
+    first, _ = timed(lambda: generate(1), args.warmup, args.repeats)
+    full, _ = timed(lambda: generate(args.max_tokens), args.warmup, args.repeats)
     step = (full - first) / (args.max_tokens - 1)
 
     print(
         f"\nbackend={args.backend}  model={args.model}  dtype={args.dtype}  "
         f"threads={torch.get_num_threads()}  batch={args.batch}  beams={args.beams}  "
-        f"enc_len={inputs['input_ids'].shape[1]}  max_tokens={args.max_tokens}\n"
+        f"enc_len={input_token_ids.shape[1]}  max_tokens={args.max_tokens}\n"
     )
     print(f"{'stage':<26}{'ms':>10}")
     for name, seconds in results.items():
