@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import torch
 from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
@@ -96,9 +98,9 @@ class LLM:
             prompts = [prompts]
         if sampling_params is None:
             sampling_params = self.default_sampling_params
-        eos_ids = sampling_params.eos_ids() or (
-            {self.eos_token_id} if self.eos_token_id is not None else set()
-        )
+        if sampling_params.eos_token_id is None and self.eos_token_id is not None:
+            sampling_params = replace(sampling_params, eos_token_id=self.eos_token_id)
+        eos_ids = sampling_params.eos_ids()
         decoder_ids = [self.decoder_start_token_id]
 
         records, engine_requests = [], []

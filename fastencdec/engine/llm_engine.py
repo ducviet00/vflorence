@@ -29,7 +29,9 @@ def select_beam_candidates(
 class LLMEngine:
     """Step-level execution engine driving scheduling, forward passes, greedy, and beam search."""
 
-    def __init__(self, model, config: Config, eos_token_id: int | None = None):
+    def __init__(
+        self, model, config: Config, eos_token_id: int | list[int] | None = None
+    ):
         self.block_manager = BlockManager(config.num_blocks, config.block_size)
         self.runner = ModelRunner(
             model,
@@ -108,7 +110,7 @@ class LLMEngine:
         # shortcut: checks one request alone; a full batch can still run out.
         # Upgrade to preemption if that shows up in practice.
         bs = self.block_manager.block_size
-        worst = params.num_beams * -(-(1 + params.max_tokens) // bs)
+        worst = params.num_beams * -(-params.max_tokens // bs)
         if worst > self.block_manager.num_blocks:
             raise ValueError(
                 f"one request may need {worst} KV blocks but num_blocks is "
