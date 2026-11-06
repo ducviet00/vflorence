@@ -89,11 +89,11 @@ def run_ours(llm, workload, max_tokens, beams, warmup, repeats):
     )
 
     def once():
-        requests = llm.engine.generate(
+        completions = llm.engine.generate(
             [(ids, [llm.decoder_start_token_id], pixels) for ids, pixels in prepared],
             params,
         )
-        return [llm.engine.results[r] for r in requests]
+        return list(completions.values())
 
     return timed(once, warmup, repeats)
 

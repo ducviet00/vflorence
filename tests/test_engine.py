@@ -60,11 +60,11 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(
             llm.block_manager.num_free_blocks, llm.block_manager.num_blocks
         )
-        self.assertTrue(all(b.ref_count == 0 for b in llm.block_manager.blocks))
+        self.assertTrue(not any(llm.block_manager.ref_counts))
         self.assertFalse(llm._finished_beams)
         for layer in llm.runner.decoder_layers:
             self.assertFalse(layer.encoder_attn.encoder_kv_cache)
-            self.assertIsNone(layer.encoder_attn.cross_staged)
+        self.assertIsNone(llm.runner._cross_staged)
 
     def test_cache_failure_then_valid_batch(self):
         llm = engine(num_blocks=1)
@@ -133,26 +133,44 @@ class EngineTests(unittest.TestCase):
         expected = ForcedEOSTokenLogitsProcessor(3, [2, 3])(histories, scores.clone())
         self.assertTrue(torch.equal(processor(histories, scores.clone()), expected))
         llm = engine()
-        result = llm.results[llm.generate([REQUEST], params)[0]]
+        (result,) = llm.generate([REQUEST], params).values()
         self.assertEqual(len(result), 2)
         self.assertIn(result[-1], [2, 3])
 
-    def test_results_only_keep_latest_batch(self):
+    def test_generate_returns_each_batch_and_keeps_nothing(self):
         llm = engine()
         params = SamplingParams(max_tokens=2)
-        first = llm.results[llm.generate([REQUEST], params)[0]]
         for _ in range(4):
-            ids = llm.generate([REQUEST, REQUEST], params)
-            self.assertEqual(set(llm.results), set(ids))
-        self.assertEqual(len(first), 2)
-        llm.generate([], params)
-        self.assertFalse(llm.results)
+            completions = llm.generate([REQUEST, REQUEST], params)
+            self.assertEqual([len(t) for t in completions.values()], [2, 2])
+            self.assertFalse(llm.results)
+        self.assertEqual(llm.generate([], params), {})
+
+    def test_too_long_inputs_are_rejected_before_running(self):
+        llm = engine(num_blocks=64)
+        cases = [
+            (([3] * 129, [1], None), SamplingParams(max_tokens=2), "encoder prompt"),
+            (REQUEST, SamplingParams(max_tokens=129), "max_position_embeddings"),
+            (REQUEST, SamplingParams(max_tokens=128, num_beams=8), "KV blocks"),
+        ]
+        for request, params, message in cases:
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                llm.generate([request], params)
+            self.assert_clean(llm)
+        # The exact limits still run: 128 encoder tokens and 128 new tokens.
+        (tokens,) = llm.generate(
+            [([3] * 128, [1], None)], SamplingParams(max_tokens=128, min_length=200)
+        ).values()
+        self.assertEqual(len(tokens), 128)
 
     def test_shared_beams_fit_two_blocks(self):
         llm = engine(num_blocks=2)
         params = SamplingParams(max_tokens=3, num_beams=2, min_length=4)
-        ids = llm.generate([REQUEST], params)
-        self.assertEqual(len(llm.results[ids[0]]), 3)
+        (tokens,) = llm.generate([REQUEST], params).values()
+        self.assertEqual(len(tokens), 3)
         self.assert_clean(llm)
 
     def test_copy_budget_preserves_nonwriting_owner(self):
@@ -160,24 +178,48 @@ class EngineTests(unittest.TestCase):
         params = SamplingParams()
         parent = Sequence(0, [1], [3], params)
         blocks = llm.block_manager
-        blocks.ensure_capacity(parent, llm.runner._copy_block)
+        blocks.ensure_capacity(parent)
         parent.num_cached_tokens = 1
         children = [llm._fork(parent, 4, 0), llm._fork(parent, 5, 0)]
         self.assertEqual(blocks.required_new_blocks(children), 2)
         blocks.deallocate(parent)
         self.assertEqual(blocks.required_new_blocks(children), 1)
 
-    def test_failed_copy_returns_reserved_block(self):
-        llm = engine(num_blocks=2)
-        parent = Sequence(0, [1], [3], SamplingParams())
+    def test_copy_on_write_copies_each_pair(self):
+        llm = engine(num_blocks=4)
         blocks = llm.block_manager
-        blocks.ensure_capacity(parent, llm.runner._copy_block)
+        parent = Sequence(0, [1], [3], SamplingParams())
+        self.assertIsNone(blocks.ensure_capacity(parent))
         parent.num_cached_tokens = 1
         child = llm._fork(parent, 4, 0)
-        with self.assertRaisesRegex(RuntimeError, "copy failed"):
-            blocks.ensure_capacity(child, Mock(side_effect=RuntimeError("copy failed")))
-        self.assertEqual(blocks.num_free_blocks, 1)
-        self.assertEqual(blocks.blocks[parent.block_table[0]].ref_count, 2)
+        src = parent.block_table[0]
+        dst = blocks.ensure_capacity(child)[1]
+        self.assertEqual(child.block_table, [dst])
+        self.assertEqual((blocks.ref_counts[src], blocks.ref_counts[dst]), (1, 1))
+
+        caches = [
+            cache
+            for layer in llm.runner.decoder_layers
+            for cache in (layer.self_attn.k_cache, layer.self_attn.v_cache)
+        ]
+        for cache in caches:
+            for block in range(4):
+                cache[block] = block
+        llm.runner._copy_blocks([(0, 2), (1, 3)])
+        for cache in caches:
+            self.assertEqual([cache[b].unique().item() for b in range(4)], [0, 1, 0, 1])
+
+    def test_failed_copy_aborts_cleanly(self):
+        llm = engine()
+        params = SamplingParams(max_tokens=3, num_beams=2, min_length=4)
+        failing = patch.object(
+            llm.runner, "_copy_blocks", side_effect=RuntimeError("copy failed")
+        )
+        with failing, self.assertRaisesRegex(RuntimeError, "copy failed"):
+            llm.generate([REQUEST], params)
+        self.assert_clean(llm)
+        (tokens,) = llm.generate([REQUEST], params).values()
+        self.assertEqual(len(tokens), 3)
 
     def test_invalid_sampling_params(self):
         invalid = [
@@ -193,6 +235,8 @@ class EngineTests(unittest.TestCase):
             {"suppress_tokens": [-1]},
             {"suppress_tokens": 3},
             {"forced_bos_token_id": [1]},
+            {"forced_eos_token_id": [2, -1]},
+            {"early_stopping": "never"},
         ]
         for kwargs in invalid:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):

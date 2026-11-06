@@ -85,7 +85,7 @@ class BartEncoderSelfAttention(_BartAttentionBase):
 
 
 class BartDecoderSelfAttention(_BartAttentionBase):
-    """Paged causal multi-head self-attention for the decoder."""
+    """Paged causal multi-head self-attention for the decoder (one new token per sequence)."""
 
     fused_projections: ClassVar[dict[str, tuple[str, ...]]] = {
         "qkv_proj": ("q_proj", "k_proj", "v_proj")
@@ -135,8 +135,6 @@ class BartDecoderCrossAttention(_BartAttentionBase):
         # request_id -> (key, value) [enc_len, num_heads, head_dim]
         self.encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self.layer_idx = layer_idx
-        self.cross_staged = None
-        self.cross_staged_key = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Project decoder queries and attend over cached encoder K/V."""

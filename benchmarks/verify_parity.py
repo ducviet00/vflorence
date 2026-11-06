@@ -150,8 +150,7 @@ def florence(dtype, beams, max_tokens):
     engine_requests = [
         (ids, [llm.decoder_start_token_id], pixels) for ids, pixels in prepared
     ]
-    request_ids = llm.engine.generate(engine_requests, params)
-    ours = [llm.engine.results[r] for r in request_ids]
+    ours = list(llm.engine.generate(engine_requests, params).values())
 
     inputs = processor(
         text=FLORENCE_PROMPTS,

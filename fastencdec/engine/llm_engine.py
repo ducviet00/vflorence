@@ -39,34 +39,34 @@ class LLMEngine:
             compile_mm_encoder=config.compile_mm_encoder,
         )
         self.scheduler = Scheduler(config)
+        self.max_positions = model.config.get_text_config().max_position_embeddings
         self.eos_token_id = eos_token_id
         self.results: dict[int, list[int]] = {}
         self._finished_beams: dict[int, list[Sequence]] = defaultdict(list)
         self._logits_processor = None
         self._next_request_id = 0
 
-    def generate(self, requests, params) -> list[int]:
-        """Enqueue a batch of requests, run until all complete, and return their request IDs."""
+    def generate(self, requests, params) -> dict[int, list[int]]:
+        """Run a batch of (encoder_ids, decoder_ids, pixel_values) requests to completion.
+
+        Returns {request_id: generated token ids}, in request order.
+        """
         if not self.is_finished():
             raise RuntimeError("finish pending requests before calling generate")
         params.validate()
         requests = list(requests)
-        self.results.clear()
         if not requests:
-            return []
+            return {}
         if params.eos_token_id is None and self.eos_token_id is not None:
             params = replace(params, eos_token_id=self.eos_token_id)
+        self._validate(requests, params)
 
-        prompt_len = len(requests[0][1])
-        if any(len(decoder_ids) != prompt_len for _, decoder_ids, _ in requests):
-            raise ValueError("decoder prompt length must be uniform across the batch")
-        if prompt_len != 1:
-            raise ValueError("the decoder prompt must be a single token")
+        # Lengths count the single decoder start token, as transformers does.
         self._logits_processor = LogitsProcessor(
             params,
             vocab_size=self.runner.model.lm_head.out_features,
-            max_length=prompt_len + params.max_tokens,
-            begin_index=prompt_len + int(params.forced_bos_token_id is not None),
+            max_length=1 + params.max_tokens,
+            begin_index=1 + int(params.forced_bos_token_id is not None),
         )
 
         request_ids = []
@@ -88,7 +88,32 @@ class LLMEngine:
         except BaseException:
             self._abort(request_ids)
             raise
-        return request_ids
+        return {r: self.results.pop(r) for r in request_ids}
+
+    def _validate(self, requests, params) -> None:
+        """Reject requests that would crash or run out of KV cache mid-batch."""
+        if params.max_tokens > self.max_positions:
+            raise ValueError(
+                f"max_tokens ({params.max_tokens}) exceeds the model's "
+                f"max_position_embeddings ({self.max_positions})"
+            )
+        for encoder_ids, decoder_ids, _ in requests:
+            if len(decoder_ids) != 1:
+                raise ValueError("the decoder prompt must be a single token")
+            if len(encoder_ids) > self.max_positions:
+                raise ValueError(
+                    f"encoder prompt has {len(encoder_ids)} tokens; the model "
+                    f"supports at most {self.max_positions}"
+                )
+        # shortcut: checks one request alone; a full batch can still run out.
+        # Upgrade to preemption if that shows up in practice.
+        bs = self.block_manager.block_size
+        worst = params.num_beams * -(-(1 + params.max_tokens) // bs)
+        if worst > self.block_manager.num_blocks:
+            raise ValueError(
+                f"one request may need {worst} KV blocks but num_blocks is "
+                f"{self.block_manager.num_blocks}; increase num_blocks"
+            )
 
     def _abort(self, request_ids) -> None:
         """Discard a failed batch, including partially written decoder state."""
@@ -124,16 +149,19 @@ class LLMEngine:
 
     def _postprocess_greedy(self, seqs, logits) -> None:
         params = seqs[0].sampling
+        eos_ids = params.eos_ids()
         lens = [len(s.token_ids) for s in seqs]
         w = max(lens)
+        # Histories differ in length: left-pad with -1, which every logits rule ignores.
         histories = [[-1] * (w - len(s.token_ids)) + s.token_ids for s in seqs]
-        lengths = None if min(lens) == w else torch.tensor(lens, dtype=torch.long)
         scores = self._logits_processor(
-            torch.tensor(histories, dtype=torch.long), logits.float(), lengths
+            torch.tensor(histories, dtype=torch.long),
+            logits.float(),
+            torch.tensor(lens, dtype=torch.long),
         )
         for seq, token in zip(seqs, scores.argmax(dim=-1).tolist()):
             seq.token_ids.append(token)
-            if token in params.eos_ids() or seq.num_generated >= params.max_tokens:
+            if token in eos_ids or seq.num_generated >= params.max_tokens:
                 self.scheduler.remove(seq)
                 self.block_manager.deallocate(seq)
                 self.runner.clear_request(seq.request_id)
@@ -170,6 +198,8 @@ class LLMEngine:
                 logprobs.reshape(len(group), beam_count, vocab) + cumulative
             ).reshape(len(group), -1)
             params = seqs[group[0][1][0]].sampling
+            # Keep enough candidates that num_beams live ones remain after EOS
+            # candidates are set aside (same rule as transformers).
             keep = min(max(2, 1 + len(params.eos_ids())) * num_beams, scores.shape[-1])
             top_values, top_indices = torch.topk(scores, keep, dim=-1)
             for (request_id, seq_indices), vals, idxs in zip(
@@ -184,8 +214,10 @@ class LLMEngine:
                     vals,
                 )
 
-    def _fork(self, parent: Sequence, token: int, score: float) -> Sequence:
-        """Create a child beam hypothesis sharing parent's KV blocks with token appended."""
+    def _fork(
+        self, parent: Sequence, token: int, score: float, share_blocks: bool = True
+    ) -> Sequence:
+        """Create a child hypothesis with token appended, sharing parent's KV blocks."""
         child = Sequence(
             parent.request_id,
             parent.decoder_prompt_ids,
@@ -196,7 +228,8 @@ class LLMEngine:
         child.token_ids = [*parent.token_ids, token]
         child.num_cached_tokens = parent.num_cached_tokens
         child.cum_logprob = score
-        self.block_manager.fork(parent, child)
+        if share_blocks:
+            self.block_manager.fork(parent, child)
         return child
 
     def _beam_advance(self, request_id, beams, params, parents, tokens, top_values):
@@ -209,11 +242,12 @@ class LLMEngine:
         ]
         finished_ranks, live_ranks = select_beam_candidates(stopped, num_beams)
 
-        # Fork children before freeing parents so shared blocks stay alive.
+        # Finished hypotheses never decode again, so they need no KV blocks.
         new_finished = [
-            self._fork(beams[parents[r]], tokens[r], top_values[r])
+            self._fork(beams[parents[r]], tokens[r], top_values[r], share_blocks=False)
             for r in finished_ranks
         ]
+        # Fork live children before freeing parents so shared blocks stay alive.
         live = [
             self._fork(beams[parents[r]], tokens[r], top_values[r]) for r in live_ranks
         ]
@@ -221,23 +255,26 @@ class LLMEngine:
             self.scheduler.remove(beam)
             self.block_manager.deallocate(beam)
 
+        lp = params.length_penalty
         finished = self._finished_beams[request_id]
         if new_finished:
             finished.extend(new_finished)
-            finished.sort(
-                key=lambda s: _length_penalized(s, params.length_penalty), reverse=True
-            )
-            for s in finished[num_beams:]:
-                self.block_manager.deallocate(s)
+            finished.sort(key=lambda s: _length_penalized(s, lp), reverse=True)
             del finished[num_beams:]
 
-        if not live or (
+        # With num_beams finished, stop at once (early_stopping) or once no live
+        # beam can still beat the worst finished one.
+        done = not live or (
             len(finished) >= num_beams
-            and _length_penalized(finished[-1], params.length_penalty)
-            >= max(s.cum_logprob for s in live)
-            / (max(live[0].num_generated, 1) ** params.length_penalty)
-        ):
-            for s in self._finished_beams.pop(request_id, []) + live:
+            and (
+                params.early_stopping
+                or _length_penalized(finished[-1], lp)
+                >= max(_length_penalized(s, lp) for s in live)
+            )
+        )
+        if done:
+            self._finished_beams.pop(request_id, None)
+            for s in live:
                 self.block_manager.deallocate(s)
             self.runner.clear_request(request_id)
             self.results[request_id] = (

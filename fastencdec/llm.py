@@ -128,19 +128,24 @@ class LLM:
                         "images are only supported for Florence-2 checkpoints"
                     )
                 if encoder_ids is None:
+                    # Cut long text to the model's max length, like transformers pipelines.
                     encoder_ids = self.tokenizer(
-                        encoder_prompt, add_special_tokens=True, padding=False
+                        encoder_prompt,
+                        add_special_tokens=True,
+                        padding=False,
+                        truncation=True,
                     )["input_ids"]
                 pixel_values = None
 
             records.append((encoder_prompt, encoder_ids))
             engine_requests.append((encoder_ids, decoder_ids, pixel_values))
 
-        request_ids = self.engine.generate(engine_requests, sampling_params)
+        completions = self.engine.generate(engine_requests, sampling_params)
         prompt_text = self._decode(decoder_ids)
         results = []
-        for request_id, (encoder_prompt, encoder_ids) in zip(request_ids, records):
-            token_ids = self.engine.results[request_id]
+        for (request_id, token_ids), (encoder_prompt, encoder_ids) in zip(
+            completions.items(), records
+        ):
             finished = bool(token_ids) and token_ids[-1] in eos_ids
             results.append(
                 RequestOutput(

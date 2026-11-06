@@ -115,9 +115,8 @@ def count_generated(rows, pad_token_id) -> int:
 
 def ours_run(llm, prompts, params):
     """One generate; returns the number of tokens the engine decoded."""
-    llm.generate(prompts, params)
-    ids = sorted(llm.engine.results)[-len(prompts) :]
-    return sum(len(llm.engine.results[r]) for r in ids)
+    outputs = llm.generate(prompts, params)
+    return sum(len(o.outputs[0].token_ids) for o in outputs)
 
 
 def hf_run(hf, tokenizer, prompts, tokens, beams, warmup, repeats):

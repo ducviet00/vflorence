@@ -139,11 +139,12 @@ compiled graph.
    `[enc_len, num_heads, head_dim]`, filled once in `_encode`, shared by all
    beams of a request and freed in `ModelRunner.clear_request`. `stage_cross`
    packs the active requests into a paged cache (plus scheduler metadata) memoized
-   on `layer.cross_staged` keyed by `tuple(request_ids)`.
+   on `ModelRunner._cross_staged` keyed by `tuple(request_ids)`.
 5. **Beam search = sequences + block sharing.** Every beam is an ordinary
    `Sequence` with the request's `request_id`. `BlockManager.fork` shares the
    parent's blocks (`refcount++`); `BlockManager.ensure_capacity` copy-on-writes
-   any block that will be written while shared. Children are created **before**
+   any block that will be written while shared (it returns the `(src, dst)` pair;
+   `ModelRunner._copy_blocks` copies all of a step's pairs at once). Children are created **before**
    parents are freed.
 6. **Scheduling.** `Scheduler.schedule()` returns *all* running sequences each
    step, so a request's beams are never split. Keep `max_num_seqs >= num_beams`.

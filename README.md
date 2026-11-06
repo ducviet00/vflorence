@@ -56,6 +56,11 @@ parsed = llm.processor.post_process_generation(
 
 ## How It Works
 
+Reading order: `engine/sequence.py` -> `engine/block_manager.py` ->
+`engine/scheduler.py` -> `engine/model_runner.py` -> `engine/llm_engine.py` ->
+`layers/attention.py` -> `models/bart.py`. The step-by-step flow is in
+[AGENTS.md section 4](AGENTS.md#4-how-a-step-works).
+
 * **Paged KV cache.** Keys and values live in fixed blocks; beams share blocks and
   only copy one when they write into a shared block.
 * **Continuous batching.** Requests join and leave the running batch freely.

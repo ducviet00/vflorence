@@ -152,10 +152,10 @@ def main():
     )
 
     def run_ours():
-        reqs = llm.engine.generate(
+        completions = llm.engine.generate(
             [(ids, [llm.decoder_start_token_id], px) for ids, px in prepared], params
         )
-        return [llm.engine.results[r] for r in reqs]
+        return list(completions.values())
 
     ours_time, ours_out = timed(run_ours, args.warmup, args.repeats)
 

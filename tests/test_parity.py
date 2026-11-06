@@ -70,6 +70,39 @@ def main():
             assert b == s, (beams, i, b, s)
             print(f"[OK] batch-vs-single beams={beams} seq={i}: {b!r}")
 
+    # early_stopping: a small EOS bias plus min_length makes beams finish at
+    # different steps, so True and False give different outputs here.
+    # BART-large-CNN and Florence-2 ship with early_stopping=True.
+    with torch.no_grad():
+        hf.final_logits_bias[0, config.eos_token_id] += 0.2
+    with TemporaryDirectory() as tmpdir:
+        hf.save_pretrained(tmpdir)
+        tokenizer.save_pretrained(tmpdir)
+        llm = LLM(tmpdir, num_blocks=64, block_size=16)
+    for beams in (2, 4):
+        for early_stopping in (False, True):
+            params = SamplingParams(
+                max_tokens=12,
+                num_beams=beams,
+                min_length=4,
+                early_stopping=early_stopping,
+            )
+            ours = llm.generate(TEXT, sampling_params=params)[0].outputs[0].token_ids
+            with torch.no_grad():
+                ref = hf.generate(
+                    **inputs,
+                    max_new_tokens=12,
+                    num_beams=beams,
+                    early_stopping=early_stopping,
+                    min_length=4,
+                    do_sample=False,
+                    forced_bos_token_id=None,
+                    forced_eos_token_id=None,
+                )
+            ref_tokens = [t for t in ref[0].tolist()[1:] if t != config.pad_token_id]
+            assert ours == ref_tokens, (beams, early_stopping, ours, ref_tokens)
+            print(f"[OK] beams={beams} early_stopping={early_stopping}: {ours!r}")
+
 
 if __name__ == "__main__":
     main()

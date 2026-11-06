@@ -46,45 +46,36 @@ class LogitsProcessor:
     def __call__(
         self, input_ids: torch.Tensor, scores: torch.Tensor, lengths=None
     ) -> torch.Tensor:
+        """Apply every enabled rule in place, in transformers' order.
+
+        ``input_ids`` is [batch, width], left-padded with -1; ``lengths`` holds each
+        row's true length (default: every row is ``width`` long).
+        """
         p = self.params
+        if lengths is None:
+            lengths = torch.full((input_ids.shape[0],), input_ids.shape[1])
         if p.repetition_penalty != 1.0:
             _repetition_penalty(scores, input_ids, p.repetition_penalty)
         if p.no_repeat_ngram_size > 0:
             _no_repeat_ngram(scores, input_ids, p.no_repeat_ngram_size)
-        cur = input_ids.shape[1]
 
-        def rows(cond: bool, pred):
-            if lengths is None:
-                return slice(None) if cond else None
-            sel = pred(lengths)
-            return sel.nonzero(as_tuple=True)[0][:, None] if sel.any() else None
+        def rows(mask: torch.Tensor) -> torch.Tensor:
+            return mask.nonzero()  # [k, 1]: indexes rows, broadcasts over columns
 
-        if (
-            p.min_length > 0
-            and self.eos
-            and (r := rows(cur < p.min_length, lambda l: l < p.min_length)) is not None
-        ):
-            scores[r, self.eos] = _NEG_INF
-        if self.forced_bos and (r := rows(cur == 1, lambda l: l == 1)) is not None:
-            scores[r, :] = _NEG_INF
-            scores[r, self.forced_bos] = 0.0
-        if (
-            self.forced_eos
-            and (
-                r := rows(
-                    cur == self.max_length - 1, lambda l: l == self.max_length - 1
-                )
-            )
-            is not None
-        ):
-            scores[r, :] = _NEG_INF
-            scores[r, self.forced_eos] = 0.0
+        if p.min_length > 0 and self.eos:
+            scores[rows(lengths < p.min_length), self.eos] = _NEG_INF
+        if self.forced_bos:
+            _force(scores, rows(lengths == 1), self.forced_bos)
+        if self.forced_eos:
+            _force(scores, rows(lengths == self.max_length - 1), self.forced_eos)
         if self.suppress:
             scores[:, self.suppress] = _NEG_INF
-        if (
-            self.begin_suppress
-            and (r := rows(cur == self.begin_index, lambda l: l == self.begin_index))
-            is not None
-        ):
-            scores[r, self.begin_suppress] = _NEG_INF
+        if self.begin_suppress:
+            scores[rows(lengths == self.begin_index), self.begin_suppress] = _NEG_INF
         return scores
+
+
+def _force(scores: torch.Tensor, rows: torch.Tensor, tokens: list[int]) -> None:
+    """Make ``tokens`` the only allowed choice in ``rows``."""
+    scores[rows[:, 0]] = _NEG_INF
+    scores[rows, tokens] = 0.0

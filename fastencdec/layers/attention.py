@@ -7,39 +7,34 @@ HEAD_DIMS = {32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 512}
 
 
 def stage_cross(layers, request_ids, block_size: int, isa: str):
-    """Stage every decoder layer's encoder K/V into a paged cache."""
-    key = tuple(request_ids)
-    if all(
-        l.encoder_attn.cross_staged is not None
-        and l.encoder_attn.cross_staged_key == key
-        for l in layers
-    ):
-        return [l.encoder_attn.cross_staged for l in layers]
+    """Pack each decoder layer's dense encoder K/V into a paged cache for this step.
 
+    ``request_ids`` has one entry per running sequence; beams of one request repeat
+    its id and share one copy of its encoder K/V.
+    """
     cache0 = layers[0].encoder_attn.encoder_kv_cache
-    rows = list(dict.fromkeys(request_ids))
-    seen = {rid: i for i, rid in enumerate(rows)}
-    enc_lens = [cache0[rid][0].shape[0] for rid in rows]
+    unique_ids = list(dict.fromkeys(request_ids))
+    row_of = {rid: i for i, rid in enumerate(unique_ids)}
+    enc_lens = [cache0[rid][0].shape[0] for rid in unique_ids]
     pages = [(length + block_size - 1) // block_size for length in enc_lens]
-    max_pages, total = max(pages), sum(pages)
-    key0 = cache0[rows[0]][0]
-    dtype = key0.dtype
-    _, num_heads, head_dim = key0.shape
+    _, num_heads, head_dim = cache0[unique_ids[0]][0].shape
+    dtype = cache0[unique_ids[0]][0].dtype
 
-    table = torch.zeros(len(rows), max_pages, dtype=torch.int32)
-    slots_per_req = []
-    pid = 0
-    for i, (length, page_num) in enumerate(zip(enc_lens, pages)):
-        table[i, :page_num] = torch.arange(pid, pid + page_num, dtype=torch.int32)
-        slots_per_req.append(
-            torch.arange(pid * block_size, pid * block_size + length, dtype=torch.long)
-        )
-        pid += page_num
+    # Page layout: each request gets consecutive pages; slots are where its tokens go.
+    table = torch.zeros(len(unique_ids), max(pages), dtype=torch.int32)
+    slots = []
+    next_page = 0
+    for i, (length, num_pages) in enumerate(zip(enc_lens, pages)):
+        table[i, :num_pages] = torch.arange(next_page, next_page + num_pages)
+        start = next_page * block_size
+        slots.append(torch.arange(start, start + length, dtype=torch.long))
+        next_page += num_pages
+    slots = torch.cat(slots)
 
-    slots = slots_per_req[0] if len(rows) == 1 else torch.cat(slots_per_req)
-    row_idx = torch.tensor([seen[rid] for rid in request_ids], dtype=torch.long)
-    block_table = table[row_idx]
-    seq_lens = torch.tensor([enc_lens[i] for i in row_idx], dtype=torch.int32)
+    # Per-sequence views: beams point at their request's row.
+    rows = torch.tensor([row_of[rid] for rid in request_ids], dtype=torch.long)
+    block_table = table[rows]
+    seq_lens = torch.tensor([enc_lens[i] for i in rows], dtype=torch.int32)
     metadata = vllm_cpu_attn.get_scheduler_metadata(
         num_reqs=len(request_ids),
         num_heads=num_heads,
@@ -53,21 +48,17 @@ def stage_cross(layers, request_ids, block_size: int, isa: str):
         block_size=block_size,
     )
 
-    shape = (total, num_heads, block_size, head_dim)
+    shape = (next_page, num_heads, block_size, head_dim)
     staged = []
     for layer in layers:
-        attn = layer.encoder_attn
+        cache = layer.encoder_attn.encoder_kv_cache
+        k = torch.cat([cache[rid][0] for rid in unique_ids])
+        v = torch.cat([cache[rid][1] for rid in unique_ids])
+        # zeros, not empty: the kernel reads whole pages, including the unused tail.
         k_cache = torch.zeros(shape, dtype=dtype)
         v_cache = torch.zeros(shape, dtype=dtype)
-        if len(rows) == 1:
-            k, v = attn.encoder_kv_cache[rows[0]]
-        else:
-            k = torch.cat([attn.encoder_kv_cache[r][0] for r in rows])
-            v = torch.cat([attn.encoder_kv_cache[r][1] for r in rows])
         vllm_cpu_attn.reshape_and_cache(k, v, k_cache, v_cache, slots, isa=isa)
-        attn.cross_staged = (k_cache, v_cache, block_table, seq_lens, metadata)
-        attn.cross_staged_key = key
-        staged.append(attn.cross_staged)
+        staged.append((k_cache, v_cache, block_table, seq_lens, metadata))
     return staged
 
 
@@ -88,6 +79,8 @@ def decoder_self_attention(
         key, value, k_cache, v_cache, ctx.slot_mapping, isa=ctx.isa
     )
     out = torch.empty_like(query)
+    # causal=False is still causal: each sequence queries only its newest token,
+    # and the cache holds nothing after it.
     vllm_cpu_attn.attention_with_kv_cache(
         query,
         k_cache,

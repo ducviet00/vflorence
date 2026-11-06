@@ -58,11 +58,11 @@ def make_runner(engine, args, dtype, workload):
         )
 
         def run():
-            reqs = llm.engine.generate(
+            completions = llm.engine.generate(
                 [(ids, [llm.decoder_start_token_id], px) for ids, px in prepared],
                 params,
             )
-            return [llm.engine.results[r] for r in reqs]
+            return list(completions.values())
 
         return run
 
