@@ -14,51 +14,54 @@ import argparse
 
 import torch
 
-from benchmarks.utils import (
-    FLORENCE,
-    HF_DECODE,
-    IMAGES,
-    blocks_for,
-    load_image,
-    strip_hf,
-    timed,
-)
+from benchmarks.utils import load_image, timed
+
+IMAGE_URLs = [  # (image URL, referring expression)
+    ("http://images.cocodataset.org/val2017/000000039769.jpg", "the cat on the left"),
+    ("http://images.cocodataset.org/val2017/000000000139.jpg", "the television"),
+    ("http://images.cocodataset.org/val2017/000000000285.jpg", "the bear"),
+    ("http://images.cocodataset.org/val2017/000000000632.jpg", "the bed"),
+    ("http://images.cocodataset.org/val2017/000000000724.jpg", "the stop sign"),
+    ("http://images.cocodataset.org/val2017/000000000776.jpg", "the teddy bear"),
+    ("http://images.cocodataset.org/val2017/000000000785.jpg", "the skier"),
+    ("http://images.cocodataset.org/val2017/000000000802.jpg", "the oven"),
+]
 
 TASKS = ["<OD>", "<OCR>", "<DETAILED_CAPTION>", "<REFERRING_EXPRESSION_SEGMENTATION>"]
 
 
-def make_workload(num_req: int):
-    """Request i: image (i // 4) % 8, task i % 4 -> every 8 requests mix all tasks."""
-    images = {cid: load_image(cid) for cid, _ in IMAGES}
-    workload = []
-    for i in range(num_req):
-        cid, phrase = IMAGES[(i // len(TASKS)) % len(IMAGES)]
+def prepare_inputs(processor, num_requests):
+    """Cycle through four tasks per image; process each request before timing."""
+    images = {}
+    labels, input_token_ids, pixels = [], [], []
+    for i in range(num_requests):
+        url, phrase = IMAGE_URLs[(i // len(TASKS)) % len(IMAGE_URLs)]
         task = TASKS[i % len(TASKS)]
-        prompt = task + phrase if task.startswith("<REFERRING") else task
-        workload.append((task, cid, prompt, images[cid]))
-    return workload
+        prompt = (
+            task + phrase if task == "<REFERRING_EXPRESSION_SEGMENTATION>" else task
+        )
+        if url not in images:
+            images[url] = load_image(url)
+        inputs = processor(text=prompt, images=images[url], return_tensors="pt")
+        labels.append((task, url.rsplit("/", 1)[-1]))
+        input_token_ids.append(inputs["input_ids"][0].tolist())
+        pixels.append(inputs["pixel_values"][0])
+    return labels, input_token_ids, pixels
 
 
-def run_fast(args, workload, dtype):
-    from transformers import AutoProcessor
-
+def run_fast(args, input_token_ids, pixels, dtype):
     from fastencdec import LLM, SamplingParams
     from fastencdec.config import default_block_size
 
     block_size = default_block_size()
-    processor = AutoProcessor.from_pretrained(args.model)
-    prepared = []
-    for _, _, prompt, image in workload:
-        inputs = processor(text=prompt, images=image, return_tensors="pt")
-        prepared.append((inputs["input_ids"][0].tolist(), inputs["pixel_values"][0]))
+    num_sequences = args.max_num_seq * args.beamsearch
+    # Include the decoder start token and one extra block per beam for copy-on-write.
+    blocks_per_sequence = (args.max_tokens + 1 + block_size - 1) // block_size + 1
     llm = LLM(
         args.model,
-        num_blocks=blocks_for(
-            args.max_num_seq * args.beamsearch, args.max_tokens, block_size
-        ),
+        num_blocks=num_sequences * blocks_per_sequence,
         block_size=block_size,
-        # max_num_seqs counts sequences (beams), so scale to keep max_num_seq requests in flight
-        max_num_seqs=args.max_num_seq * args.beamsearch,
+        max_num_seqs=num_sequences,
         dtype=dtype,
     )
     params = SamplingParams(
@@ -66,48 +69,64 @@ def run_fast(args, workload, dtype):
         num_beams=args.beamsearch,
         eos_token_id=llm.eos_token_id,
     )
-    requests = [(ids, [llm.decoder_start_token_id], px) for ids, px in prepared]
+    requests = [
+        (ids, [llm.decoder_start_token_id], image_pixels)
+        for ids, image_pixels in zip(input_token_ids, pixels)
+    ]
 
     def once():
         return list(llm.engine.generate(requests, params).values())
 
     seconds, rows = timed(once, args.warmup, args.repeats)
-    return seconds, rows, [0] * len(rows), processor.tokenizer
+    return seconds, rows, [0] * len(rows)
 
 
-def run_hf(args, workload, dtype):
-    from transformers import AutoProcessor
-    from transformers import Florence2ForConditionalGeneration as HFModel
+def run_hf(args, input_token_ids, pixels, dtype, tokenizer):
+    from transformers import Florence2ForConditionalGeneration
 
-    processor = AutoProcessor.from_pretrained(args.model)
-    model = HFModel.from_pretrained(args.model, dtype=dtype).eval()
-    chunks = [
-        processor(
-            text=[w[2] for w in workload[i : i + args.max_num_seq]],
-            images=[w[3] for w in workload[i : i + args.max_num_seq]],
-            padding=True,
-            return_tensors="pt",
+    model = Florence2ForConditionalGeneration.from_pretrained(
+        args.model, dtype=dtype
+    ).eval()
+    batches = []
+    for start in range(0, len(input_token_ids), args.max_num_seq):
+        end = start + args.max_num_seq
+        batch = tokenizer.pad(
+            {"input_ids": input_token_ids[start:end]}, padding=True, return_tensors="pt"
         )
-        for i in range(0, len(workload), args.max_num_seq)
-    ]
+        batch["pixel_values"] = torch.stack(pixels[start:end]).to(dtype)
+        batches.append(batch)
 
+    @torch.no_grad()
     def once():
-        rows, pads = [], []
-        with torch.no_grad():
-            for inputs in chunks:
-                out = model.generate(
-                    **inputs,
-                    max_new_tokens=args.max_tokens,
-                    num_beams=args.beamsearch,
-                    **HF_DECODE,
-                )
-                r, p = strip_hf(out, processor.tokenizer.pad_token_id)
-                rows += r
-                pads += p
-        return rows, pads
+        return [
+            model.generate(
+                **batch,
+                max_new_tokens=args.max_tokens,
+                num_beams=args.beamsearch,
+                # Override checkpoint defaults to match fast-encdec's decoding.
+                do_sample=False,
+                forced_bos_token_id=None,
+                forced_eos_token_id=None,
+                early_stopping=False,
+                length_penalty=1.0,
+                no_repeat_ngram_size=0,
+            )
+            for batch in batches
+        ]
 
-    seconds, (rows, pads) = timed(once, args.warmup, args.repeats)
-    return seconds, rows, pads, processor.tokenizer
+    seconds, outputs = timed(once, args.warmup, args.repeats)
+    rows, padding = [], []
+    for output in outputs:
+        for row in output.tolist():
+            tokens = row[
+                1:
+            ]  # HF includes the decoder start token; fast-encdec does not.
+            length = len(tokens)
+            while tokens and tokens[-1] == tokenizer.pad_token_id:
+                tokens.pop()
+            rows.append(tokens)
+            padding.append(length - len(tokens))
+    return seconds, rows, padding
 
 
 def main():
@@ -125,18 +144,27 @@ def main():
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=1)
-    ap.add_argument("--model", default=FLORENCE)
+    ap.add_argument("--model", default="florence-community/Florence-2-base")
     args = ap.parse_args()
     if args.num_req < 1 or args.max_num_seq < 1 or args.beamsearch < 1:
         ap.error("--num-req, --max-num-seq and --beamsearch must be >= 1")
 
+    if args.max_tokens < 1 or args.warmup < 0 or args.repeats < 1:
+        ap.error("need --max-tokens >= 1, --warmup >= 0 and --repeats >= 1")
+
     import transformers
+    from transformers import AutoProcessor
 
     transformers.logging.set_verbosity_error()
     dtype = getattr(torch, args.dtype)
-    workload = make_workload(args.num_req)
-    run = run_fast if args.backend == "fast" else run_hf
-    seconds, rows, pads, tokenizer = run(args, workload, dtype)
+
+    processor = AutoProcessor.from_pretrained(args.model)
+    tokenizer = processor.tokenizer
+    labels, input_token_ids, pixels = prepare_inputs(processor, args.num_req)
+    if args.backend == "fast":
+        seconds, rows, pads = run_fast(args, input_token_ids, pixels, dtype)
+    else:
+        seconds, rows, pads = run_hf(args, input_token_ids, pixels, dtype, tokenizer)
 
     print(
         f"\nbackend={args.backend}  model={args.model}  dtype={args.dtype}  "
@@ -144,13 +172,13 @@ def main():
         f"max_num_seq={args.max_num_seq}  beams={args.beamsearch}  "
         f"max_tokens={args.max_tokens}\n"
     )
-    for i, ((task, cid, _, _), toks) in enumerate(zip(workload, rows)):
+    for i, ((task, cid), toks) in enumerate(zip(labels, rows)):
         text = tokenizer.decode(toks).replace("\n", " ")
         print(f"#{i:<3} {task:<38} {cid}  {len(toks):>4} tok  {text[:60]}")
 
     print(f"\n{'task':<38}{'reqs':>6}{'gen tok':>9}{'mean':>8}{'pad tok':>9}")
     for task in TASKS:
-        idx = [i for i, w in enumerate(workload) if w[0] == task]
+        idx = [i for i, w in enumerate(labels) if w[0] == task]
         if not idx:
             continue
         gen = sum(len(rows[i]) for i in idx)
