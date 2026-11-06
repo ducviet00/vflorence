@@ -373,23 +373,23 @@ class Florence2ForConditionalGeneration(nn.Module):
     @torch.no_grad()
     def encode(
         self,
-        encoder_input_ids: torch.Tensor,
+        encoder_token_ids: torch.Tensor,
         pixel_values: torch.Tensor | None = None,
         image_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Scatter projected visual tokens into image_token_id slots and run the BART encoder."""
         language_model = self.model.language_model
         positions = (
-            torch.arange(encoder_input_ids.shape[1], device=encoder_input_ids.device)
+            torch.arange(encoder_token_ids.shape[1], device=encoder_token_ids.device)
             .unsqueeze(0)
-            .expand_as(encoder_input_ids)
+            .expand_as(encoder_token_ids)
         )
-        inputs_embeds = language_model.shared(encoder_input_ids)
+        inputs_embeds = language_model.shared(encoder_token_ids)
         if image_embeds is None and pixel_values is not None:
             image_embeds = self.get_image_features(pixel_values)
         if image_embeds is not None:
             image_embeds = image_embeds.to(inputs_embeds.dtype)
-            image_mask = encoder_input_ids == self.config.image_token_id
+            image_mask = encoder_token_ids == self.config.image_token_id
             inputs_embeds = inputs_embeds.masked_scatter(
                 image_mask.unsqueeze(-1), image_embeds
             )

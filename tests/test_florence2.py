@@ -27,7 +27,7 @@ from fastencdec.utils.loader import load_hf_weights
 MODEL = "hf-tiny-v2/tiny-random-Florence2ForConditionalGeneration"
 
 
-def build_encoder_ids(config, tokenizer, num_image_tokens):
+def build_encoder_token_ids(config, tokenizer, num_image_tokens):
     text = config.text_config
     prompt_ids = tokenizer("<CAPTION>", add_special_tokens=False)["input_ids"]
     return (
@@ -72,8 +72,8 @@ def main():
         feat_ref = hf.get_image_features(pixel_values).pooler_output
         feat_our = ours.get_image_features(pixel_values)
         num_image_tokens = feat_ref.shape[1]
-        encoder_ids = build_encoder_ids(config, tokenizer, num_image_tokens)
-        encoder = torch.tensor([encoder_ids])
+        encoder_token_ids = build_encoder_token_ids(config, tokenizer, num_image_tokens)
+        encoder = torch.tensor([encoder_token_ids])
         hidden_ref = hf.model(
             input_ids=encoder, pixel_values=pixel_values
         ).encoder_last_hidden_state
@@ -98,7 +98,7 @@ def main():
         (tokens,) = engine.generate(
             [
                 (
-                    encoder_ids,
+                    encoder_token_ids,
                     [config.text_config.decoder_start_token_id],
                     pixel_values[0],
                 )
@@ -127,7 +127,7 @@ def main():
     for image, _ in batch:
         with torch.no_grad():
             n_img = ours.get_image_features(image.unsqueeze(0)).shape[1]
-        ids = build_encoder_ids(config, tokenizer, n_img)
+        ids = build_encoder_token_ids(config, tokenizer, n_img)
         params = SamplingParams(max_tokens=6, num_beams=1)
         engine = LLMEngine(ours, Config(num_blocks=64, block_size=16, max_num_seqs=8))
         (tokens,) = engine.generate(
@@ -141,7 +141,7 @@ def main():
     for image, _ in batch:
         with torch.no_grad():
             n_img = ours.get_image_features(image.unsqueeze(0)).shape[1]
-        ids = build_encoder_ids(config, tokenizer, n_img)
+        ids = build_encoder_token_ids(config, tokenizer, n_img)
         engine_requests.append(
             (ids, [config.text_config.decoder_start_token_id], image)
         )
