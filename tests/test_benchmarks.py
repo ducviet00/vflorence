@@ -1,77 +1,44 @@
-"""Device checks must work without downloading a model or calling CUDA on CPU."""
+"""Benchmark helper checks without downloading a model."""
 
-import contextlib
-import io
-import sys
 import unittest
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import Mock
 
 import torch
+import verify_parity
 
-from benchmarks import (
-    attn_backend,
-    benchmark,
-    benchmark_vllm,
-    throughput,
-    verify_parity,
-)
+from benchmarks import continuous_batching, utils
 
 
 class BenchmarkTests(unittest.TestCase):
-    def test_cuda_attention_comparison_rejected_before_loading(self):
-        stderr = io.StringIO()
-        with (
-            patch.object(sys, "argv", ["attn_backend.py", "--device", "cuda"]),
-            patch("transformers.AutoTokenizer.from_pretrained") as load,
-            contextlib.redirect_stderr(stderr),
-            self.assertRaises(SystemExit) as error,
-        ):
-            attn_backend.main()
-        self.assertEqual(error.exception.code, 2)
-        self.assertIn("requires --device cpu", stderr.getvalue())
-        load.assert_not_called()
+    def test_blocks_for_covers_decoder_tokens(self):
+        # 8 seqs x (ceil(513 / 32) = 17 blocks + 1 CoW slack)
+        self.assertEqual(utils.blocks_for(8, 512, 32), 8 * 18)
+        self.assertEqual(utils.blocks_for(1, 15, 16), 2)
 
-    def test_cpu_throughput_never_synchronizes_cuda(self):
-        tokenizer = Mock(return_value={"input_ids": [3, 4, 5]})
-        tokenizer.decode.return_value = "prompt"
-        profiler = MagicMock()
-        with (
-            patch.object(
-                sys,
-                "argv",
-                [
-                    "throughput.py",
-                    "--device",
-                    "cpu",
-                    "--requests",
-                    "1",
-                    "--max-tokens",
-                    "2",
-                    "--warmup",
-                    "0",
-                    "--repeats",
-                    "1",
-                    "--profile",
-                ],
-            ),
-            patch("transformers.AutoTokenizer.from_pretrained", return_value=tokenizer),
-            patch.object(throughput, "LLM"),
-            patch(
-                "torch.cuda.synchronize", side_effect=AssertionError("CUDA on CPU")
-            ) as sync,
-            patch("torch.profiler.profile", return_value=profiler) as profile,
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            throughput.main()
-        sync.assert_not_called()
-        from torch.profiler import ProfilerActivity
+    def test_timed_returns_best_and_last(self):
+        calls = iter(range(10))
+        seconds, last = utils.timed(lambda: next(calls), warmup=2, repeats=3)
+        self.assertEqual(last, 4)
+        self.assertGreaterEqual(seconds, 0)
 
-        self.assertEqual(profile.call_args.kwargs["activities"], [ProfilerActivity.CPU])
+    def test_strip_hf_counts_padding(self):
+        out = torch.tensor([[2, 5, 6, 2, 1, 1], [2, 7, 2, 1, 1, 1]])
+        rows, pads = utils.strip_hf(out, pad_token_id=1)
+        self.assertEqual(rows, [[5, 6, 2], [7, 2]])
+        self.assertEqual(pads, [2, 3])
 
-    def test_vllm_uses_same_workload_definitions(self):
-        self.assertIs(benchmark_vllm.make_prompt, benchmark.make_prompt)
-        self.assertIs(benchmark_vllm.SCENARIOS, benchmark.SCENARIOS)
-        self.assertIs(benchmark_vllm.CONFIGS, benchmark.CONFIGS)
+    def test_workload_mixes_all_tasks_per_window(self):
+        utils_load = continuous_batching.load_image
+        continuous_batching.load_image = Mock(return_value=None)
+        try:
+            workload = continuous_batching.make_workload(32)
+        finally:
+            continuous_batching.load_image = utils_load
+        for start in range(0, 32, 8):
+            tasks = {w[0] for w in workload[start : start + 8]}
+            self.assertEqual(tasks, set(continuous_batching.TASKS))
+        self.assertEqual(len({w[1] for w in workload}), len(utils.IMAGES))
+        self.assertTrue(workload[3][2].endswith(utils.IMAGES[0][1]))
 
     def test_parity_failures_raise(self):
         with self.assertRaises(AssertionError):

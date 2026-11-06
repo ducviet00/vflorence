@@ -10,6 +10,7 @@ Run with:  PYTHONPATH=. python tests/test_florence2.py
 
 import os
 import sys
+from tempfile import TemporaryDirectory
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -40,18 +41,26 @@ def build_encoder_ids(config, tokenizer, num_image_tokens):
 def main():
     torch.manual_seed(0)
     config = AutoConfig.from_pretrained(MODEL)
+    config.text_config.d_model = 32
+    config.text_config.encoder_attention_heads = 1
+    config.text_config.decoder_attention_heads = 1
+    config.vision_config.projection_dim = 32
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    hf = HFFlorence2.from_pretrained(MODEL, dtype=torch.float32).eval()
+    hf = HFFlorence2(config).eval()
 
     ours = Florence2ForConditionalGeneration(config)
-    load_hf_weights(ours, MODEL, hf_model_cls=HFFlorence2)
+    with TemporaryDirectory() as tmpdir:
+        hf.save_pretrained(tmpdir)
+        load_hf_weights(ours, tmpdir, hf_model_cls=HFFlorence2)
     ours = ours.eval()
 
     # compile=False is a full opt-out: the vision tower must stay eager too.
     eager_runner = LLMEngine(
         ours, Config(num_blocks=64, block_size=16, max_num_seqs=8, compile=False)
     ).runner
-    tower_eager = eager_runner.mm_step is None and eager_runner.decode_step is None
+    tower_eager = (
+        not eager_runner.compiled and eager_runner.image_fn == ours.get_image_features
+    )
     assert tower_eager, "compile=False compiled the vision tower or decoder"
     print(
         f"[{'OK' if tower_eager else 'MISMATCH'}] compile=False keeps the tower eager"
@@ -70,10 +79,6 @@ def main():
         ).encoder_last_hidden_state
         hidden_our = ours.encode(encoder, pixel_values)
 
-    # The vendored DaViT feeds SDPA pre-contiguous Q/K/V, which selects the flash
-    # kernel instead of the math one the reference takes on non-contiguous inputs;
-    # fp32 features therefore agree to ~1e-6 rather than bit-exactly (the decoded
-    # tokens below are unaffected).
     feat_diff = (feat_ref - feat_our).abs().max().item()
     hidden_diff = (hidden_ref - hidden_our).abs().max().item()
     tol = 1e-5
@@ -88,9 +93,9 @@ def main():
 
     # Greedy/beam generation parity through the paged engine.
     for beams in (1, 2, 4):
-        params = SamplingParams(max_tokens=6, num_beams=beams, temperature=0.0)
+        params = SamplingParams(max_tokens=6, num_beams=beams)
         engine = LLMEngine(ours, Config(num_blocks=64, block_size=16, max_num_seqs=8))
-        (request,) = engine.generate(
+        (tokens,) = engine.generate(
             [
                 (
                     encoder_ids,
@@ -99,10 +104,8 @@ def main():
                 )
             ],
             params,
-        )
-        our_tokens = [config.text_config.decoder_start_token_id] + engine.results[
-            request
-        ]
+        ).values()
+        our_tokens = [config.text_config.decoder_start_token_id] + tokens
 
         with torch.no_grad():
             ref = hf.generate(
@@ -125,16 +128,14 @@ def main():
         with torch.no_grad():
             n_img = ours.get_image_features(image.unsqueeze(0)).shape[1]
         ids = build_encoder_ids(config, tokenizer, n_img)
-        params = SamplingParams(max_tokens=6, num_beams=1, temperature=0.0)
+        params = SamplingParams(max_tokens=6, num_beams=1)
         engine = LLMEngine(ours, Config(num_blocks=64, block_size=16, max_num_seqs=8))
-        (request,) = engine.generate(
+        (tokens,) = engine.generate(
             [(ids, [config.text_config.decoder_start_token_id], image)], params
-        )
-        singles.append(
-            [config.text_config.decoder_start_token_id] + engine.results[request]
-        )
+        ).values()
+        singles.append([config.text_config.decoder_start_token_id] + tokens)
 
-    params = SamplingParams(max_tokens=6, num_beams=1, temperature=0.0)
+    params = SamplingParams(max_tokens=6, num_beams=1)
     engine = LLMEngine(ours, Config(num_blocks=64, block_size=16, max_num_seqs=8))
     engine_requests = []
     for image, _ in batch:
@@ -144,9 +145,9 @@ def main():
         engine_requests.append(
             (ids, [config.text_config.decoder_start_token_id], image)
         )
-    requests = engine.generate(engine_requests, params)
-    for i, request in enumerate(requests):
-        batched = [config.text_config.decoder_start_token_id] + engine.results[request]
+    completions = engine.generate(engine_requests, params)
+    for i, tokens in enumerate(completions.values()):
+        batched = [config.text_config.decoder_start_token_id] + tokens
         assert batched == singles[i], (i, batched, singles[i])
         print(f"[OK] batch-vs-single {i}: {batched}")
 

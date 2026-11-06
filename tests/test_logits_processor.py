@@ -1,6 +1,6 @@
 """LogitsProcessor matches transformers' LogitsProcessorList exactly.
 
-Covers every knob build_logits_processor used to wire up, on random logits and
+Covers every knob LogitsProcessor wires up, on random logits and
 histories including the edge lengths (len < ngram, len == 1 for forced BOS,
 len == max-1 for forced EOS, begin_index).
 """
@@ -17,9 +17,6 @@ from transformers.generation.logits_process import (
     RepetitionPenaltyLogitsProcessor,
     SuppressTokensAtBeginLogitsProcessor,
     SuppressTokensLogitsProcessor,
-    TemperatureLogitsWarper,
-    TopKLogitsWarper,
-    TopPLogitsWarper,
 )
 
 from fastencdec.layers.logits_processor import LogitsProcessor
@@ -30,7 +27,6 @@ EOS = [2, 7]
 
 
 def reference(params, input_ids, scores):
-    """The old stack, built the way build_logits_processor built it."""
     eos = torch.tensor(sorted(EOS), dtype=torch.long)
     procs = LogitsProcessorList()
     if params.repetition_penalty != 1.0:
@@ -49,14 +45,6 @@ def reference(params, input_ids, scores):
         procs.append(
             SuppressTokensAtBeginLogitsProcessor(params.begin_suppress_tokens, 3)
         )
-    if params.temperature > 0:
-        min_tokens = len(EOS) + 1 if params.num_beams > 1 else 1
-        if params.temperature != 1.0:
-            procs.append(TemperatureLogitsWarper(params.temperature))
-        if params.top_k > 0:
-            procs.append(TopKLogitsWarper(params.top_k, min_tokens_to_keep=min_tokens))
-        if params.top_p < 1.0:
-            procs.append(TopPLogitsWarper(params.top_p, min_tokens_to_keep=min_tokens))
     return procs(input_ids, scores)
 
 
@@ -68,10 +56,8 @@ def check(params, rows):
     processor = LogitsProcessor(
         params,
         vocab_size=VOCAB,
-        device="cpu",
         max_length=64,
         begin_index=3,
-        is_beam=params.num_beams > 1,
     )
     got = processor(input_ids, scores.clone())
     assert torch.equal(got, want), f"mismatch rows={rows} params={params}"
@@ -94,10 +80,8 @@ def check_padded(params, true_lens):
     processor = LogitsProcessor(
         params,
         vocab_size=VOCAB,
-        device="cpu",
         max_length=64,
         begin_index=3,
-        is_beam=params.num_beams > 1,
     )
     got = processor(pad, scores.clone(), torch.tensor(true_lens))
     assert torch.equal(got, want), f"padded mismatch lens={true_lens} params={params}"
@@ -122,16 +106,6 @@ def main():
             forced_bos_token_id=0,
             suppress_tokens=[5],
         ),
-        SamplingParams(eos_token_id=EOS, temperature=0.7, top_k=5),
-        SamplingParams(eos_token_id=EOS, temperature=0.7, top_p=0.9),
-        SamplingParams(eos_token_id=EOS, temperature=0.7, top_k=5, top_p=0.9),
-        SamplingParams(
-            eos_token_id=EOS, num_beams=4, temperature=0.7, top_k=5, top_p=0.9
-        ),
-        # top_k below the beam min_tokens_to_keep (len(EOS)+1 == 3): HF keeps
-        # max(top_k, min_tokens), not top_k.
-        SamplingParams(eos_token_id=EOS, num_beams=4, temperature=0.7, top_k=1),
-        SamplingParams(eos_token_id=EOS, num_beams=4, temperature=0.7, top_k=2),
         # Out-of-vocab suppress ids: HF's isin mask ignores them.
         SamplingParams(eos_token_id=EOS, suppress_tokens=[5, 999]),
         SamplingParams(eos_token_id=EOS, begin_suppress_tokens=[5, 999]),
@@ -175,9 +149,7 @@ def main():
             for r, s in zip(true_rows, scores)
         ]
     )
-    processor = LogitsProcessor(
-        rep, vocab_size=VOCAB, device="cpu", max_length=64, begin_index=3, is_beam=False
-    )
+    processor = LogitsProcessor(rep, vocab_size=VOCAB, max_length=64, begin_index=3)
     got = processor(pad, scores.clone(), torch.tensor([len(r) for r in true_rows]))
     assert torch.equal(got, want), "padded repetition aliases token 0"
     print("padded repetition zero-alias ok")
