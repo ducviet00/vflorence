@@ -15,6 +15,7 @@ from fastencdec.engine.llm_engine import LLMEngine
 from fastencdec.engine.sequence import Sequence
 from fastencdec.layers.logits_processor import LogitsProcessor
 from fastencdec.models.bart import BartForConditionalGeneration
+from fastencdec.utils.context import get_context, set_context
 from fastencdec.utils.loader import load_hf_weights
 
 
@@ -146,12 +147,68 @@ class EngineTests(unittest.TestCase):
             self.assertFalse(llm.results)
         self.assertEqual(llm.generate([], params), {})
 
+    def test_generation_releases_global_cross_cache(self):
+        llm = engine()
+        self.addCleanup(set_context)
+        llm.generate([REQUEST], SamplingParams(max_tokens=2))
+        self.assert_clean(llm)
+        self.assertIsNone(get_context().cross_staged)
+
+    def test_exact_block_budget_fits(self):
+        llm = engine(num_blocks=1, block_size=16)
+        (tokens,) = llm.generate(
+            [REQUEST], SamplingParams(max_tokens=16, min_length=17)
+        ).values()
+        self.assertEqual(len(tokens), 16)
+        self.assert_clean(llm)
+
+    def test_runner_failure_releases_global_cross_cache(self):
+        llm = engine()
+        self.addCleanup(set_context)
+        seq = Sequence(0, [1], [3, 4, 5], SamplingParams())
+        with (
+            patch.object(
+                llm.runner, "decode_fn", side_effect=RuntimeError("decode failed")
+            ),
+            self.assertRaisesRegex(RuntimeError, "decode failed"),
+        ):
+            llm.runner.run([seq])
+        self.assertIsNone(get_context().cross_staged)
+
+    def test_eos_fallback_matches_engine_stop_reason(self):
+        cases = [
+            (2, [], "length", None),
+            ([2, 3], None, "stop", 2),
+        ]
+        for model_eos, requested_eos, finish_reason, stop_reason in cases:
+            with self.subTest(model_eos=model_eos, requested_eos=requested_eos):
+                llm = LLM.__new__(LLM)
+                llm.multimodal = False
+                llm.eos_token_id = model_eos
+                llm.decoder_start_token_id = 1
+                llm.tokenizer = Mock()
+                llm.tokenizer.decode.return_value = ""
+                llm.engine = engine()
+                llm.engine.eos_token_id = model_eos
+                params = SamplingParams(
+                    max_tokens=2,
+                    eos_token_id=requested_eos,
+                    forced_eos_token_id=2,
+                    min_length=2,
+                )
+                (result,) = llm.generate({"prompt_token_ids": [3, 4, 5]}, params)
+                completion = result.outputs[0]
+                self.assertEqual(len(completion.token_ids), 2)
+                self.assertEqual(completion.token_ids[-1], 2)
+                self.assertEqual(completion.finish_reason, finish_reason)
+                self.assertEqual(completion.stop_reason, stop_reason)
+
     def test_too_long_inputs_are_rejected_before_running(self):
         llm = engine(num_blocks=64)
         cases = [
             (([3] * 129, [1], None), SamplingParams(max_tokens=2), "encoder prompt"),
             (REQUEST, SamplingParams(max_tokens=129), "max_position_embeddings"),
-            (REQUEST, SamplingParams(max_tokens=128, num_beams=8), "KV blocks"),
+            (REQUEST, SamplingParams(max_tokens=128, num_beams=9), "KV blocks"),
         ]
         for request, params, message in cases:
             with (
