@@ -63,6 +63,7 @@ def run_fast(args, input_token_ids, pixels, dtype):
         block_size=block_size,
         max_num_seqs=num_sequences,
         dtype=dtype,
+        mm_cache_size=args.mm_cache_size,
     )
     params = SamplingParams(
         max_tokens=args.max_tokens,
@@ -74,10 +75,19 @@ def run_fast(args, input_token_ids, pixels, dtype):
         for ids, image_pixels in zip(input_token_ids, pixels)
     ]
 
+    runner = llm.engine.runner
+
     def once():
+        # Cold cache each run: only reuse within the batch (4 tasks per image) counts.
+        runner.mm_cache.clear()
+        runner.mm_cache_hits = runner.mm_cache_misses = 0
         return list(llm.engine.generate(requests, params).values())
 
     seconds, rows = timed(once, args.warmup, args.repeats)
+    print(
+        f"mm cache: size={args.mm_cache_size}  hits={runner.mm_cache_hits}  "
+        f"misses={runner.mm_cache_misses}"
+    )
     return seconds, rows, [0] * len(rows)
 
 
@@ -142,6 +152,9 @@ def main():
     ap.add_argument("--beamsearch", type=int, default=1, help="1 = greedy")
     ap.add_argument("--max-tokens", type=int, default=512)
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
+    ap.add_argument(
+        "--mm-cache-size", type=int, default=256, help="fast only; 0 disables"
+    )
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--model", default="florence-community/Florence-2-base")
