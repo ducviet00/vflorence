@@ -136,7 +136,7 @@ cells are wall time and generated tokens/s, speedup over HF is by wall time.
 <tr><th>config</th><th>engine</th><th align="right">c4a-standard-8</th><th align="right">c4-standard-8</th></tr>
 <tr><td rowspan="2">greedy</td><td>fast-encdec</td><td align="right">7.8 s, 471 tok/s (<b>4.27x</b>)</td><td align="right">7.1 s, 509 tok/s (<b>5.13x</b>)</td></tr>
 <tr><td>HF</td><td align="right">33.1 s, 110 tok/s</td><td align="right">36.3 s, 104 tok/s</td></tr>
-<tr><td rowspan="2">beams=4</td><td>fast-encdec</td><td align="right">14.3 s, 360 tok/s (<b>4.94x</b>)</td><td align="right">13.4 s, 389 tok/s (<b>9.21x</b>)</td></tr>
+<tr><td rowspan="2">beams=4</td><td>fast-encdec</td><td align="right">13.9 s, 375 tok/s (<b>5.12x</b>)</td><td align="right">13.4 s, 389 tok/s (<b>9.21x</b>)</td></tr>
 <tr><td>HF</td><td align="right">70.9 s, 73 tok/s</td><td align="right">123.7 s, 40 tok/s</td></tr>
 </table>
 
