@@ -1,6 +1,5 @@
-from .llm import LLM
-from .outputs import CompletionOutput, RequestOutput
+from .llm import LLM, Request, RequestOut
 from .sampling_params import SamplingParams
 
 __version__ = "0.1.0"
-__all__ = ["LLM", "CompletionOutput", "RequestOutput", "SamplingParams"]
+__all__ = ["LLM", "Request", "RequestOut", "SamplingParams"]

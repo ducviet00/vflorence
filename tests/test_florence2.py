@@ -18,7 +18,7 @@ import torch
 from transformers import AutoConfig, AutoTokenizer
 from transformers import Florence2ForConditionalGeneration as HFFlorence2
 
-from fastencdec import SamplingParams
+from fastencdec import Request, SamplingParams
 from fastencdec.config import Config
 from fastencdec.engine import LLMEngine
 from fastencdec.models.florence2 import Florence2ForConditionalGeneration
@@ -96,13 +96,7 @@ def main():
         params = SamplingParams(max_tokens=6, num_beams=beams)
         engine = LLMEngine(ours, Config(num_blocks=64, block_size=16, max_num_seqs=8))
         (tokens,) = engine.generate(
-            [
-                (
-                    encoder_token_ids,
-                    [config.text_config.decoder_start_token_id],
-                    pixel_values[0],
-                )
-            ],
+            [Request(encoder_token_ids, pixel_values[0])],
             params,
         ).values()
         our_tokens = [config.text_config.decoder_start_token_id] + tokens
@@ -130,9 +124,7 @@ def main():
         ids = build_encoder_token_ids(config, tokenizer, n_img)
         params = SamplingParams(max_tokens=6, num_beams=1)
         engine = LLMEngine(ours, Config(num_blocks=64, block_size=16, max_num_seqs=8))
-        (tokens,) = engine.generate(
-            [(ids, [config.text_config.decoder_start_token_id], image)], params
-        ).values()
+        (tokens,) = engine.generate([Request(ids, image)], params).values()
         singles.append([config.text_config.decoder_start_token_id] + tokens)
 
     params = SamplingParams(max_tokens=6, num_beams=1)
@@ -142,9 +134,7 @@ def main():
         with torch.no_grad():
             n_img = ours.get_image_features(image.unsqueeze(0)).shape[1]
         ids = build_encoder_token_ids(config, tokenizer, n_img)
-        engine_requests.append(
-            (ids, [config.text_config.decoder_start_token_id], image)
-        )
+        engine_requests.append(Request(ids, image))
     completions = engine.generate(engine_requests, params)
     for i, tokens in enumerate(completions.values()):
         batched = [config.text_config.decoder_start_token_id] + tokens
@@ -153,8 +143,7 @@ def main():
 
     # Multimodal cache: a repeated image runs the vision encoder once, across calls.
     image_a, image_b = batch[0][0], torch.randn(3, 32, 32)
-    ids_a = engine_requests[0][0]
-    start = [config.text_config.decoder_start_token_id]
+    ids_a = engine_requests[0].input_ids
     engine = LLMEngine(
         ours,
         Config(num_blocks=64, block_size=16, max_num_seqs=8, mm_cache_size=1),
@@ -162,19 +151,19 @@ def main():
     runner, calls = engine.runner, []
     image_fn = runner.image_fn
     runner.image_fn = lambda px: calls.append(len(px)) or image_fn(px)
-    first = engine.generate([(ids_a, start, image_a), (ids_a, start, image_a)], params)
-    again = engine.generate([(ids_a, start, image_a.clone())], params)
+    first = engine.generate([Request(ids_a, image_a), Request(ids_a, image_a)], params)
+    again = engine.generate([Request(ids_a, image_a.clone())], params)
     assert calls == [1], calls  # dedup within a step + hit across calls
     assert list(first.values()) == [singles[0][1:]] * 2, first
     assert list(again.values()) == [singles[0][1:]], again
-    engine.generate([(ids_a, start, image_b)], params)  # evicts image_a
+    engine.generate([Request(ids_a, image_b)], params)  # evicts image_a
     assert len(runner.mm_cache) == 1 and calls == [1, 1], (runner.mm_cache, calls)
-    engine.generate([(ids_a, start, image_a)], params)
+    engine.generate([Request(ids_a, image_a)], params)
     assert calls == [1, 1, 1], calls
     assert (runner.mm_cache_hits, runner.mm_cache_misses) == (2, 3)
     # Mixed hit + miss in one step: the later request (cached image_a) stays.
     hash_a = next(iter(runner.mm_cache))
-    engine.generate([(ids_a, start, image_b), (ids_a, start, image_a)], params)
+    engine.generate([Request(ids_a, image_b), Request(ids_a, image_a)], params)
     assert list(runner.mm_cache) == [hash_a] and calls == [1, 1, 1, 1], calls
     print("[OK] mm cache: dedup, cross-call hit, LRU eviction, hit stats")
 

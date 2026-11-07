@@ -51,10 +51,9 @@ Mirrors nano-vllm's package layout (`engine/`, `layers/`, `models/`, `utils/`).
 
 ```
 fastencdec/
-  __init__.py          package exports (LLM, SamplingParams, RequestOutput, ...)
+  __init__.py          package exports (LLM, Request, RequestOut, SamplingParams)
   config.py            Config (engine hyperparameters)
-  llm.py               unified LLM facade (BART + Florence-2, vLLM-style API)
-  outputs.py           RequestOutput / CompletionOutput (vLLM-shaped)
+  llm.py               unified LLM facade (BART + Florence-2), Request / RequestOut
   sampling_params.py   SamplingParams (greedy + beam search)
   engine/
     sequence.py        Sequence
