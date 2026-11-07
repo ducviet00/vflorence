@@ -1,3 +1,4 @@
+import logging
 import platform
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
@@ -5,9 +6,12 @@ from contextlib import nullcontext
 import torch
 import vllm_cpu_attn
 
+from ..config import Config
 from ..layers import attention
 from ..utils.context import set_context
+from ..utils.loader import load_hf_weights
 
+logger = logging.getLogger(__name__)
 _COMPILED_RUNNERS = 0
 
 # On aarch64 with torch >= 2.15, oneDNN runs a plain (unpacked) weight fastest for
@@ -22,20 +26,11 @@ _UNFROZEN_SINGLE_ROW = (
 class ModelRunner:
     """Manages KV caches, encoder caching, step preparation, and model execution."""
 
-    def __init__(
-        self,
-        model,
-        block_manager,
-        dtype=torch.float32,
-        compile=True,
-        compile_mm_encoder=True,
-        mm_cache_size=256,
-    ):
-        self.model = model.eval()
-        self.block_manager = block_manager
-        self.block_size = block_manager.block_size
-        self.dtype = dtype
-        self.decoder_layers = list(model.decoder_layers)
+    def __init__(self, config: Config):
+        self.model = load_hf_weights(config)
+        self.block_size = config.block_size
+        self.dtype = config.dtype
+        self.decoder_layers = list(self.model.decoder_layers)
         self.num_heads = self.decoder_layers[0].self_attn.num_heads
         self.head_dim = self.decoder_layers[0].self_attn.head_dim
         if self.head_dim not in attention.HEAD_DIMS:
@@ -43,17 +38,17 @@ class ModelRunner:
                 f"vllm-cpu-attn does not support head_dim={self.head_dim}; "
                 f"must be one of {sorted(attention.HEAD_DIMS)}"
             )
-        self.isa = vllm_cpu_attn.get_isa(dtype, self.block_size, self.head_dim)
+        self.isa = vllm_cpu_attn.get_isa(self.dtype, self.block_size, self.head_dim)
         # Eager by default; _compile swaps in compiled versions.
-        self.compiled = compile
+        self.compiled = config.compile
         self.decode_fn = self.model
         self.encode_fn = self.model.encode
         self.image_fn = getattr(self.model, "get_image_features", None)
-        if compile:
-            self._compile(compile_mm_encoder)
+        if config.compile:
+            self._compile()
         # Multimodal encoder cache: LRU of mm_hash -> image embeddings, kept across calls.
         self.mm_cache = OrderedDict()
-        self.mm_cache_size = mm_cache_size
+        self.mm_cache_size = config.mm_cache_size
         self.mm_cache_hits = self.mm_cache_misses = 0
         # Cross-attention K/V staged for the current batch, keyed by its request ids.
         self._cross_key = None
@@ -63,16 +58,34 @@ class ModelRunner:
         # zeros, not empty: the kernel reads whole blocks, and 0 * NaN from garbage
         # in a block's unused tail would poison the output.
         shape = (
-            block_manager.num_blocks,
+            config.num_blocks,
             self.num_heads,
             self.block_size,
             self.head_dim,
         )
         for layer in self.decoder_layers:
-            layer.self_attn.k_cache = torch.zeros(shape, dtype=dtype)
-            layer.self_attn.v_cache = torch.zeros(shape, dtype=dtype)
+            layer.self_attn.k_cache = torch.zeros(shape, dtype=self.dtype)
+            layer.self_attn.v_cache = torch.zeros(shape, dtype=self.dtype)
 
-    def _compile(self, compile_mm_encoder: bool) -> None:
+        weight_bytes = sum(
+            t.numel() * t.element_size()
+            for t in (*self.model.parameters(), *self.model.buffers())
+        )
+        kv_bytes = sum(
+            c.numel() * c.element_size()
+            for layer in self.decoder_layers
+            for c in (layer.self_attn.k_cache, layer.self_attn.v_cache)
+        )
+        logger.info(
+            "Allocated %.1f MB (weights %.1f MB + KV cache %.1f MB, %d blocks of %d tokens)",
+            (weight_bytes + kv_bytes) / (1024**2),
+            weight_bytes / (1024**2),
+            kv_bytes / (1024**2),
+            config.num_blocks,
+            self.block_size,
+        )
+
+    def _compile(self) -> None:
         global _COMPILED_RUNNERS
         _COMPILED_RUNNERS += 1
         # Each engine adds ~4 Dynamo cache entries; past the limit Dynamo silently
@@ -87,7 +100,7 @@ class ModelRunner:
         # One dynamic graph covers every batch size / encoder length.
         self.decode_fn = torch.compile(self.model, dynamic=True)
         self.encode_fn = torch.compile(self.model.encode, dynamic=True)
-        if self.image_fn is not None and compile_mm_encoder:
+        if self.image_fn is not None:
             self.image_fn = torch.compile(self.image_fn, dynamic=False)
 
     def _copy_blocks(self, copies: list[tuple[int, int]]) -> None:
@@ -123,8 +136,8 @@ class ModelRunner:
             for seq in seqs:
                 self.mm_cache[seq.mm_hash] = embeds[seq.mm_hash]
                 self.mm_cache.move_to_end(seq.mm_hash)
-            while len(self.mm_cache) > self.mm_cache_size:
-                self.mm_cache.popitem(last=False)
+                if len(self.mm_cache) > self.mm_cache_size:
+                    self.mm_cache.popitem(last=False)
         return embeds
 
     @torch.no_grad()
@@ -163,8 +176,8 @@ class ModelRunner:
             layer.encoder_attn.encoder_kv_cache.pop(request_id, None)
         self._cross_key = self._cross_staged = None
 
-    def _prepare(self, seqs):
-        """Allocate KV blocks and build input_ids, positions, and Context tensors for the step."""
+    def _prepare(self, seqs, copies=()):
+        """Build input_ids, positions, and Context tensors for the step."""
         bs = self.block_size
         for seq in seqs:
             num_new = len(seq.token_ids) - seq.num_cached_tokens
@@ -172,17 +185,13 @@ class ModelRunner:
                 raise ValueError(
                     f"each step must feed 1 token per sequence, got {num_new}"
                 )
-        if (
-            self.block_manager.required_new_blocks(seqs)
-            > self.block_manager.num_free_blocks
-        ):
-            raise RuntimeError("KV cache is full; increase num_blocks")
+
+        if copies:
+            self._copy_blocks(copies)
 
         input_ids, positions, new_slots = [], [], []
-        context_lens, seq_block_tables, copies = [], [], []
+        context_lens, seq_block_tables = [], []
         for seq in seqs:
-            if (copy := self.block_manager.ensure_capacity(seq)) is not None:
-                copies.append(copy)
             pos = seq.num_cached_tokens
             input_ids.append(seq.token_ids[pos])
             positions.append(pos)
@@ -190,9 +199,6 @@ class ModelRunner:
             seq.num_cached_tokens = pos + 1
             context_lens.append(pos + 1)
             seq_block_tables.append(seq.block_table)
-        # Safe to copy after the loop: a dst is a fresh block, never another pair's src.
-        if copies:
-            self._copy_blocks(copies)
 
         max_blocks = max(len(t) for t in seq_block_tables)
         padded = [t + [0] * (max_blocks - len(t)) for t in seq_block_tables]
@@ -231,14 +237,14 @@ class ModelRunner:
         )
 
     @torch.no_grad()
-    def run(self, seqs):
+    def run(self, seqs, copies=()):
         """Encode any fresh sequences, run one decoder step, and return next-token logits."""
         fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
         if fresh:
             self._encode(fresh)
 
         try:
-            input_ids, positions = self._prepare(seqs)
+            input_ids, positions = self._prepare(seqs, copies)
             with self._inductor_ctx(len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW):
                 return self.decode_fn(input_ids, positions)
         finally:
