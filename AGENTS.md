@@ -103,10 +103,15 @@ LLMEngine.step()                  # argmax (greedy) or beam-expand; append; free
 `LLMEngine.generate(requests, params)` is the offline entrypoint: it adds the
 whole batch under a single `SamplingParams` and runs to completion.
 
-`LLMEngine._postprocess` groups sequences by request, then batches every beam
-request that shares a `(beam width, live beam count, decoder length)` into one
-`_beam_group`: a single `log_softmax` + logits-processor call + `topk` over
-`[num_requests, beam_count * vocab]`.
+`ModelRunner._sample` runs `log_softmax` (beams only) and the logits processor
+once over the whole batch, with histories left-padded by -1 and true lengths
+passed in, so sequences of different decoder lengths share one call.
+`_beam_search` then adds each beam's `cum_logprob` and, when every request has
+the same live beam count, runs one `topk` over a `[requests, beam_count * vocab]`
+view of the scores; otherwise (a request on its first step has 1 beam) it runs
+one `topk` per request. It relies on a request's beams being adjacent in
+`seqs`, which `Scheduler._postprocess_beam` guarantees; that method also forks
+the surviving candidates.
 
 `models/bart.py` uses `F.scaled_dot_product_attention` for `BartEncoderSelfAttention`
 (dense, no cache) and calls the opaque `decoder_self_attention` and
