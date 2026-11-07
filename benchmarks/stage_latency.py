@@ -58,9 +58,11 @@ def prepare_inputs(args, florence, dtype):
     paragraph_ids = tokenizer(PARAGRAPH, add_special_tokens=False)["input_ids"]
     content_length = args.enc_len - 2
     copies = (content_length + len(paragraph_ids) - 1) // len(paragraph_ids)
-    token_ids = tokenizer.build_inputs_with_special_tokens(
-        (paragraph_ids * copies)[:content_length]
-    )
+    token_ids = [
+        tokenizer.bos_token_id,
+        *(paragraph_ids * copies)[:content_length],
+        tokenizer.eos_token_id,
+    ]
     return torch.tensor([token_ids] * args.batch), None
 
 

@@ -88,34 +88,42 @@ Reading order: `engine/sequence.py` -> `engine/block_manager.py` ->
 
 Measured on GCP `c4a-standard-8` (Arm Neoverse-V2, 8 physical cores) and
 `c4-standard-8` (Intel Xeon 8581C, **4** physical cores, AMX) with
-`torch 2.15.0+cpu`, `transformers 5.22.1` and `vllm-cpu-attn 0.1.0`, bf16.
+`torch 2.15.0+cpu`, `transformers 5.22.2` and `vllm-cpu-attn 0.1.0`, bf16.
+Both backends on the Xeon box run with tcmalloc (`LD_PRELOAD`, see Installation).
 Wall times are not like-for-like across the two machines: the Xeon box has
 half the physical cores. Cells are fast-encdec / HF (speedup).
 
 **Continuous batching** (`benchmarks/continuous_batching.py`): 32 Florence-2-base
 requests (8 COCO images x `<OD>`, `<OCR>`, `<DETAILED_CAPTION>`,
 `<REFERRING_EXPRESSION_SEGMENTATION>`), 8 requests in flight, up to 512 tokens.
-fast-encdec refills a slot as soon as a request finishes; HF runs 4 padded batches
-of 8, and 68-75% of its decoded positions are padding.
+fast-encdec refills a slot as soon as a request finishes, and its multimodal cache
+(on by default, cleared before each run) runs the vision encoder once per image:
+8 misses, 24 hits. HF runs 4 padded batches of 8 and encodes every image, and
+68-75% of its decoded positions are padding. One timed run after 3 warmup runs;
+cells are wall time and generated tokens/s, speedup over HF is by wall time.
 
-| config | c4a-standard-8 | c4-standard-8 |
-|---|---:|---:|
-| greedy | 14.2 s / 30.7 s (**2.16x**) | 12.6 s / 47.8 s (**3.79x**) |
-| beams=4 | 22.6 s / 69.8 s (**3.08x**) | 22.0 s / 146.8 s (**6.67x**) |
+<table>
+<tr><th>config</th><th>engine</th><th align="right">c4a-standard-8</th><th align="right">c4-standard-8</th></tr>
+<tr><td rowspan="2">greedy</td><td>fast-encdec</td><td align="right">7.6 s, 481 tok/s (<b>4.31x</b>)</td><td align="right">7.6 s, 475 tok/s (<b>5.27x</b>)</td></tr>
+<tr><td>HF</td><td align="right">32.6 s, 112 tok/s</td><td align="right">40.0 s, 95 tok/s</td></tr>
+<tr><td rowspan="2">beams=4</td><td>fast-encdec</td><td align="right">16.5 s, 314 tok/s (<b>4.41x</b>)</td><td align="right">16.4 s, 318 tok/s (<b>8.19x</b>)</td></tr>
+<tr><td>HF</td><td align="right">72.6 s, 72 tok/s</td><td align="right">134.4 s, 37 tok/s</td></tr>
+</table>
 
 **Per stage** (`benchmarks/stage_latency.py`): batch 8; Florence-2-base with
 `<DETAILED_CAPTION>` (590 encoder tokens), BART-large-cnn with 512 encoder tokens.
+The multimodal cache is off here so the vision stage runs every call.
 The decode step is averaged over 128 steps with EOS suppressed.
 
 | stage | c4a-standard-8 | c4-standard-8 |
 |---|---:|---:|
-| Florence-2 vision | 2195 / 2236 ms (1.02x) | 2771 / 4818 ms (1.74x) |
-| Florence-2 encode | 265 / 265 ms (1.00x) | 176 / 250 ms (1.42x) |
-| Florence-2 decode step, greedy | 6.74 / 11.46 ms (1.70x) | 7.49 / 12.77 ms (1.70x) |
-| Florence-2 decode step, beams=4 | 13.22 / 25.18 ms (1.90x) | 16.60 / 51.41 ms (3.10x) |
-| BART encode | 712 / 711 ms (1.00x) | 562 / 672 ms (1.20x) |
-| BART decode step, greedy | 13.30 / 24.92 ms (1.87x) | 19.76 / 28.44 ms (1.44x) |
-| BART decode step, beams=4 | 27.22 / 54.72 ms (2.01x) | 32.58 / 207.98 ms (6.38x) |
+| Florence-2 vision | 2298 / 2280 ms (0.99x) | 1626 / 2733 ms (1.68x) |
+| Florence-2 encode | 268 / 270 ms (1.01x) | 173 / 193 ms (1.11x) |
+| Florence-2 decode step, greedy | 6.07 / 11.08 ms (1.83x) | 8.52 / 14.36 ms (1.69x) |
+| Florence-2 decode step, beams=4 | 13.03 / 25.09 ms (1.93x) | 16.06 / 47.71 ms (2.97x) |
+| BART encode | 717 / 717 ms (1.00x) | 429 / 483 ms (1.13x) |
+| BART decode step, greedy | 12.95 / 23.70 ms (1.83x) | 19.36 / 29.71 ms (1.53x) |
+| BART decode step, beams=4 | 27.73 / 54.95 ms (1.98x) | 33.40 / 101.77 ms (3.05x) |
 
 ## Tests & Benchmarks
 
