@@ -1,5 +1,5 @@
 import platform
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
 
 import torch
@@ -29,6 +29,7 @@ class ModelRunner:
         dtype=torch.float32,
         compile=True,
         compile_mm_encoder=True,
+        mm_cache_size=256,
     ):
         self.model = model.eval()
         self.block_manager = block_manager
@@ -50,6 +51,10 @@ class ModelRunner:
         self.image_fn = getattr(self.model, "get_image_features", None)
         if compile:
             self._compile(compile_mm_encoder)
+        # Multimodal encoder cache: LRU of mm_hash -> image embeddings, kept across calls.
+        self.mm_cache = OrderedDict()
+        self.mm_cache_size = mm_cache_size
+        self.mm_cache_hits = self.mm_cache_misses = 0
         # Cross-attention K/V staged for the current batch, keyed by its request ids.
         self._cross_key = None
         self._cross_staged = None
@@ -92,9 +97,39 @@ class ModelRunner:
             for cache in (layer.self_attn.k_cache, layer.self_attn.v_cache):
                 cache[dst] = cache[src]
 
+    def _image_embeds(self, seqs) -> dict[str, torch.Tensor]:
+        """Return {mm_hash: image embeddings}; run the vision encoder only on cache misses."""
+        embeds, misses = {}, {}
+        for seq in seqs:
+            key = seq.mm_hash
+            if key in embeds or key in misses:
+                self.mm_cache_hits += 1  # same image twice in one step
+            elif key in self.mm_cache:
+                self.mm_cache.move_to_end(key)
+                embeds[key] = self.mm_cache[key]
+                self.mm_cache_hits += 1
+            else:
+                misses[key] = seq.pixel_values
+                self.mm_cache_misses += 1
+        by_shape = defaultdict(list)
+        for key, px in misses.items():
+            by_shape[px.shape].append(key)
+        for keys in by_shape.values():
+            with self._inductor_ctx():
+                out = self.image_fn(torch.stack([misses[k] for k in keys]))
+            for key, emb in zip(keys, out):
+                embeds[key] = emb.clone()  # own storage, not a view of the batch
+                if self.mm_cache_size:
+                    self.mm_cache[key] = embeds[key]
+                    if len(self.mm_cache) > self.mm_cache_size:
+                        self.mm_cache.popitem(last=False)
+        return embeds
+
     @torch.no_grad()
     def _encode(self, seqs) -> None:
         """Batch fresh sequences by (encoder_len, image_shape) and cache cross-attn K/V."""
+        images = [s for s in seqs if s.pixel_values is not None]
+        embeds = self._image_embeds(images) if images else {}
         groups = defaultdict(list)
         for seq in seqs:
             px_shape = (
@@ -103,16 +138,12 @@ class ModelRunner:
             groups[(len(seq.encoder_token_ids), px_shape)].append(seq)
         for group in groups.values():
             ids = torch.tensor([s.encoder_token_ids for s in group], dtype=torch.long)
-            px = (
-                None
-                if group[0].pixel_values is None
-                else torch.stack([s.pixel_values for s in group])
-            )
             with self._inductor_ctx():
-                if px is None:
+                if group[0].pixel_values is None:
                     hidden = self.encode_fn(ids)
                 else:
-                    hidden = self.encode_fn(ids, image_embeds=self.image_fn(px))
+                    image_embeds = torch.stack([embeds[s.mm_hash] for s in group])
+                    hidden = self.encode_fn(ids, image_embeds=image_embeds)
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
                 shape = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)

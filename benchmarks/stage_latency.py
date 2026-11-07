@@ -79,6 +79,7 @@ def fast_stages(args, input_token_ids, pixels, dtype):
         block_size=block_size,
         max_num_seqs=num_sequences,
         dtype=dtype,
+        mm_cache_size=0,  # stages time the vision encoder on every call
     )
     runner = llm.engine.runner
 

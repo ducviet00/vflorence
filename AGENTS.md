@@ -92,6 +92,7 @@ Scheduler.schedule()              # admit waiting up to max_num_seqs; return ALL
 ModelRunner.run(seqs)
     fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
     _encode(fresh)                # batched encoder (grouped by length/image shape) -> dense cross-attn K/V
+                                  #   vision encoder runs only on mm_cache misses
     _prepare(seqs)                # input_ids/positions/slot_mapping/self_metadata; ensure blocks/CoW
     set_context(...)              # Context: context_lens, block_tables, slot_mapping,
                                   #   query_start_loc, self_metadata, isa, cross_staged
@@ -142,9 +143,14 @@ compiled graph.
    any block that will be written while shared (it returns the `(src, dst)` pair;
    `ModelRunner._copy_blocks` copies all of a step's pairs at once). Children are created **before**
    parents are freed.
-6. **Scheduling.** `Scheduler.schedule()` returns *all* running sequences each
+6. **Multimodal cache.** `ModelRunner.mm_cache` is an LRU (`Config.mm_cache_size`
+   entries, 0 disables) of `Sequence.mm_hash -> image_embeds` (vision tower +
+   projector output), kept across `generate` calls; `mm_cache_hits` /
+   `mm_cache_misses` count lookups. `mm_hash` is the sha256 of `pixel_values`
+   (~3 ms for 768x768 fp32); the processor still runs every time (~2.5 ms).
+7. **Scheduling.** `Scheduler.schedule()` returns *all* running sequences each
    step, so a request's beams are never split. Keep `max_num_seqs >= num_beams`.
-7. **Global context.** `utils/context.set_context(...)` is called once per
+8. **Global context.** `utils/context.set_context(...)` is called once per
    forward; it builds the step's `Context` and attention custom ops read it via
    `get_context()`. It is not thread-safe and assumes a single in-flight
    forward.
@@ -175,5 +181,5 @@ PYTHONPATH=. $P examples/florence2.py
 # one backend per run: repeat each with --backend hf
 PYTHONPATH=. $P benchmarks/stage_latency.py --backend fast
 PYTHONPATH=. $P benchmarks/stage_latency.py --backend fast --model facebook/bart-large-cnn --enc-len 512
-PYTHONPATH=. $P benchmarks/continuous_batching.py --backend fast --beamsearch 1   # and 4
+PYTHONPATH=. $P benchmarks/continuous_batching.py --backend fast --beamsearch 1   # and 4; --mm-cache-size 0 disables the image cache
 ```
