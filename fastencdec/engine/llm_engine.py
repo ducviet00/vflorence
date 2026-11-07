@@ -3,10 +3,10 @@ import torch
 from ..config import Config
 from ..sampling_params import SamplingParams
 from .model_runner import ModelRunner
-from .scheduler import Scheduler, select_beam_candidates
+from .scheduler import Scheduler
 from .sequence import Request, RequestOut, Sequence
 
-__all__ = ["LLMEngine", "Request", "RequestOut", "select_beam_candidates"]
+__all__ = ["LLMEngine", "Request", "RequestOut"]
 
 
 class LLMEngine:
