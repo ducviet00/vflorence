@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer
 
-from fastencdec import LLM, SamplingParams
+from fastencdec import LLM, Request, SamplingParams
 
 MODEL = "hf-internal-testing/tiny-random-BartForConditionalGeneration"
 TEXT = "The quick brown fox jumps over the lazy dog."
@@ -31,15 +31,16 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     hf = AutoModelForSeq2SeqLM.from_config(config).eval()
     inputs = tokenizer(TEXT, return_tensors="pt")
+    text_req = Request(inputs["input_ids"][0].tolist())
+    batch_reqs = [Request(tokenizer(t)["input_ids"]) for t in BATCH]
 
     with TemporaryDirectory() as tmpdir:
         hf.save_pretrained(tmpdir)
-        tokenizer.save_pretrained(tmpdir)
         llm = LLM(tmpdir, num_blocks=64, block_size=16)
 
     for beams in (1, 2, 4):
         params = SamplingParams(max_tokens=12, num_beams=beams)
-        ours = llm.generate(TEXT, sampling_params=params)[0].outputs[0].token_ids
+        ours = llm.generate(text_req, sampling_params=params)[0].completion_token_ids
         with torch.no_grad():
             ref = hf.generate(
                 **inputs,
@@ -60,11 +61,12 @@ def main():
     for beams in (1, 2, 4):
         params = SamplingParams(max_tokens=12, num_beams=beams, min_length=13)
         batched = [
-            o.outputs[0].token_ids for o in llm.generate(BATCH, sampling_params=params)
+            o.completion_token_ids
+            for o in llm.generate(batch_reqs, sampling_params=params)
         ]
         single = [
-            llm.generate(text, sampling_params=params)[0].outputs[0].token_ids
-            for text in BATCH
+            llm.generate(req, sampling_params=params)[0].completion_token_ids
+            for req in batch_reqs
         ]
         for i, (b, s) in enumerate(zip(batched, single)):
             assert b == s, (beams, i, b, s)
@@ -77,7 +79,6 @@ def main():
         hf.final_logits_bias[0, config.eos_token_id] += 0.2
     with TemporaryDirectory() as tmpdir:
         hf.save_pretrained(tmpdir)
-        tokenizer.save_pretrained(tmpdir)
         llm = LLM(tmpdir, num_blocks=64, block_size=16)
     for beams in (2, 4):
         for early_stopping in (False, True):
@@ -87,7 +88,9 @@ def main():
                 min_length=4,
                 early_stopping=early_stopping,
             )
-            ours = llm.generate(TEXT, sampling_params=params)[0].outputs[0].token_ids
+            ours = llm.generate(text_req, sampling_params=params)[
+                0
+            ].completion_token_ids
             with torch.no_grad():
                 ref = hf.generate(
                     **inputs,
