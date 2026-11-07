@@ -19,9 +19,9 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence) -> None:
-        if seq.sampling.num_beams > self.max_num_seqs:
+        if seq.sampling_params.num_beams > self.max_num_seqs:
             raise ValueError(
-                f"num_beams ({seq.sampling.num_beams}) exceeds "
+                f"num_beams ({seq.sampling_params.num_beams}) exceeds "
                 f"max_num_seqs ({self.max_num_seqs})"
             )
         self.waiting.append(seq)
@@ -30,21 +30,27 @@ class Scheduler:
         self.running.remove(seq)
         self.block_manager.deallocate(seq)
 
-    def _fork(self, parent: Sequence, token: int, score: float = 0.0) -> Sequence:
-        child = parent.fork(token, score)
+    def _fork(
+        self, parent: Sequence, token_id: int, cum_logprob: float = 0.0
+    ) -> Sequence:
+        child = parent.fork(token_id, cum_logprob)
         self.block_manager.fork(parent, child)
         return child
 
     def schedule(self) -> tuple[list[Sequence], list[tuple[int, int]]]:
         """Admit waiting sequences up to max_num_seqs, allocate KV blocks, and return (running, copies)."""
-        used = sum({s.request_id: s.sampling.num_beams for s in self.running}.values())
+        used = sum(
+            {
+                seq.request_id: seq.sampling_params.num_beams for seq in self.running
+            }.values()
+        )
         while (
             self.waiting
-            and used + self.waiting[0].sampling.num_beams <= self.max_num_seqs
+            and used + self.waiting[0].sampling_params.num_beams <= self.max_num_seqs
         ):
             seq = self.waiting.popleft()
             self.running.append(seq)
-            used += seq.sampling.num_beams
+            used += seq.sampling_params.num_beams
 
         seqs = list(self.running)
         if (
@@ -64,7 +70,7 @@ class Scheduler:
     ) -> list[tuple[int, RequestOut]]:
         for seq in seqs:
             seq.num_cached_tokens += 1
-        if seqs and seqs[0].sampling.num_beams > 1:
+        if seqs and seqs[0].sampling_params.num_beams > 1:
             return self._postprocess_beam(seqs, sample_out)
         return self._postprocess_greedy(seqs, sample_out)
 
@@ -72,8 +78,8 @@ class Scheduler:
         self, seqs: list[Sequence], token_ids: list[int]
     ) -> list[tuple[int, RequestOut]]:
         outputs = []
-        for seq, token in zip(seqs, token_ids):
-            seq.append_token(token)
+        for seq, token_id in zip(seqs, token_ids):
+            seq.append_token(token_id)
             if seq.is_finished:
                 self.remove(seq)
                 outputs.append((seq.request_id, seq.to_output()))
@@ -84,15 +90,15 @@ class Scheduler:
     ) -> list[tuple[int, RequestOut]]:
         outputs = []
         for request_id, candidates in topk_candidates.items():
-            params = candidates[0][0].sampling
-            num_beams = params.num_beams
-            early_stopping = params.early_stopping
+            sampling_params = candidates[0][0].sampling_params
+            num_beams = sampling_params.num_beams
+            early_stopping = sampling_params.early_stopping
             finished_beams = self._finished_beams[request_id]
             running_beams = []
 
             # Split top-K continuations into finished (only if rank < num_beams) and running beams.
-            for rank, (parent, token, log_prob) in enumerate(candidates):
-                child = parent.fork(token, log_prob)
+            for rank, (parent, token_id, cum_logprob) in enumerate(candidates):
+                child = parent.fork(token_id, cum_logprob)
                 if child.is_finished:
                     if rank < num_beams:
                         finished_beams.append(child)
@@ -100,7 +106,7 @@ class Scheduler:
                     running_beams.append((parent, child))
 
             # Keep top num_beams finished beams ranked by length-penalized score.
-            finished_beams.sort(key=lambda s: s.score, reverse=True)
+            finished_beams.sort(key=lambda seq: seq.score, reverse=True)
             del finished_beams[num_beams:]
 
             # Stop when no running beams remain or the early-stop heuristic is satisfied.
