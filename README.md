@@ -134,10 +134,10 @@ cells are wall time and generated tokens/s, speedup over HF is by wall time.
 
 <table>
 <tr><th>config</th><th>engine</th><th align="right">c4a-standard-8</th><th align="right">c4-standard-8</th></tr>
-<tr><td rowspan="2">greedy</td><td>fast-encdec</td><td align="right">7.6 s, 481 tok/s (<b>4.31x</b>)</td><td align="right">7.6 s, 475 tok/s (<b>5.27x</b>)</td></tr>
-<tr><td>HF</td><td align="right">32.6 s, 112 tok/s</td><td align="right">40.0 s, 95 tok/s</td></tr>
-<tr><td rowspan="2">beams=4</td><td>fast-encdec</td><td align="right">16.5 s, 314 tok/s (<b>4.41x</b>)</td><td align="right">16.4 s, 318 tok/s (<b>8.19x</b>)</td></tr>
-<tr><td>HF</td><td align="right">72.6 s, 72 tok/s</td><td align="right">134.4 s, 37 tok/s</td></tr>
+<tr><td rowspan="2">greedy</td><td>fast-encdec</td><td align="right">7.7 s, 475 tok/s (<b>4.41x</b>)</td><td align="right">8.2 s, 440 tok/s (<b>5.16x</b>)</td></tr>
+<tr><td>HF</td><td align="right">33.9 s, 108 tok/s</td><td align="right">42.3 s, 90 tok/s</td></tr>
+<tr><td rowspan="2">beams=4</td><td>fast-encdec</td><td align="right">16.2 s, 319 tok/s (<b>4.51x</b>)</td><td align="right">18.4 s, 284 tok/s (<b>7.77x</b>)</td></tr>
+<tr><td>HF</td><td align="right">73.0 s, 71 tok/s</td><td align="right">143.0 s, 35 tok/s</td></tr>
 </table>
 
 **Per stage** (`benchmarks/stage_latency.py`): batch 8; Florence-2-base with
@@ -147,13 +147,13 @@ The decode step is averaged over 128 steps with EOS suppressed.
 
 | stage | c4a-standard-8 | c4-standard-8 |
 |---|---:|---:|
-| Florence-2 vision | 2298 / 2280 ms (0.99x) | 1626 / 2733 ms (1.68x) |
-| Florence-2 encode | 268 / 270 ms (1.01x) | 173 / 193 ms (1.11x) |
-| Florence-2 decode step, greedy | 6.07 / 11.08 ms (1.83x) | 8.52 / 14.36 ms (1.69x) |
-| Florence-2 decode step, beams=4 | 13.03 / 25.09 ms (1.93x) | 16.06 / 47.71 ms (2.97x) |
-| BART encode | 717 / 717 ms (1.00x) | 429 / 483 ms (1.13x) |
-| BART decode step, greedy | 12.95 / 23.70 ms (1.83x) | 19.36 / 29.71 ms (1.53x) |
-| BART decode step, beams=4 | 27.73 / 54.95 ms (1.98x) | 33.40 / 101.77 ms (3.05x) |
+| Florence-2 vision | 2237 / 2295 ms (1.03x) | 1352 / 2403 ms (1.78x) |
+| Florence-2 encode | 271 / 276 ms (1.02x) | 150 / 162 ms (1.08x) |
+| Florence-2 decode step, greedy | 6.54 / 11.41 ms (1.74x) | 6.86 / 11.77 ms (1.72x) |
+| Florence-2 decode step, beams=4 | 13.39 / 25.61 ms (1.91x) | 16.29 / 50.56 ms (3.10x) |
+| BART encode | 718 / 738 ms (1.03x) | 431 / 480 ms (1.11x) |
+| BART decode step, greedy | 13.60 / 24.66 ms (1.81x) | 20.14 / 31.64 ms (1.57x) |
+| BART decode step, beams=4 | 27.17 / 55.47 ms (2.04x) | 34.13 / 107.45 ms (3.15x) |
 
 ## Tests & Benchmarks
 
