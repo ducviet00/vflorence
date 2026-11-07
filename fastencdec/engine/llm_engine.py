@@ -39,6 +39,7 @@ class LLMEngine:
             config.dtype,
             compile=config.compile,
             compile_mm_encoder=config.compile_mm_encoder,
+            mm_cache_size=config.mm_cache_size,
         )
         self.scheduler = Scheduler(config)
         self.max_positions = model.config.get_text_config().max_position_embeddings
@@ -226,6 +227,7 @@ class LLMEngine:
             parent.encoder_token_ids,
             parent.sampling,
             parent.pixel_values,
+            parent.mm_hash,
         )
         child.token_ids = [*parent.token_ids, token]
         child.num_cached_tokens = parent.num_cached_tokens

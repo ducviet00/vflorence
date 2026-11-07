@@ -33,6 +33,7 @@ class LLM:
         dtype: torch.dtype = torch.float32,
         compile: bool = True,
         compile_mm_encoder: bool = True,
+        mm_cache_size: int = 256,
     ):
         config = Config(
             num_blocks=num_blocks,
@@ -41,6 +42,7 @@ class LLM:
             dtype=dtype,
             compile=compile,
             compile_mm_encoder=compile_mm_encoder,
+            mm_cache_size=mm_cache_size,
         )
         hf_config = AutoConfig.from_pretrained(model_path)
         self.multimodal = hf_config.model_type == "florence2"

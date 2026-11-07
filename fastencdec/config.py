@@ -19,6 +19,7 @@ class Config:
     dtype: torch.dtype = torch.float32
     compile: bool = True
     compile_mm_encoder: bool = True
+    mm_cache_size: int = 256  # image embeddings kept across calls; 0 disables
 
     def __post_init__(self) -> None:
         if self.block_size is None:
@@ -27,5 +28,7 @@ class Config:
             raise ValueError("num_blocks, block_size and max_num_seqs must be positive")
         if self.block_size % 16 != 0:
             raise ValueError("block_size must be a multiple of 16")
+        if self.mm_cache_size < 0:
+            raise ValueError("mm_cache_size must be >= 0")
         if self.dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("dtype must be torch.float32 or torch.bfloat16")
