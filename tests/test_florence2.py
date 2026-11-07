@@ -172,6 +172,10 @@ def main():
     engine.generate([(ids_a, start, image_a)], params)
     assert calls == [1, 1, 1], calls
     assert (runner.mm_cache_hits, runner.mm_cache_misses) == (2, 3)
+    # Mixed hit + miss in one step: the later request (cached image_a) stays.
+    hash_a = next(iter(runner.mm_cache))
+    engine.generate([(ids_a, start, image_b), (ids_a, start, image_a)], params)
+    assert list(runner.mm_cache) == [hash_a] and calls == [1, 1, 1, 1], calls
     print("[OK] mm cache: dedup, cross-call hit, LRU eviction, hit stats")
 
 

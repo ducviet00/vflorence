@@ -105,7 +105,6 @@ class ModelRunner:
             if key in embeds or key in misses:
                 self.mm_cache_hits += 1  # same image twice in one step
             elif key in self.mm_cache:
-                self.mm_cache.move_to_end(key)
                 embeds[key] = self.mm_cache[key]
                 self.mm_cache_hits += 1
             else:
@@ -119,10 +118,13 @@ class ModelRunner:
                 out = self.image_fn(torch.stack([misses[k] for k in keys]))
             for key, emb in zip(keys, out):
                 embeds[key] = emb.clone()  # own storage, not a view of the batch
-                if self.mm_cache_size:
-                    self.mm_cache[key] = embeds[key]
-                    if len(self.mm_cache) > self.mm_cache_size:
-                        self.mm_cache.popitem(last=False)
+        if self.mm_cache_size:
+            # Update recency in request order, so hits and misses rank by last use.
+            for seq in seqs:
+                self.mm_cache[seq.mm_hash] = embeds[seq.mm_hash]
+                self.mm_cache.move_to_end(seq.mm_hash)
+            while len(self.mm_cache) > self.mm_cache_size:
+                self.mm_cache.popitem(last=False)
         return embeds
 
     @torch.no_grad()
