@@ -29,6 +29,7 @@ class ModelRunner:
     """Manages KV caches, encoder caching, step preparation, and model execution."""
 
     def __init__(self, config: Config):
+        self.config = config
         self.model = load_hf_weights(config)
         self.block_size = config.block_size
         self.dtype = config.dtype
@@ -57,12 +58,14 @@ class ModelRunner:
         self._cross_staged = None
         self._logits_processor: LogitsProcessor | None = None
         self._sampling_params: SamplingParams | None = None
+        self.allocate_kv_cache()
 
+    def allocate_kv_cache(self) -> None:
         # Separate tensors per layer: views of one shared tensor break Inductor codegen.
         # zeros, not empty: the kernel reads whole blocks, and 0 * NaN from garbage
         # in a block's unused tail would poison the output.
         shape = (
-            config.num_blocks,
+            self.config.num_blocks,
             self.num_heads,
             self.block_size,
             self.head_dim,
@@ -85,7 +88,7 @@ class ModelRunner:
             (weight_bytes + kv_bytes) / (1024**2),
             weight_bytes / (1024**2),
             kv_bytes / (1024**2),
-            config.num_blocks,
+            self.config.num_blocks,
             self.block_size,
         )
 
