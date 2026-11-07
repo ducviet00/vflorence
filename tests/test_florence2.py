@@ -104,8 +104,6 @@ def main():
                     max_new_tokens=6,
                     num_beams=beams,
                     do_sample=False,
-                    forced_bos_token_id=None,
-                    forced_eos_token_id=None,
                 )
             ref_tokens = ref[0].tolist()
             assert our_tokens == ref_tokens, (beams, our_tokens, ref_tokens)

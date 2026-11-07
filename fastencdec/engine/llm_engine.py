@@ -1,3 +1,6 @@
+import logging
+import math
+
 import torch
 
 from ..config import Config
@@ -7,6 +10,8 @@ from .scheduler import Scheduler
 from .sequence import Request, RequestOut, Sequence
 
 __all__ = ["LLMEngine", "Request", "RequestOut"]
+
+logger = logging.getLogger(__name__)
 
 
 class LLMEngine:
@@ -20,12 +25,21 @@ class LLMEngine:
         self.max_positions = config.text_config.max_position_embeddings
         self.decoder_start_token_id = config.text_config.decoder_start_token_id
         self.eos_token_id = config.text_config.eos_token_id
-        self.default_sampling_params = SamplingParams.from_generation_config(
+        self._sampling_params = SamplingParams.from_generation_config(
             config.generation_config, self.eos_token_id
         )
         self._next_request_id = 0
 
-    def add_request(self, request: Request, sampling_params: SamplingParams) -> int:
+    def add_request(
+        self,
+        request: Request,
+        sampling_params: SamplingParams | None = None,
+    ) -> int:
+        if sampling_params is None:
+            sampling_params = self._sampling_params
+        else:
+            sampling_params = sampling_params.with_defaults(self._sampling_params)
+        self._validate(request, sampling_params)
         request_id = self._next_request_id
         self._next_request_id += 1
         self.scheduler.add(
@@ -63,35 +77,48 @@ class LLMEngine:
             requests = list(requests)
         if not requests:
             return []
-        sampling_params = sampling_params or self.default_sampling_params
-        self._validate(requests, sampling_params)
 
-        request_ids = [
-            self.add_request(request, sampling_params) for request in requests
-        ]
+        slots: list[int | RequestOut] = []
+        for request in requests:
+            try:
+                slots.append(self.add_request(request, sampling_params))
+            except ValueError as e:
+                logger.error("request rejected: %s", e)
+                slots.append(RequestOut(request.input_ids, [], request.pixel_values))
         outputs: dict[int, RequestOut] = {}
         while not self.is_finished():
             for request_id, out in self.step():
                 outputs[request_id] = out
-        return [outputs[request_id] for request_id in request_ids]
+        return [outputs[s] if isinstance(s, int) else s for s in slots]
 
-    def _validate(self, requests, sampling_params: SamplingParams) -> None:
-        """Reject requests that would crash or run out of KV cache mid-batch."""
+    def _validate(self, request: Request, sampling_params: SamplingParams) -> None:
+        """Reject a request that would crash or run out of KV cache mid-step."""
+        if request.pixel_values is not None and self.runner.image_fn is None:
+            raise ValueError(
+                "pixel_values are only supported for Florence-2 checkpoints"
+            )
+
+        active = self.scheduler.waiting or self.scheduler.running
+        if active and active[0].sampling_params != sampling_params:
+            raise ValueError("all active requests must share the same SamplingParams")
         if sampling_params.max_tokens > self.max_positions:
             raise ValueError(
                 f"max_tokens ({sampling_params.max_tokens}) exceeds the model's "
                 f"max_position_embeddings ({self.max_positions})"
             )
-        for request in requests:
-            if len(request.input_ids) > self.max_positions:
-                raise ValueError(
-                    f"encoder prompt has {len(request.input_ids)} tokens; the model "
-                    f"supports at most {self.max_positions}"
-                )
-        # shortcut: checks one request alone; a full batch can still run out.
-        # Upgrade to preemption if that shows up in practice.
-        max_num_blocks = sampling_params.num_beams * (
-            sampling_params.max_tokens // self.config.block_size
+        if len(request.input_ids) > self.max_positions:
+            raise ValueError(
+                f"encoder prompt has {len(request.input_ids)} tokens; the model "
+                f"supports at most {self.max_positions}"
+            )
+        if sampling_params.num_beams > self.config.max_num_seqs:
+            raise ValueError(
+                f"num_beams ({sampling_params.num_beams}) exceeds "
+                f"max_num_seqs ({self.config.max_num_seqs})"
+            )
+
+        max_num_blocks = sampling_params.num_beams * math.ceil(
+            sampling_params.max_tokens / self.config.block_size
         )
         if max_num_blocks > self.config.num_blocks:
             raise ValueError(

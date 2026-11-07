@@ -47,8 +47,6 @@ def main():
                 max_new_tokens=12,
                 num_beams=beams,
                 do_sample=False,
-                forced_bos_token_id=None,
-                forced_eos_token_id=None,
             )
         ref_tokens = ref[0].tolist()[1:]
         assert ours == ref_tokens, (beams, ours, ref_tokens)
@@ -99,8 +97,6 @@ def main():
                     early_stopping=early_stopping,
                     min_length=4,
                     do_sample=False,
-                    forced_bos_token_id=None,
-                    forced_eos_token_id=None,
                 )
             ref_tokens = [t for t in ref[0].tolist()[1:] if t != config.pad_token_id]
             assert ours == ref_tokens, (beams, early_stopping, ours, ref_tokens)

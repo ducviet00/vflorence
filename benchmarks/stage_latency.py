@@ -149,8 +149,6 @@ def hf_stages(args, input_token_ids, pixels, dtype):
             min_new_tokens=tokens,  # Suppress EOS so every request generates exactly N tokens.
             num_beams=args.beams,
             do_sample=False,
-            forced_bos_token_id=None,
-            forced_eos_token_id=None,
             early_stopping=False,
             length_penalty=1.0,
             no_repeat_ngram_size=0,

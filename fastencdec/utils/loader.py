@@ -3,6 +3,11 @@ import transformers
 
 from ..config import Config
 
+_ARCH_BY_MODEL_TYPE = {
+    "bart": "BartForConditionalGeneration",
+    "florence2": "Florence2ForConditionalGeneration",
+}
+
 
 def fuse_projections(model, state_dict: dict) -> None:
     """Concatenate separate HF projections (e.g. q/k/v_proj -> qkv_proj) along dim 0 in state_dict."""
@@ -20,7 +25,10 @@ def load_hf_weights(config: Config):
     """Instantiate model from config and load HuggingFace checkpoint weights."""
     from .. import models
 
-    arch = config.hf_config.architectures[0]
+    model_type = config.hf_config.model_type
+    if model_type not in _ARCH_BY_MODEL_TYPE:
+        raise ValueError(f"unsupported model_type: {model_type!r}")
+    arch = _ARCH_BY_MODEL_TYPE[model_type]
     model = getattr(models, arch)(config.hf_config)
     hf_model_cls = getattr(transformers, arch)
 

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from math import isfinite
 from numbers import Real
 
@@ -10,7 +10,9 @@ class SamplingParams:
     max_tokens: int = 64
     num_beams: int = 1
     repetition_penalty: float = 1.0
-    eos_token_id: int | list[int] | None = 2
+    eos_token_id: int | list[int] | None = (
+        None  # None: checkpoint default; []: never stop
+    )
     length_penalty: float = 1.0
     no_repeat_ngram_size: int = 0
     min_length: int = 0
@@ -53,6 +55,17 @@ class SamplingParams:
             if value is not None and not _is_id_list(value):
                 raise ValueError(f"{name} must be a list of token IDs")
 
+    def with_defaults(self, default: "SamplingParams") -> "SamplingParams":
+        """Like transformers' generate(): a copy whose None fields take default's values."""
+        return replace(
+            self,
+            **{
+                f.name: getattr(default, f.name)
+                for f in fields(self)
+                if getattr(self, f.name) is None
+            },
+        )
+
     def eos_ids(self) -> set[int]:
         if self.eos_token_id is None:
             return set()
@@ -66,7 +79,7 @@ class SamplingParams:
     def from_generation_config(
         cls,
         config,
-        eos_token_id: int | list[int] | None = 2,
+        eos_token_id: int | list[int] | None = None,
         decoder_prompt_len: int = 1,
     ) -> "SamplingParams":
         val = lambda x, default: default if x is None else x

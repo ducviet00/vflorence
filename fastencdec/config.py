@@ -1,3 +1,4 @@
+import math
 import platform
 from dataclasses import dataclass, field
 
@@ -14,8 +15,8 @@ class Config:
     dtype: torch.dtype = torch.float32
     compile: bool = True
     mm_cache_size: int = 256  # image embeddings kept across calls; 0 disables
+    num_blocks: int | None = None  # None: enough for max_num_seqs full-length sequences
     block_size: int = field(init=False)
-    num_blocks: int = field(init=False)
     hf_config: PretrainedConfig = field(init=False)
     text_config: PretrainedConfig = field(init=False)
     generation_config: GenerationConfig = field(init=False)
@@ -36,6 +37,9 @@ class Config:
             self.generation_config = GenerationConfig.from_pretrained(self.model)
         except OSError:
             self.generation_config = GenerationConfig()
-        self.num_blocks = self.max_num_seqs * (
-            self.text_config.max_position_embeddings // self.block_size
-        )
+        if self.num_blocks is None:
+            self.num_blocks = self.max_num_seqs * math.ceil(
+                self.text_config.max_position_embeddings / self.block_size
+            )
+        if self.num_blocks <= 0:
+            raise ValueError("num_blocks must be positive")
