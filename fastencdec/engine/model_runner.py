@@ -2,7 +2,6 @@ import logging
 import platform
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
-from itertools import groupby
 
 import torch
 import vllm_cpu_attn
@@ -285,57 +284,33 @@ class ModelRunner:
     def _beam_search(self, seqs, scores, sampling_params) -> dict[int, list]:
         """Return each request's top-k (parent, token_id, cum_logprob) candidates.
 
-        scores holds processed log-probs, one row per seq; it is updated in place.
+        scores holds processed log-probs, one row per seq.
         """
-        vocab_size = scores.shape[-1]
         # Keep top K = max(2, 1 + n_eos_tokens) * num_beams continuations.
         n_eos_tokens = len(sampling_params.eos_ids())
         beams_to_keep = max(2, 1 + n_eos_tokens) * sampling_params.num_beams
-        cum_logprobs = torch.tensor(
+        # cum_logprob is constant per row, so a request's top K lies within its
+        # rows' top K: topk each row over the vocab, then add cum_logprob to the
+        # survivors only (in float32, as the full-vocab add did).
+        top_scores, top_ids = torch.topk(
+            scores, min(beams_to_keep, scores.shape[-1]), dim=-1
+        )
+        top_scores += torch.tensor(
             [seq.cum_logprob for seq in seqs], dtype=torch.float32
-        )
-        scores += cum_logprobs.unsqueeze(-1)
+        ).unsqueeze(-1)
 
-        # The scheduler keeps a request's beams adjacent, so each request is one
-        # contiguous slice of scores.
-        requests = [
-            (request_id, list(beams))
-            for request_id, beams in groupby(seqs, key=lambda seq: seq.request_id)
-        ]
-        assert len({request_id for request_id, _ in requests}) == len(requests), (
-            "beams of a request must be adjacent"
-        )
-        beam_counts = {len(beams) for _, beams in requests}
-        if len(beam_counts) == 1:
-            # Usual case, every request has the same live beam count: one topk
-            # over [requests, beams * vocab] (a view, no copy).
-            flat = scores.view(len(requests), -1)
-            top_scores, top_indices = torch.topk(
-                flat, min(beams_to_keep, flat.shape[-1]), dim=-1
-            )
-            tops = zip(top_scores.tolist(), top_indices.tolist())
-        else:
-            # A request on its first step has 1 beam; topk each request separately.
-            tops = []
-            start = 0
-            for _, beams in requests:
-                flat = scores[start : start + len(beams)].flatten()
-                top_scores, top_indices = torch.topk(
-                    flat, min(beams_to_keep, flat.numel())
-                )
-                tops.append((top_scores.tolist(), top_indices.tolist()))
-                start += len(beams)
-
-        topk_candidates = {}
-        for (request_id, beams), (request_scores, request_indices) in zip(
-            requests, tops
+        topk_candidates = defaultdict(list)
+        for seq, row_scores, row_ids in zip(
+            seqs, top_scores.tolist(), top_ids.tolist()
         ):
-            candidates = []
-            for index, cum_logprob in zip(request_indices, request_scores):
-                beam, token_id = divmod(index, vocab_size)
-                candidates.append((beams[beam], token_id, cum_logprob))
-            topk_candidates[request_id] = candidates
-        return topk_candidates
+            topk_candidates[seq.request_id].extend(
+                zip([seq] * len(row_ids), row_ids, row_scores)
+            )
+        for candidates in topk_candidates.values():
+            # Stable sort: ties keep beam-then-rank order, like a flattened topk.
+            candidates.sort(key=lambda candidate: candidate[2], reverse=True)
+            del candidates[beams_to_keep:]
+        return dict(topk_candidates)
 
     @torch.no_grad()
     def run(self, seqs, copies=()):
