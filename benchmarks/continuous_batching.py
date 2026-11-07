@@ -107,8 +107,6 @@ def run_hf(args, input_token_ids, pixels, dtype, tokenizer):
                 num_beams=args.beamsearch,
                 # Override checkpoint defaults to match fast-encdec's decoding.
                 do_sample=False,
-                forced_bos_token_id=None,
-                forced_eos_token_id=None,
                 early_stopping=False,
                 length_penalty=1.0,
                 no_repeat_ngram_size=0,

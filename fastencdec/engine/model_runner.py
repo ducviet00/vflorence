@@ -247,10 +247,7 @@ class ModelRunner:
         )
 
     def _get_logits_processor(self, sampling_params: SamplingParams) -> LogitsProcessor:
-        if (
-            sampling_params is not self._sampling_params
-            or self._logits_processor is None
-        ):
+        if sampling_params != self._sampling_params or self._logits_processor is None:
             # Lengths count the single decoder start token, as transformers does.
             self._logits_processor = LogitsProcessor(
                 sampling_params,
