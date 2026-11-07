@@ -280,38 +280,39 @@ class ModelRunner:
             groups[(len(indices), len(seqs[indices[0]].token_ids))].append(
                 (request_id, indices)
             )
-        candidates = {}
+        topk_candidates = {}
         for (beam_count, _), group in groups.items():
             rows = [i for _, seq_indices in group for i in seq_indices]
             input_ids = torch.tensor(
                 [seqs[i].token_ids for i in rows], dtype=torch.long
             )
-            logprobs = processor(
+            log_probs = processor(
                 input_ids, torch.log_softmax(logits[rows].float(), dim=-1)
             )
-            cumulative = torch.tensor(
+            running_beam_scores = torch.tensor(
                 [
                     [seqs[i].cum_logprob for i in seq_indices]
                     for _, seq_indices in group
                 ],
                 dtype=torch.float32,
             ).unsqueeze(-1)
-            scores = (
-                logprobs.reshape(len(group), beam_count, vocab) + cumulative
+            log_probs = (
+                log_probs.reshape(len(group), beam_count, vocab) + running_beam_scores
             ).reshape(len(group), -1)
-            # Keep enough candidates that num_beams live ones remain after EOS
-            # candidates are set aside (same rule as transformers).
-            keep = min(max(2, 1 + len(params.eos_ids())) * num_beams, scores.shape[-1])
-            top_values, top_indices = torch.topk(scores, keep, dim=-1)
-            for (request_id, _), vals, idxs in zip(
-                group, top_values.tolist(), top_indices.tolist()
+            # Keep top K = max(2, 1 + n_eos_tokens) * num_beams continuations.
+            n_eos_tokens = len(params.eos_ids())
+            beams_to_keep = min(
+                max(2, 1 + n_eos_tokens) * num_beams, log_probs.shape[-1]
+            )
+            topk_log_probs, topk_indices = torch.topk(log_probs, beams_to_keep, dim=-1)
+            for (request_id, seq_indices), vals, idxs in zip(
+                group, topk_log_probs.tolist(), topk_indices.tolist()
             ):
-                candidates[request_id] = (
-                    [k // vocab for k in idxs],
-                    [k % vocab for k in idxs],
-                    vals,
-                )
-        return candidates
+                topk_candidates[request_id] = [
+                    (seqs[seq_indices[k // vocab]], k % vocab, val)
+                    for k, val in zip(idxs, vals)
+                ]
+        return topk_candidates
 
     @torch.no_grad()
     def run(self, seqs, copies=()):
