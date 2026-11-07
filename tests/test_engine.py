@@ -231,6 +231,37 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(mixed, alone)
         self.assertEqual(len(mixed[0]), 8)  # max(2, 1 + 1 eos) * 4 beams
 
+    def test_beam_search_matches_flattened_topk(self):
+        llm = self.engine()
+        torch.manual_seed(0)
+        for eos, vocab in (([2], 32), ([2, 3, 4], 32), ([2], 5)):
+            params = SamplingParams(num_beams=4, eos_token_id=eos)
+            keep = max(2, 1 + len(eos)) * 4
+            seqs = [Sequence(r, [1], [3], params) for r in (0, 0, 0, 0, 1, 2, 2)]
+            for seq in seqs:
+                seq.cum_logprob = -torch.rand(()).item()
+            scores = torch.log_softmax(torch.randn(len(seqs), vocab), dim=-1)
+            scores[-1, :2] = float(
+                "-inf"
+            )  # masked, never picked: -inf ties have no defined order
+            got = llm.runner._beam_search(seqs, scores.clone(), params)
+
+            # Reference: add cum_logprob to every score, topk each request's flat rows.
+            cum = torch.tensor([seq.cum_logprob for seq in seqs]).unsqueeze(-1)
+            total = scores + cum
+            for request_id in (0, 1, 2):
+                rows = [i for i, seq in enumerate(seqs) if seq.request_id == request_id]
+                flat = total[rows].flatten()
+                values, indices = torch.topk(flat, min(keep, flat.numel()))
+                expected = [
+                    (rows[i // vocab], i % vocab, v)
+                    for i, v in zip(indices.tolist(), values.tolist())
+                ]
+                row_of = {id(seq): i for i, seq in enumerate(seqs)}
+                actual = [(row_of[id(p)], t, c) for p, t, c in got[request_id]]
+                with self.subTest(eos=eos, vocab=vocab, request_id=request_id):
+                    self.assertEqual(actual, expected)
+
     def test_eos_override_and_single_request_out(self):
         llm = self.engine()
         # None takes the checkpoint's EOS (2); [] never stops early.
