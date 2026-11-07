@@ -25,7 +25,7 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import torch
 
-from fastencdec import LLM, SamplingParams
+from fastencdec import LLM, Request, SamplingParams
 from fastencdec.config import default_block_size
 
 BART = "facebook/bart-large-cnn"
@@ -96,8 +96,9 @@ def bart(dtype, beams, max_tokens):
         length_penalty=2.0,
         no_repeat_ngram_size=3,
     )
+    requests = [Request(tokenizer(t, truncation=True)["input_ids"]) for t in BART_TEXTS]
     ours = [
-        o.outputs[0].token_ids for o in llm.generate(BART_TEXTS, sampling_params=params)
+        o.completion_token_ids for o in llm.generate(requests, sampling_params=params)
     ]
 
     enc = tokenizer(BART_TEXTS, return_tensors="pt", padding=True)
@@ -137,20 +138,19 @@ def florence(dtype, beams, max_tokens):
     processor = AutoProcessor.from_pretrained(FLORENCE)
     hf = HFFlorence2.from_pretrained(FLORENCE, dtype=dtype).eval()
 
-    prepared = []
+    requests = []
     for prompt in FLORENCE_PROMPTS:
-        inputs = llm.processor(text=prompt, images=image, return_tensors="pt")
-        prepared.append((inputs["input_ids"][0].tolist(), inputs["pixel_values"][0]))
+        inputs = processor(text=prompt, images=image, return_tensors="pt")
+        requests.append(
+            Request(inputs["input_ids"][0].tolist(), inputs["pixel_values"][0])
+        )
 
     params = SamplingParams(
         max_tokens=max_tokens,
         num_beams=beams,
         eos_token_id=llm.eos_token_id,
     )
-    engine_requests = [
-        (ids, [llm.decoder_start_token_id], pixels) for ids, pixels in prepared
-    ]
-    ours = list(llm.engine.generate(engine_requests, params).values())
+    ours = [o.completion_token_ids for o in llm.generate(requests, params)]
 
     inputs = processor(
         text=FLORENCE_PROMPTS,

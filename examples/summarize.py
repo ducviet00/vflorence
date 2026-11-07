@@ -2,8 +2,11 @@
 
 import time
 
-from fastencdec import LLM, SamplingParams
+from transformers import AutoTokenizer
 
+from fastencdec import LLM, Request, SamplingParams
+
+MODEL = "facebook/bart-large-cnn"
 ARTICLE = (
     "The quick brown fox jumps over the lazy dog. It was a sunny afternoon and the "
     "fox had been running through the meadow for hours, chasing butterflies and "
@@ -12,7 +15,8 @@ ARTICLE = (
 
 
 def main():
-    llm = LLM("facebook/bart-large-cnn")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    llm = LLM(MODEL)
 
     # bart-large-cnn needs these decoding heuristics; without them raw decoding
     # collapses to short, repetitive output.
@@ -24,9 +28,11 @@ def main():
         min_length=8,
     )
 
+    request = Request(tokenizer(ARTICLE, truncation=True)["input_ids"])
     start = time.perf_counter()
-    outputs = llm.generate([ARTICLE], params)
-    print(f"{time.perf_counter() - start:.2f}s  {outputs[0].outputs[0].text}")
+    outputs = llm.generate(request, params)
+    text = tokenizer.decode(outputs[0].completion_token_ids, skip_special_tokens=True)
+    print(f"{time.perf_counter() - start:.2f}s  {text}")
 
 
 if __name__ == "__main__":

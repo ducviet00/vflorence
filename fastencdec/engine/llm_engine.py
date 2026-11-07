@@ -42,7 +42,9 @@ class LLMEngine:
             mm_cache_size=config.mm_cache_size,
         )
         self.scheduler = Scheduler(config)
-        self.max_positions = model.config.get_text_config().max_position_embeddings
+        text_config = model.config.get_text_config()
+        self.max_positions = text_config.max_position_embeddings
+        self.decoder_start_token_id = text_config.decoder_start_token_id
         self.eos_token_id = eos_token_id
         self.results: dict[int, list[int]] = {}
         self._finished_beams: dict[int, list[Sequence]] = defaultdict(list)
@@ -50,7 +52,7 @@ class LLMEngine:
         self._next_request_id = 0
 
     def generate(self, requests, params) -> dict[int, list[int]]:
-        """Run a batch of (encoder_token_ids, decoder_token_ids, pixel_values) requests to completion.
+        """Run a batch of Request instances to completion.
 
         Returns {request_id: generated token ids}, in request order.
         """
@@ -72,18 +74,19 @@ class LLMEngine:
             begin_index=1 + int(params.forced_bos_token_id is not None),
         )
 
+        decoder_token_ids = [self.decoder_start_token_id]
         request_ids = []
         try:
-            for encoder_token_ids, decoder_token_ids, pixel_values in requests:
+            for req in requests:
                 request_id = self._next_request_id
                 self._next_request_id += 1
                 self.scheduler.add(
                     Sequence(
                         request_id,
                         decoder_token_ids,
-                        encoder_token_ids,
+                        req.input_ids,
                         params,
-                        pixel_values,
+                        req.pixel_values,
                     )
                 )
                 request_ids.append(request_id)
@@ -100,12 +103,10 @@ class LLMEngine:
                 f"max_tokens ({params.max_tokens}) exceeds the model's "
                 f"max_position_embeddings ({self.max_positions})"
             )
-        for encoder_token_ids, decoder_token_ids, _ in requests:
-            if len(decoder_token_ids) != 1:
-                raise ValueError("the decoder prompt must be a single token")
-            if len(encoder_token_ids) > self.max_positions:
+        for req in requests:
+            if len(req.input_ids) > self.max_positions:
                 raise ValueError(
-                    f"encoder prompt has {len(encoder_token_ids)} tokens; the model "
+                    f"encoder prompt has {len(req.input_ids)} tokens; the model "
                     f"supports at most {self.max_positions}"
                 )
         # shortcut: checks one request alone; a full batch can still run out.

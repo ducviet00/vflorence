@@ -118,15 +118,15 @@ class BenchmarkTests(unittest.TestCase):
                 stages["encode"]()
                 self.assertIs(llm.engine.runner.encode_fn.call_args.args[0], ids)
                 generate(7)
-                requests, params = llm.engine.generate.call_args.args
-                self.assertEqual(requests[0][:2], ([0, 4, 2], [2]))
+                requests, params = llm.generate.call_args.args
+                self.assertEqual(requests[0].input_ids, [0, 4, 2])
                 self.assertEqual(params.max_tokens, 7)
                 self.assertEqual(params.min_length, 8)
                 self.assertEqual(params.num_beams, 4)
                 if pixels is None:
-                    self.assertIsNone(requests[0][2])
+                    self.assertIsNone(requests[0].pixel_values)
                 else:
-                    torch.testing.assert_close(requests[0][2], pixels[0])
+                    torch.testing.assert_close(requests[0].pixel_values, pixels[0])
 
     def test_hf_stage_generation_uses_explicit_inputs_and_token_limit(self):
         args = SimpleNamespace(model="unused", beams=4)

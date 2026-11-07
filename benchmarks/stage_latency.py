@@ -66,7 +66,7 @@ def prepare_inputs(args, florence, dtype):
 
 def fast_stages(args, input_token_ids, pixels, dtype):
     """Return {stage: callable} for fast-encdec."""
-    from fastencdec import LLM, SamplingParams
+    from fastencdec import LLM, Request, SamplingParams
     from fastencdec.config import default_block_size
 
     block_size = default_block_size()
@@ -98,11 +98,7 @@ def fast_stages(args, input_token_ids, pixels, dtype):
             return runner.encode_fn(input_token_ids)
 
     requests = [
-        (
-            row.tolist(),
-            [llm.decoder_start_token_id],
-            pixels[i] if pixels is not None else None,
-        )
+        Request(row.tolist(), pixels[i] if pixels is not None else None)
         for i, row in enumerate(input_token_ids)
     ]
 
@@ -112,7 +108,7 @@ def fast_stages(args, input_token_ids, pixels, dtype):
         params = SamplingParams(
             max_tokens=tokens, num_beams=args.beams, min_length=tokens + 1
         )
-        return llm.engine.generate(requests, params)
+        return llm.generate(requests, params)
 
     stages = {"encode": encode}
     if pixels is not None:

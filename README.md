@@ -34,14 +34,15 @@ See `examples/` for runnable scripts. `LLM` takes `dtype` (`torch.float32` or `t
 `num_blocks`, `block_size`, `max_num_seqs`, `compile` (default `True`) and `compile_mm_encoder`:
 
 ```python
-from fastencdec import LLM, SamplingParams
+from transformers import AutoTokenizer
 
+from fastencdec import LLM, Request, SamplingParams
+
+tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
 llm = LLM("facebook/bart-large-cnn")
-outputs = llm.generate(
-    "A car is parked in front of a building ...",
-    SamplingParams(max_tokens=64, num_beams=4),
-)
-print(outputs[0].outputs[0].text)
+request = Request(tokenizer("A car is parked in front of a building ...")["input_ids"])
+outputs = llm.generate(request, SamplingParams(max_tokens=64, num_beams=4))
+print(tokenizer.decode(outputs[0].completion_token_ids, skip_special_tokens=True))
 ```
 
 Florence-2 takes an image plus a task prompt, and the answer is parsed with the
@@ -50,18 +51,20 @@ processor:
 ```python
 import torch
 from PIL import Image
+from transformers import AutoProcessor
 
-from fastencdec import LLM, SamplingParams
+from fastencdec import LLM, Request, SamplingParams
 
+processor = AutoProcessor.from_pretrained("florence-community/Florence-2-base")
 llm = LLM("florence-community/Florence-2-base", dtype=torch.bfloat16)
 image = Image.open("car.jpg")
+inputs = processor(text="<OD>", images=image, return_tensors="pt")
 outputs = llm.generate(
-    {"prompt": "<OD>", "multi_modal_data": {"image": image}},
+    Request(inputs["input_ids"][0].tolist(), inputs["pixel_values"][0]),
     SamplingParams(max_tokens=256, num_beams=3),
 )
-parsed = llm.processor.post_process_generation(
-    outputs[0].outputs[0].text, task="<OD>", image_size=image.size
-)
+text = processor.tokenizer.decode(outputs[0].completion_token_ids)
+parsed = processor.post_process_generation(text, task="<OD>", image_size=image.size)
 ```
 
 ## How It Works

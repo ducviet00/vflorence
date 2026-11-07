@@ -2,14 +2,14 @@
 
 import unittest
 from tempfile import TemporaryDirectory
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 from transformers import BartConfig, GenerationConfig
 from transformers import BartForConditionalGeneration as HFBart
 from transformers.generation.logits_process import ForcedEOSTokenLogitsProcessor
 
-from fastencdec import LLM, SamplingParams
+from fastencdec import LLM, Request, RequestOut, SamplingParams
 from fastencdec.config import Config
 from fastencdec.engine.llm_engine import LLMEngine
 from fastencdec.engine.sequence import Sequence
@@ -52,7 +52,7 @@ def engine(num_blocks=8, block_size=16):
     )
 
 
-REQUEST = ([3, 4, 5], [1], None)
+REQUEST = Request([3, 4, 5])
 
 
 class EngineTests(unittest.TestCase):
@@ -102,7 +102,7 @@ class EngineTests(unittest.TestCase):
     def test_partial_enqueue_failure(self):
         llm = engine()
         with self.assertRaises(TypeError):
-            llm.generate([REQUEST, (None, [1], None)], SamplingParams())
+            llm.generate([REQUEST, Request(None)], SamplingParams())
         self.assert_clean(llm)
 
     def test_beam_finalization_failure_cleans_detached_request(self):
@@ -175,38 +175,34 @@ class EngineTests(unittest.TestCase):
             llm.runner.run([seq])
         self.assertIsNone(get_context().cross_staged)
 
-    def test_eos_fallback_matches_engine_stop_reason(self):
+    def test_eos_fallback_and_single_request_out(self):
         cases = [
-            (2, [], "length", None),
-            ([2, 3], None, "stop", 2),
+            (2, [], 2),
+            ([2, 3], None, 1),
         ]
-        for model_eos, requested_eos, finish_reason, stop_reason in cases:
+        for model_eos, requested_eos, expected_len in cases:
             with self.subTest(model_eos=model_eos, requested_eos=requested_eos):
                 llm = LLM.__new__(LLM)
                 llm.multimodal = False
                 llm.eos_token_id = model_eos
                 llm.decoder_start_token_id = 1
-                llm.tokenizer = Mock()
-                llm.tokenizer.decode.return_value = ""
                 llm.engine = engine()
                 llm.engine.eos_token_id = model_eos
                 params = SamplingParams(
                     max_tokens=2,
                     eos_token_id=requested_eos,
-                    forced_eos_token_id=2,
-                    min_length=2,
+                    forced_bos_token_id=2,
+                    min_length=1,
                 )
-                (result,) = llm.generate({"prompt_token_ids": [3, 4, 5]}, params)
-                completion = result.outputs[0]
-                self.assertEqual(len(completion.token_ids), 2)
-                self.assertEqual(completion.token_ids[-1], 2)
-                self.assertEqual(completion.finish_reason, finish_reason)
-                self.assertEqual(completion.stop_reason, stop_reason)
+                (result,) = llm.generate(REQUEST, params)
+                self.assertIsInstance(result, RequestOut)
+                self.assertEqual(len(result.completion_token_ids), expected_len)
+                self.assertEqual(result.completion_token_ids[0], 2)
 
     def test_too_long_inputs_are_rejected_before_running(self):
         llm = engine(num_blocks=64)
         cases = [
-            (([3] * 129, [1], None), SamplingParams(max_tokens=2), "encoder prompt"),
+            (Request([3] * 129), SamplingParams(max_tokens=2), "encoder prompt"),
             (REQUEST, SamplingParams(max_tokens=129), "max_position_embeddings"),
             (REQUEST, SamplingParams(max_tokens=128, num_beams=9), "KV blocks"),
         ]
@@ -219,7 +215,7 @@ class EngineTests(unittest.TestCase):
             self.assert_clean(llm)
         # The exact limits still run: 128 encoder tokens and 128 new tokens.
         (tokens,) = llm.generate(
-            [([3] * 128, [1], None)], SamplingParams(max_tokens=128, min_length=200)
+            [Request([3] * 128)], SamplingParams(max_tokens=128, min_length=200)
         ).values()
         self.assertEqual(len(tokens), 128)
 
@@ -305,15 +301,11 @@ class EngineTests(unittest.TestCase):
             llm.generate([REQUEST], params)
         self.assert_clean(llm)
 
-    def test_florence_token_prompt_is_rejected(self):
+    def test_pixel_values_validation(self):
         llm = LLM.__new__(LLM)
-        llm.multimodal = True
-        llm.eos_token_id = 2
-        llm.decoder_start_token_id = 1
-        llm.processor = Mock()
-        with self.assertRaisesRegex(ValueError, "text prompt"):
-            llm.generate({"prompt_token_ids": [3]}, SamplingParams())
-        llm.processor.assert_not_called()
+        llm.multimodal = False
+        with self.assertRaisesRegex(ValueError, "pixel_values"):
+            llm.generate(Request([3], torch.zeros(1)), SamplingParams())
 
     def test_missing_and_extra_weights_are_rejected(self):
         ref = HFBart(model().config)

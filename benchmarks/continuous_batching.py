@@ -50,7 +50,7 @@ def prepare_inputs(processor, num_requests):
 
 
 def run_fast(args, input_token_ids, pixels, dtype):
-    from fastencdec import LLM, SamplingParams
+    from fastencdec import LLM, Request, SamplingParams
     from fastencdec.config import default_block_size
 
     block_size = default_block_size()
@@ -71,8 +71,7 @@ def run_fast(args, input_token_ids, pixels, dtype):
         eos_token_id=llm.eos_token_id,
     )
     requests = [
-        (ids, [llm.decoder_start_token_id], image_pixels)
-        for ids, image_pixels in zip(input_token_ids, pixels)
+        Request(ids, image_pixels) for ids, image_pixels in zip(input_token_ids, pixels)
     ]
 
     runner = llm.engine.runner
@@ -81,7 +80,7 @@ def run_fast(args, input_token_ids, pixels, dtype):
         # Cold cache each run: only reuse within the batch (4 tasks per image) counts.
         runner.mm_cache.clear()
         runner.mm_cache_hits = runner.mm_cache_misses = 0
-        return list(llm.engine.generate(requests, params).values())
+        return [o.completion_token_ids for o in llm.generate(requests, params)]
 
     seconds, rows = timed(once, args.warmup, args.repeats)
     print(
