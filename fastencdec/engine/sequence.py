@@ -1,3 +1,4 @@
+import copy
 import hashlib
 from dataclasses import dataclass, field
 
@@ -49,6 +50,13 @@ class Sequence:
     def append_token(self, token_id: int) -> None:
         self.token_ids.append(token_id)
 
+    def fork(self, token_id: int, cum_logprob: float = 0.0) -> "Sequence":
+        child = copy.copy(self)
+        child.token_ids = [*self.token_ids, token_id]
+        child.block_table = []
+        child.cum_logprob = cum_logprob
+        return child
+
     @property
     def num_generated(self) -> int:
         return len(self.token_ids) - len(self.decoder_token_ids)
@@ -56,3 +64,23 @@ class Sequence:
     @property
     def completion_token_ids(self) -> list[int]:
         return self.token_ids[len(self.decoder_token_ids) :]
+
+    @property
+    def is_finished(self) -> bool:
+        return (
+            self.token_ids[-1] in self.sampling.eos_ids()
+            or self.num_generated >= self.sampling.max_tokens
+        )
+
+    @property
+    def score(self) -> float:
+        return self.cum_logprob / (
+            max(self.num_generated, 1) ** self.sampling.length_penalty
+        )
+
+    def to_output(self) -> RequestOut:
+        return RequestOut(
+            input_ids=self.encoder_token_ids,
+            completion_token_ids=self.completion_token_ids,
+            pixel_values=self.pixel_values,
+        )
