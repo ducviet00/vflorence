@@ -150,8 +150,8 @@ class ModelRunner:
     @torch.no_grad()
     def _encode(self, seqs) -> None:
         """Batch fresh sequences by (encoder_len, image_shape) and cache cross-attn K/V."""
-        images = [s for s in seqs if s.pixel_values is not None]
-        embeds = self._image_embeds(images) if images else {}
+        image_seqs = [seq for seq in seqs if seq.pixel_values is not None]
+        embeds = self._image_embeds(image_seqs) if image_seqs else {}
         groups = defaultdict(list)
         for seq in seqs:
             px_shape = (
@@ -159,16 +159,18 @@ class ModelRunner:
             )
             groups[(len(seq.encoder_token_ids), px_shape)].append(seq)
         for group in groups.values():
-            ids = torch.tensor([s.encoder_token_ids for s in group], dtype=torch.long)
+            input_ids = torch.tensor(
+                [seq.encoder_token_ids for seq in group], dtype=torch.long
+            )
             with self._inductor_ctx():
                 if group[0].pixel_values is None:
-                    hidden = self.encode_fn(ids)
+                    hidden = self.encode_fn(input_ids)
                 else:
-                    image_embeds = torch.stack([embeds[s.mm_hash] for s in group])
-                    hidden = self.encode_fn(ids, image_embeds=image_embeds)
+                    image_embeds = torch.stack([embeds[seq.mm_hash] for seq in group])
+                    hidden = self.encode_fn(input_ids, image_embeds=image_embeds)
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
-                shape = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)
+                shape = (len(group), input_ids.shape[1], attn.num_heads, attn.head_dim)
                 key, value = attn.kv_proj(hidden).chunk(2, dim=-1)
                 key, value = (
                     key.reshape(shape).contiguous(),
@@ -185,7 +187,7 @@ class ModelRunner:
 
     def _prepare(self, seqs, copies=()):
         """Build input_ids, positions, and Context tensors for the step."""
-        bs = self.block_size
+        block_size = self.block_size
         for seq in seqs:
             num_new = len(seq.token_ids) - seq.num_cached_tokens
             if num_new != 1:
@@ -196,18 +198,20 @@ class ModelRunner:
         if copies:
             self._copy_blocks(copies)
 
-        input_ids, positions, new_slots = [], [], []
-        context_lens, seq_block_tables = [], []
+        input_ids, positions, slot_mapping = [], [], []
+        context_lens, block_tables = [], []
         for seq in seqs:
             pos = seq.num_cached_tokens
             input_ids.append(seq.token_ids[pos])
             positions.append(pos)
-            new_slots.append(seq.block_table[pos // bs] * bs + pos % bs)
+            slot_mapping.append(
+                seq.block_table[pos // block_size] * block_size + pos % block_size
+            )
             context_lens.append(pos + 1)
-            seq_block_tables.append(seq.block_table)
+            block_tables.append(seq.block_table)
 
-        max_blocks = max(len(t) for t in seq_block_tables)
-        padded = [t + [0] * (max_blocks - len(t)) for t in seq_block_tables]
+        max_blocks = max(len(t) for t in block_tables)
+        padded_tables = [t + [0] * (max_blocks - len(t)) for t in block_tables]
         context_lens_t = torch.tensor(context_lens, dtype=torch.int32)
         query_start_loc = torch.arange(len(seqs) + 1, dtype=torch.int32)
         self_metadata = vllm_cpu_attn.get_scheduler_metadata(
@@ -220,18 +224,18 @@ class ModelRunner:
             query_start_loc=query_start_loc,
             causal=False,
             isa=self.isa,
-            block_size=bs,
+            block_size=block_size,
         )
         request_ids = tuple(seq.request_id for seq in seqs)
         if request_ids != self._cross_key:
             self._cross_staged = attention.stage_cross(
-                self.decoder_layers, request_ids, bs, self.isa
+                self.decoder_layers, request_ids, block_size, self.isa
             )
             self._cross_key = request_ids
         set_context(
             context_lens=context_lens_t,
-            block_tables=torch.tensor(padded, dtype=torch.int32),
-            slot_mapping=torch.tensor(new_slots, dtype=torch.int64),
+            block_tables=torch.tensor(padded_tables, dtype=torch.int32),
+            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int64),
             query_start_loc=query_start_loc,
             self_metadata=self_metadata,
             isa=self.isa,
@@ -242,36 +246,41 @@ class ModelRunner:
             torch.tensor(positions, dtype=torch.long),
         )
 
-    def _get_logits_processor(self, params: SamplingParams) -> LogitsProcessor:
-        if params is not self._sampling_params or self._logits_processor is None:
+    def _get_logits_processor(self, sampling_params: SamplingParams) -> LogitsProcessor:
+        if (
+            sampling_params is not self._sampling_params
+            or self._logits_processor is None
+        ):
             # Lengths count the single decoder start token, as transformers does.
             self._logits_processor = LogitsProcessor(
-                params,
+                sampling_params,
                 vocab_size=self.model.lm_head.out_features,
-                max_length=1 + params.max_tokens,
-                begin_index=1 + int(params.forced_bos_token_id is not None),
+                max_length=1 + sampling_params.max_tokens,
+                begin_index=1 + int(sampling_params.forced_bos_token_id is not None),
             )
-            self._sampling_params = params
+            self._sampling_params = sampling_params
         return self._logits_processor
 
     def _sample(self, seqs, logits):
         """Apply LogitsProcessor and return greedy token IDs or beam top-k candidates."""
-        params = seqs[0].sampling
-        processor = self._get_logits_processor(params)
-        if params.num_beams == 1:
-            lens = [len(s.token_ids) for s in seqs]
-            w = max(lens)
+        sampling_params = seqs[0].sampling_params
+        processor = self._get_logits_processor(sampling_params)
+        if sampling_params.num_beams == 1:
+            lengths = [len(seq.token_ids) for seq in seqs]
+            max_len = max(lengths)
             # Histories differ in length: left-pad with -1, which every logits rule ignores.
-            histories = [[-1] * (w - len(s.token_ids)) + s.token_ids for s in seqs]
+            histories = [
+                [-1] * (max_len - len(seq.token_ids)) + seq.token_ids for seq in seqs
+            ]
             scores = processor(
                 torch.tensor(histories, dtype=torch.long),
                 logits.float(),
-                torch.tensor(lens, dtype=torch.long),
+                torch.tensor(lengths, dtype=torch.long),
             )
             return scores.argmax(dim=-1).tolist()
 
-        num_beams = params.num_beams
-        vocab = logits.shape[-1]
+        num_beams = sampling_params.num_beams
+        vocab_size = logits.shape[-1]
         by_request: dict[int, list[int]] = defaultdict(list)
         for index, seq in enumerate(seqs):
             by_request[seq.request_id].append(index)
@@ -297,20 +306,25 @@ class ModelRunner:
                 dtype=torch.float32,
             ).unsqueeze(-1)
             log_probs = (
-                log_probs.reshape(len(group), beam_count, vocab) + running_beam_scores
+                log_probs.reshape(len(group), beam_count, vocab_size)
+                + running_beam_scores
             ).reshape(len(group), -1)
             # Keep top K = max(2, 1 + n_eos_tokens) * num_beams continuations.
-            n_eos_tokens = len(params.eos_ids())
+            n_eos_tokens = len(sampling_params.eos_ids())
             beams_to_keep = min(
                 max(2, 1 + n_eos_tokens) * num_beams, log_probs.shape[-1]
             )
             topk_log_probs, topk_indices = torch.topk(log_probs, beams_to_keep, dim=-1)
-            for (request_id, seq_indices), vals, idxs in zip(
+            for (request_id, seq_indices), log_probs_row, indices_row in zip(
                 group, topk_log_probs.tolist(), topk_indices.tolist()
             ):
                 topk_candidates[request_id] = [
-                    (seqs[seq_indices[k // vocab]], k % vocab, val)
-                    for k, val in zip(idxs, vals)
+                    (
+                        seqs[seq_indices[idx // vocab_size]],
+                        idx % vocab_size,
+                        cum_logprob,
+                    )
+                    for idx, cum_logprob in zip(indices_row, log_probs_row)
                 ]
         return topk_candidates
 

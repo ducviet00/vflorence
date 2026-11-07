@@ -27,7 +27,7 @@ class Sequence:
     request_id: int
     decoder_token_ids: list[int]
     encoder_token_ids: list[int]
-    sampling: SamplingParams
+    sampling_params: SamplingParams
     pixel_values: torch.Tensor | None = None
     mm_hash: str | None = (
         None  # image cache key; hashed from pixel_values if unset (forks reuse it)
@@ -68,14 +68,14 @@ class Sequence:
     @property
     def is_finished(self) -> bool:
         return (
-            self.token_ids[-1] in self.sampling.eos_ids()
-            or self.num_generated >= self.sampling.max_tokens
+            self.token_ids[-1] in self.sampling_params.eos_ids()
+            or self.num_generated >= self.sampling_params.max_tokens
         )
 
     @property
     def score(self) -> float:
         return self.cum_logprob / (
-            max(self.num_generated, 1) ** self.sampling.length_penalty
+            max(self.num_generated, 1) ** self.sampling_params.length_penalty
         )
 
     def to_output(self) -> RequestOut:
