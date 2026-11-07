@@ -151,6 +151,33 @@ def main():
         assert batched == singles[i], (i, batched, singles[i])
         print(f"[OK] batch-vs-single {i}: {batched}")
 
+    # Multimodal cache: a repeated image runs the vision encoder once, across calls.
+    image_a, image_b = batch[0][0], torch.randn(3, 32, 32)
+    ids_a = engine_requests[0][0]
+    start = [config.text_config.decoder_start_token_id]
+    engine = LLMEngine(
+        ours,
+        Config(num_blocks=64, block_size=16, max_num_seqs=8, mm_cache_size=1),
+    )
+    runner, calls = engine.runner, []
+    image_fn = runner.image_fn
+    runner.image_fn = lambda px: calls.append(len(px)) or image_fn(px)
+    first = engine.generate([(ids_a, start, image_a), (ids_a, start, image_a)], params)
+    again = engine.generate([(ids_a, start, image_a.clone())], params)
+    assert calls == [1], calls  # dedup within a step + hit across calls
+    assert list(first.values()) == [singles[0][1:]] * 2, first
+    assert list(again.values()) == [singles[0][1:]], again
+    engine.generate([(ids_a, start, image_b)], params)  # evicts image_a
+    assert len(runner.mm_cache) == 1 and calls == [1, 1], (runner.mm_cache, calls)
+    engine.generate([(ids_a, start, image_a)], params)
+    assert calls == [1, 1, 1], calls
+    assert (runner.mm_cache_hits, runner.mm_cache_misses) == (2, 3)
+    # Mixed hit + miss in one step: the later request (cached image_a) stays.
+    hash_a = next(iter(runner.mm_cache))
+    engine.generate([(ids_a, start, image_b), (ids_a, start, image_a)], params)
+    assert list(runner.mm_cache) == [hash_a] and calls == [1, 1, 1, 1], calls
+    print("[OK] mm cache: dedup, cross-call hit, LRU eviction, hit stats")
+
 
 if __name__ == "__main__":
     main()
