@@ -283,15 +283,12 @@ class ModelRunner:
 
     def _beam_search(self, seqs, scores, sampling_params) -> dict[int, list]:
         """Return each request's top-k (parent, token_id, cum_logprob) candidates.
-
         scores holds processed log-probs, one row per seq.
         """
         # Keep top K = max(2, 1 + n_eos_tokens) * num_beams continuations.
         n_eos_tokens = len(sampling_params.eos_ids())
         beams_to_keep = max(2, 1 + n_eos_tokens) * sampling_params.num_beams
-        # cum_logprob is constant per row, so a request's top K lies within its
-        # rows' top K: topk each row over the vocab, then add cum_logprob to the
-        # survivors only (in float32, as the full-vocab add did).
+        # topk each row over the vocab, then add cum_logprob to the survivors only.
         top_scores, top_ids = torch.topk(
             scores, min(beams_to_keep, scores.shape[-1]), dim=-1
         )
@@ -307,7 +304,6 @@ class ModelRunner:
                 zip([seq] * len(row_ids), row_ids, row_scores)
             )
         for candidates in topk_candidates.values():
-            # Stable sort: ties keep beam-then-rank order, like a flattened topk.
             candidates.sort(key=lambda candidate: candidate[2], reverse=True)
             del candidates[beams_to_keep:]
         return dict(topk_candidates)
