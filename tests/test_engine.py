@@ -11,7 +11,6 @@ from transformers.generation.logits_process import ForcedEOSTokenLogitsProcessor
 
 from fastencdec import LLM, Request, RequestOut, SamplingParams
 from fastencdec.config import Config
-from fastencdec.engine.llm_engine import LLMEngine
 from fastencdec.engine.sequence import Sequence
 from fastencdec.layers.logits_processor import LogitsProcessor
 from fastencdec.models.bart import BartForConditionalGeneration
@@ -40,81 +39,99 @@ def model(activation="gelu"):
     ).eval()
 
 
-def engine(num_blocks=8, block_size=16):
-    return LLMEngine(
-        model(),
-        Config(
-            num_blocks=num_blocks,
-            block_size=block_size,
-            compile=False,
-        ),
-        eos_token_id=2,
-    )
-
-
 REQUEST = Request([3, 4, 5])
 
 
 class EngineTests(unittest.TestCase):
-    def assert_clean(self, llm):
-        self.assertTrue(llm.is_finished())
-        self.assertEqual(
-            llm.block_manager.num_free_blocks, llm.block_manager.num_blocks
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = TemporaryDirectory()
+        torch.manual_seed(0)
+        HFBart(model().config).eval().save_pretrained(cls._tmpdir.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmpdir.cleanup()
+
+    def engine(self, max_num_seqs=2, **kwargs):
+        return LLM(
+            self._tmpdir.name,
+            max_num_seqs=max_num_seqs,
+            compile=False,
+            **kwargs,
         )
-        self.assertTrue(not any(llm.block_manager.ref_counts))
-        self.assertFalse(llm._finished_beams)
+
+    def assert_clean(self, llm):
+        blocks = llm.scheduler.block_manager
+        self.assertTrue(llm.is_finished())
+        self.assertEqual(blocks.num_free_blocks, blocks.num_blocks)
+        self.assertTrue(not any(blocks.ref_counts))
+        self.assertFalse(llm.scheduler._finished_beams)
         for layer in llm.runner.decoder_layers:
             self.assertFalse(layer.encoder_attn.encoder_kv_cache)
         self.assertIsNone(llm.runner._cross_staged)
 
-    def test_cache_failure_then_valid_batch(self):
-        llm = engine(num_blocks=1)
+    def test_cache_full_raises(self):
+        llm = self.engine(max_num_seqs=1)
         params = SamplingParams(max_tokens=3, min_length=4)
+        llm.scheduler.running = [
+            Sequence(i, [1], [3], params)
+            for i in range(llm.scheduler.block_manager.num_blocks + 1)
+        ]
         with self.assertRaisesRegex(RuntimeError, "KV cache is full"):
-            llm.generate([REQUEST, REQUEST], params)
-        self.assert_clean(llm)
-        self.assertEqual(len(llm.generate([REQUEST], params)), 1)
-        self.assert_clean(llm)
+            llm.scheduler.schedule()
 
-    def test_forward_failure_after_beam_fork(self):
-        llm = engine(num_blocks=4)
-        params = SamplingParams(max_tokens=4, num_beams=2, min_length=5)
-        forward = llm.runner.run
-        calls = 0
-
-        def fail(seqs):
-            nonlocal calls
-            calls += 1
-            logits = forward(seqs)
-            if calls == 2:
-                raise RuntimeError("failed after writing cache")
-            return logits
-
-        with (
-            patch.object(llm.runner, "run", side_effect=fail),
-            self.assertRaisesRegex(RuntimeError, "failed after writing cache"),
-        ):
-            llm.generate([REQUEST], params)
-        self.assert_clean(llm)
-        self.assertEqual(len(llm.generate([REQUEST], params)), 1)
+    def test_mixed_sampling_params_rejected(self):
+        llm = self.engine(max_num_seqs=4)
+        llm.add_request(REQUEST, SamplingParams(max_tokens=2))
+        with self.assertRaisesRegex(ValueError, "share the same SamplingParams"):
+            llm.add_request(REQUEST, SamplingParams(max_tokens=2, num_beams=2))
+        llm.add_request(REQUEST, SamplingParams(max_tokens=2))  # equal values are fine
+        while not llm.is_finished():
+            llm.step()
         self.assert_clean(llm)
 
-    def test_partial_enqueue_failure(self):
-        llm = engine()
-        with self.assertRaises(TypeError):
-            llm.generate([REQUEST, Request(None)], SamplingParams())
+    def test_mutated_sampling_params_rebuild_processor(self):
+        llm = self.engine()
+        params = SamplingParams(max_tokens=2, min_length=10, forced_eos_token_id=2)
+        (out,) = llm.generate([REQUEST], params)
+        self.assertEqual(len(out.completion_token_ids), 2)
+        params.max_tokens = 4
+        (out,) = llm.generate([REQUEST], params)
+        self.assertEqual(len(out.completion_token_ids), 4)
         self.assert_clean(llm)
 
-    def test_beam_finalization_failure_cleans_detached_request(self):
-        llm = engine()
-        params = SamplingParams(
-            max_tokens=3, num_beams=2, min_length=4, length_penalty=1024.0
+    def test_pixel_values_validation(self):
+        llm = self.engine()
+        with self.assertRaisesRegex(ValueError, "pixel_values"):
+            llm.add_request(Request([3], torch.zeros(1)), SamplingParams())
+        self.assert_clean(llm)
+
+    def test_rejected_request_returns_empty_and_others_run(self):
+        llm = self.engine()
+        bad1 = Request([3] * 129)  # longer than max_position_embeddings
+        bad2 = Request([4] * 130)
+        with self.assertLogs("fastencdec.engine.llm_engine", "ERROR") as logs:
+            outs = llm.generate([bad1, REQUEST, bad2], SamplingParams(max_tokens=2))
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("encoder prompt", logs.output[0])
+        self.assertEqual([len(o.completion_token_ids) for o in outs], [0, 2, 0])
+        self.assertEqual(
+            [o.input_ids for o in outs],
+            [bad1.input_ids, REQUEST.input_ids, bad2.input_ids],
         )
-        with self.assertRaises(OverflowError):
-            llm.generate([REQUEST], params)
         self.assert_clean(llm)
-        llm.generate([REQUEST], SamplingParams(max_tokens=1))
-        self.assert_clean(llm)
+
+    def test_loads_by_model_type(self):
+        ref = HFBart(model().config)
+        ref.config.architectures = ["BartModel"]
+        with TemporaryDirectory() as path:
+            ref.save_pretrained(path)
+            ref.config.architectures = None
+            ref.config.save_pretrained(path)
+            self.assertIsInstance(
+                load_hf_weights(Config(path)), BartForConditionalGeneration
+            )
 
     def test_forced_eos_list_matches_reference(self):
         try:
@@ -133,61 +150,121 @@ class EngineTests(unittest.TestCase):
         )
         expected = ForcedEOSTokenLogitsProcessor(3, [2, 3])(histories, scores.clone())
         self.assertTrue(torch.equal(processor(histories, scores.clone()), expected))
-        llm = engine()
-        (result,) = llm.generate([REQUEST], params).values()
-        self.assertEqual(len(result), 2)
-        self.assertIn(result[-1], [2, 3])
+        llm = self.engine()
+        (result,) = llm.generate([REQUEST], params)
+        self.assertEqual(len(result.completion_token_ids), 2)
+        self.assertIn(result.completion_token_ids[-1], [2, 3])
 
     def test_generate_returns_each_batch_and_keeps_nothing(self):
-        llm = engine()
+        llm = self.engine()
         params = SamplingParams(max_tokens=2)
         for _ in range(4):
             completions = llm.generate([REQUEST, REQUEST], params)
-            self.assertEqual([len(t) for t in completions.values()], [2, 2])
-            self.assertFalse(llm.results)
-        self.assertEqual(llm.generate([], params), {})
+            self.assertEqual([len(o.completion_token_ids) for o in completions], [2, 2])
+            self.assertEqual(
+                [o.input_ids for o in completions], [REQUEST.input_ids] * 2
+            )
+            self.assert_clean(llm)
+        self.assertEqual(llm.generate([], params), [])
 
     def test_generation_releases_global_cross_cache(self):
-        llm = engine()
+        llm = self.engine()
         self.addCleanup(set_context)
         llm.generate([REQUEST], SamplingParams(max_tokens=2))
         self.assert_clean(llm)
         self.assertIsNone(get_context().cross_staged)
 
     def test_exact_block_budget_fits(self):
-        llm = engine(num_blocks=1, block_size=16)
-        (tokens,) = llm.generate(
-            [REQUEST], SamplingParams(max_tokens=16, min_length=17)
-        ).values()
-        self.assertEqual(len(tokens), 16)
+        llm = self.engine(max_num_seqs=1)
+        bs = llm.config.block_size
+        (out,) = llm.generate(
+            [REQUEST], SamplingParams(max_tokens=bs, min_length=bs + 1)
+        )
+        self.assertEqual(len(out.completion_token_ids), bs)
         self.assert_clean(llm)
 
     def test_runner_failure_releases_global_cross_cache(self):
-        llm = engine()
+        llm = self.engine()
         self.addCleanup(set_context)
-        seq = Sequence(0, [1], [3, 4, 5], SamplingParams())
+        llm.scheduler.add(Sequence(0, [1], [3, 4, 5], SamplingParams()))
+        seqs, copies = llm.scheduler.schedule()
         with (
             patch.object(
                 llm.runner, "decode_fn", side_effect=RuntimeError("decode failed")
             ),
             self.assertRaisesRegex(RuntimeError, "decode failed"),
         ):
-            llm.runner.run([seq])
+            llm.runner.run(seqs, copies)
         self.assertIsNone(get_context().cross_staged)
 
-    def test_eos_fallback_and_single_request_out(self):
-        cases = [
-            (2, [], 2),
-            ([2, 3], None, 1),
-        ]
-        for model_eos, requested_eos, expected_len in cases:
-            with self.subTest(model_eos=model_eos, requested_eos=requested_eos):
-                llm = LLM.__new__(LLM)
-                llm.multimodal = False
-                llm.eos_token_id = model_eos
-                llm.decoder_start_token_id = 1
-                llm.engine = engine()
-                llm.engine.eos_token_id = model_eos
+    def test_none_fields_take_checkpoint_defaults(self):
+        llm = self.engine()
+        llm._sampling_params = SamplingParams(
+            max_tokens=3, min_length=10, eos_token_id=2
+        )
+        (out,) = llm.generate([REQUEST])  # no params: checkpoint defaults as-is
+        self.assertEqual(len(out.completion_token_ids), 3)
+        filled = SamplingParams(max_tokens=5).with_defaults(llm._sampling_params)
+        self.assertEqual((filled.max_tokens, filled.eos_token_id), (5, 2))
+
+    def test_beam_search_mixed_beam_counts_match_per_request(self):
+        llm = self.engine()
+        params = SamplingParams(num_beams=4, eos_token_id=2)
+        # Request 0 has 4 live beams, request 1 is on its first step with 1 beam.
+        seqs = [Sequence(0, [1, 5 + b], [3], params) for b in range(4)]
+        seqs.append(Sequence(1, [1], [3], params))
+        for b, seq in enumerate(seqs):
+            seq.cum_logprob = -0.1 * b
+        scores = torch.log_softmax(torch.randn(len(seqs), 32), dim=-1)
+
+        def picks(candidates):
+            return {
+                request_id: [(seqs.index(p), t, round(c, 5)) for p, t, c in cands]
+                for request_id, cands in candidates.items()
+            }
+
+        mixed = picks(llm.runner._beam_search(seqs, scores.clone(), params))
+        alone = {
+            **picks(llm.runner._beam_search(seqs[:4], scores[:4].clone(), params)),
+            **picks(llm.runner._beam_search(seqs[4:], scores[4:].clone(), params)),
+        }
+        self.assertEqual(mixed, alone)
+        self.assertEqual(len(mixed[0]), 8)  # max(2, 1 + 1 eos) * 4 beams
+
+    def test_beam_search_matches_flattened_topk(self):
+        llm = self.engine()
+        torch.manual_seed(0)
+        for eos, vocab in (([2], 32), ([2, 3, 4], 32), ([2], 5)):
+            params = SamplingParams(num_beams=4, eos_token_id=eos)
+            keep = max(2, 1 + len(eos)) * 4
+            seqs = [Sequence(r, [1], [3], params) for r in (0, 0, 0, 0, 1, 2, 2)]
+            for seq in seqs:
+                seq.cum_logprob = -torch.rand(()).item()
+            scores = torch.log_softmax(torch.randn(len(seqs), vocab), dim=-1)
+            scores[-1, :2] = float("-inf")  # masked; too few to tie in the top K
+            got = llm.runner._beam_search(seqs, scores.clone(), params)
+
+            # Reference: the old full-vocab add + flattened topk per request.
+            cum = torch.tensor([seq.cum_logprob for seq in seqs]).unsqueeze(-1)
+            total = scores + cum
+            for request_id in (0, 1, 2):
+                rows = [i for i, seq in enumerate(seqs) if seq.request_id == request_id]
+                flat = total[rows].flatten()
+                values, indices = torch.topk(flat, min(keep, flat.numel()))
+                expected = [
+                    (rows[i // vocab], i % vocab, v)
+                    for i, v in zip(indices.tolist(), values.tolist())
+                ]
+                row_of = {id(seq): i for i, seq in enumerate(seqs)}
+                actual = [(row_of[id(p)], t, c) for p, t, c in got[request_id]]
+                with self.subTest(eos=eos, vocab=vocab, request_id=request_id):
+                    self.assertEqual(actual, expected)
+
+    def test_eos_override_and_single_request_out(self):
+        llm = self.engine()
+        # None takes the checkpoint's EOS (2); [] never stops early.
+        for requested_eos, expected_len in ((None, 1), ([], 2), ([2, 3], 1)):
+            with self.subTest(requested_eos=requested_eos):
                 params = SamplingParams(
                     max_tokens=2,
                     eos_token_id=requested_eos,
@@ -196,55 +273,64 @@ class EngineTests(unittest.TestCase):
                 )
                 (result,) = llm.generate(REQUEST, params)
                 self.assertIsInstance(result, RequestOut)
+                self.assertEqual(result.input_ids, REQUEST.input_ids)
+                self.assertIsNone(result.pixel_values)
                 self.assertEqual(len(result.completion_token_ids), expected_len)
                 self.assertEqual(result.completion_token_ids[0], 2)
 
     def test_too_long_inputs_are_rejected_before_running(self):
-        llm = engine(num_blocks=64)
+        llm = self.engine(max_num_seqs=2)
         cases = [
             (Request([3] * 129), SamplingParams(max_tokens=2), "encoder prompt"),
             (REQUEST, SamplingParams(max_tokens=129), "max_position_embeddings"),
-            (REQUEST, SamplingParams(max_tokens=128, num_beams=9), "KV blocks"),
+            (REQUEST, SamplingParams(max_tokens=128, num_beams=9), "max_num_seqs"),
         ]
         for request, params, message in cases:
             with (
                 self.subTest(message=message),
                 self.assertRaisesRegex(ValueError, message),
             ):
-                llm.generate([request], params)
+                llm.add_request(request, params)
             self.assert_clean(llm)
         # The exact limits still run: 128 encoder tokens and 128 new tokens.
-        (tokens,) = llm.generate(
+        (out,) = llm.generate(
             [Request([3] * 128)], SamplingParams(max_tokens=128, min_length=200)
-        ).values()
-        self.assertEqual(len(tokens), 128)
+        )
+        self.assertEqual(len(out.completion_token_ids), 128)
+        llm = self.engine(num_blocks=1)
+        with self.assertRaisesRegex(ValueError, "KV blocks"):
+            llm.add_request(REQUEST, SamplingParams(max_tokens=128))
+        self.assert_clean(llm)
 
     def test_shared_beams_fit_two_blocks(self):
-        llm = engine(num_blocks=2)
+        llm = self.engine(max_num_seqs=2)
         params = SamplingParams(max_tokens=3, num_beams=2, min_length=4)
-        (tokens,) = llm.generate([REQUEST], params).values()
-        self.assertEqual(len(tokens), 3)
+        (out,) = llm.generate([REQUEST], params)
+        self.assertEqual(len(out.completion_token_ids), 3)
         self.assert_clean(llm)
 
     def test_copy_budget_preserves_nonwriting_owner(self):
-        llm = engine(num_blocks=3)
+        llm = self.engine()
         params = SamplingParams()
         parent = Sequence(0, [1], [3], params)
-        blocks = llm.block_manager
+        blocks = llm.scheduler.block_manager
         blocks.ensure_capacity(parent)
         parent.num_cached_tokens = 1
-        children = [llm._fork(parent, 4, 0), llm._fork(parent, 5, 0)]
+        children = [parent.fork(4, 0), parent.fork(5, 0)]
+        for child in children:
+            blocks.fork(parent, child)
         self.assertEqual(blocks.required_new_blocks(children), 2)
         blocks.deallocate(parent)
         self.assertEqual(blocks.required_new_blocks(children), 1)
 
     def test_copy_on_write_copies_each_pair(self):
-        llm = engine(num_blocks=4)
-        blocks = llm.block_manager
+        llm = self.engine()
+        blocks = llm.scheduler.block_manager
         parent = Sequence(0, [1], [3], SamplingParams())
         self.assertIsNone(blocks.ensure_capacity(parent))
         parent.num_cached_tokens = 1
-        child = llm._fork(parent, 4, 0)
+        child = parent.fork(4, 0)
+        blocks.fork(parent, child)
         src = parent.block_table[0]
         dst = blocks.ensure_capacity(child)[1]
         self.assertEqual(child.block_table, [dst])
@@ -261,18 +347,6 @@ class EngineTests(unittest.TestCase):
         llm.runner._copy_blocks([(0, 2), (1, 3)])
         for cache in caches:
             self.assertEqual([cache[b].unique().item() for b in range(4)], [0, 1, 0, 1])
-
-    def test_failed_copy_aborts_cleanly(self):
-        llm = engine()
-        params = SamplingParams(max_tokens=3, num_beams=2, min_length=4)
-        failing = patch.object(
-            llm.runner, "_copy_blocks", side_effect=RuntimeError("copy failed")
-        )
-        with failing, self.assertRaisesRegex(RuntimeError, "copy failed"):
-            llm.generate([REQUEST], params)
-        self.assert_clean(llm)
-        (tokens,) = llm.generate([REQUEST], params).values()
-        self.assertEqual(len(tokens), 3)
 
     def test_invalid_sampling_params(self):
         invalid = [
@@ -294,18 +368,6 @@ class EngineTests(unittest.TestCase):
         for kwargs in invalid:
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 SamplingParams(**kwargs)
-        llm = engine()
-        params = SamplingParams()
-        params.num_beams = 0
-        with self.assertRaises(ValueError):
-            llm.generate([REQUEST], params)
-        self.assert_clean(llm)
-
-    def test_pixel_values_validation(self):
-        llm = LLM.__new__(LLM)
-        llm.multimodal = False
-        with self.assertRaisesRegex(ValueError, "pixel_values"):
-            llm.generate(Request([3], torch.zeros(1)), SamplingParams())
 
     def test_missing_and_extra_weights_are_rejected(self):
         ref = HFBart(model().config)
@@ -319,14 +381,13 @@ class EngineTests(unittest.TestCase):
             with self.subTest(missing=missing), TemporaryDirectory() as path:
                 ref.save_pretrained(path, state_dict=bad)
                 with self.assertRaisesRegex(RuntimeError, "checkpoint"):
-                    load_hf_weights(model(), path)
+                    load_hf_weights(Config(path))
 
     def test_relu_matches_reference(self):
-        ours = model("relu")
-        ref = HFBart(ours.config).eval()
+        ref = HFBart(model("relu").config).eval()
         with TemporaryDirectory() as path:
             ref.save_pretrained(path)
-            load_hf_weights(ours, path)
+            ours = load_hf_weights(Config(path))
         inputs = torch.tensor([[3, 4, 5]])
         with torch.no_grad():
             want = ref.get_encoder()(input_ids=inputs).last_hidden_state

@@ -31,7 +31,7 @@ export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
 ## Quick Start
 
 See `examples/` for runnable scripts. `LLM` takes `dtype` (`torch.float32` or `torch.bfloat16`),
-`num_blocks`, `block_size`, `max_num_seqs`, `compile` (default `True`) and `compile_mm_encoder`:
+`max_num_seqs`, `compile` (default `True`) and `mm_cache_size`:
 
 ```python
 from transformers import AutoTokenizer
@@ -74,6 +74,36 @@ Reading order: `engine/sequence.py` -> `engine/block_manager.py` ->
 `layers/attention.py` -> `models/bart.py`. The step-by-step flow is in
 [AGENTS.md section 4](AGENTS.md#4-how-a-step-works).
 
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant E as LLMEngine
+    participant S as Scheduler
+    participant B as BlockManager
+    participant R as ModelRunner
+
+    U->>E: generate(requests, sampling_params)
+    loop for req in requests
+        E->>S: add(Sequence)
+    end
+    loop while not is_finished()
+        E->>S: schedule()
+        S->>B: ensure_capacity(seq)
+        B-->>S: copies (CoW block pairs)
+        S-->>E: seqs, copies
+        E->>R: run(seqs, copies)
+        Note over R: _encode(fresh) -> encoder_kv_cache<br/>_prepare(seqs, copies) + stage_cross<br/>decode_fn(input_ids, positions)<br/>_sample(seqs, logits)
+        R-->>E: sample_out (tokens / beam top-k)
+        E->>S: postprocess(seqs, sample_out)
+        S->>B: fork(parent, child) / deallocate(seq)
+        S-->>E: finished (request_id, RequestOut)
+        loop for request_id, _ in finished
+            E->>R: clear_request(request_id)
+        end
+    end
+    E-->>U: list[RequestOut]
+```
+
 * **Paged KV cache.** Keys and values live in fixed blocks; beams share blocks and
   only copy one when they write into a shared block.
 * **Continuous batching.** Requests join and leave the running batch freely.
@@ -104,10 +134,10 @@ cells are wall time and generated tokens/s, speedup over HF is by wall time.
 
 <table>
 <tr><th>config</th><th>engine</th><th align="right">c4a-standard-8</th><th align="right">c4-standard-8</th></tr>
-<tr><td rowspan="2">greedy</td><td>fast-encdec</td><td align="right">7.6 s, 481 tok/s (<b>4.31x</b>)</td><td align="right">7.6 s, 475 tok/s (<b>5.27x</b>)</td></tr>
-<tr><td>HF</td><td align="right">32.6 s, 112 tok/s</td><td align="right">40.0 s, 95 tok/s</td></tr>
-<tr><td rowspan="2">beams=4</td><td>fast-encdec</td><td align="right">16.5 s, 314 tok/s (<b>4.41x</b>)</td><td align="right">16.4 s, 318 tok/s (<b>8.19x</b>)</td></tr>
-<tr><td>HF</td><td align="right">72.6 s, 72 tok/s</td><td align="right">134.4 s, 37 tok/s</td></tr>
+<tr><td rowspan="2">greedy</td><td>fast-encdec</td><td align="right">7.8 s, 471 tok/s (<b>4.27x</b>)</td><td align="right">7.1 s, 509 tok/s (<b>5.13x</b>)</td></tr>
+<tr><td>HF</td><td align="right">33.1 s, 110 tok/s</td><td align="right">36.3 s, 104 tok/s</td></tr>
+<tr><td rowspan="2">beams=4</td><td>fast-encdec</td><td align="right">13.9 s, 375 tok/s (<b>5.12x</b>)</td><td align="right">13.4 s, 389 tok/s (<b>9.21x</b>)</td></tr>
+<tr><td>HF</td><td align="right">70.9 s, 73 tok/s</td><td align="right">123.7 s, 40 tok/s</td></tr>
 </table>
 
 **Per stage** (`benchmarks/stage_latency.py`): batch 8; Florence-2-base with
@@ -117,13 +147,13 @@ The decode step is averaged over 128 steps with EOS suppressed.
 
 | stage | c4a-standard-8 | c4-standard-8 |
 |---|---:|---:|
-| Florence-2 vision | 2298 / 2280 ms (0.99x) | 1626 / 2733 ms (1.68x) |
-| Florence-2 encode | 268 / 270 ms (1.01x) | 173 / 193 ms (1.11x) |
-| Florence-2 decode step, greedy | 6.07 / 11.08 ms (1.83x) | 8.52 / 14.36 ms (1.69x) |
-| Florence-2 decode step, beams=4 | 13.03 / 25.09 ms (1.93x) | 16.06 / 47.71 ms (2.97x) |
-| BART encode | 717 / 717 ms (1.00x) | 429 / 483 ms (1.13x) |
-| BART decode step, greedy | 12.95 / 23.70 ms (1.83x) | 19.36 / 29.71 ms (1.53x) |
-| BART decode step, beams=4 | 27.73 / 54.95 ms (1.98x) | 33.40 / 101.77 ms (3.05x) |
+| Florence-2 vision | 2214 / 2218 ms (1.00x) | 1451 / 2576 ms (1.78x) |
+| Florence-2 encode | 269 / 272 ms (1.01x) | 156 / 173 ms (1.11x) |
+| Florence-2 decode step, greedy | 6.32 / 11.57 ms (1.83x) | 7.39 / 12.85 ms (1.74x) |
+| Florence-2 decode step, beams=4 | 13.62 / 25.27 ms (1.86x) | 13.39 / 43.79 ms (3.27x) |
+| BART encode | 715 / 715 ms (1.00x) | 374 / 420 ms (1.12x) |
+| BART decode step, greedy | 13.42 / 24.57 ms (1.83x) | 17.91 / 28.15 ms (1.57x) |
+| BART decode step, beams=4 | 27.48 / 54.51 ms (1.98x) | 30.78 / 92.25 ms (3.00x) |
 
 ## Tests & Benchmarks
 
