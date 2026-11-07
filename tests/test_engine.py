@@ -241,12 +241,10 @@ class EngineTests(unittest.TestCase):
             for seq in seqs:
                 seq.cum_logprob = -torch.rand(()).item()
             scores = torch.log_softmax(torch.randn(len(seqs), vocab), dim=-1)
-            scores[-1, :2] = float(
-                "-inf"
-            )  # masked, never picked: -inf ties have no defined order
+            scores[-1, :2] = float("-inf")  # masked; too few to tie in the top K
             got = llm.runner._beam_search(seqs, scores.clone(), params)
 
-            # Reference: add cum_logprob to every score, topk each request's flat rows.
+            # Reference: the old full-vocab add + flattened topk per request.
             cum = torch.tensor([seq.cum_logprob for seq in seqs]).unsqueeze(-1)
             total = scores + cum
             for request_id in (0, 1, 2):
