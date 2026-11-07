@@ -207,6 +207,30 @@ class EngineTests(unittest.TestCase):
         filled = SamplingParams(max_tokens=5).with_defaults(llm._sampling_params)
         self.assertEqual((filled.max_tokens, filled.eos_token_id), (5, 2))
 
+    def test_beam_search_mixed_beam_counts_match_per_request(self):
+        llm = self.engine()
+        params = SamplingParams(num_beams=4, eos_token_id=2)
+        # Request 0 has 4 live beams, request 1 is on its first step with 1 beam.
+        seqs = [Sequence(0, [1, 5 + b], [3], params) for b in range(4)]
+        seqs.append(Sequence(1, [1], [3], params))
+        for b, seq in enumerate(seqs):
+            seq.cum_logprob = -0.1 * b
+        scores = torch.log_softmax(torch.randn(len(seqs), 32), dim=-1)
+
+        def picks(candidates):
+            return {
+                request_id: [(seqs.index(p), t, round(c, 5)) for p, t, c in cands]
+                for request_id, cands in candidates.items()
+            }
+
+        mixed = picks(llm.runner._beam_search(seqs, scores.clone(), params))
+        alone = {
+            **picks(llm.runner._beam_search(seqs[:4], scores[:4].clone(), params)),
+            **picks(llm.runner._beam_search(seqs[4:], scores[4:].clone(), params)),
+        }
+        self.assertEqual(mixed, alone)
+        self.assertEqual(len(mixed[0]), 8)  # max(2, 1 + 1 eos) * 4 beams
+
     def test_eos_override_and_single_request_out(self):
         llm = self.engine()
         # None takes the checkpoint's EOS (2); [] never stops early.

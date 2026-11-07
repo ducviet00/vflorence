@@ -2,6 +2,7 @@ import logging
 import platform
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
+from itertools import groupby
 
 import torch
 import vllm_cpu_attn
@@ -262,67 +263,78 @@ class ModelRunner:
         """Apply LogitsProcessor and return greedy token IDs or beam top-k candidates."""
         sampling_params = seqs[0].sampling_params
         logits_processor = self._get_logits_processor(sampling_params)
+        lengths = [len(seq.token_ids) for seq in seqs]
+        max_len = max(lengths)
+        # Histories differ in length: left-pad with -1, which every logits rule ignores.
+        histories = [
+            [-1] * (max_len - len(seq.token_ids)) + seq.token_ids for seq in seqs
+        ]
+        # One float buffer for the whole batch; .float() is a no-op for fp32 logits.
+        scores = logits.float()
+        if sampling_params.num_beams > 1:
+            scores = torch.log_softmax(scores, dim=-1)
+        scores = logits_processor(  # in place
+            torch.tensor(histories, dtype=torch.long),
+            scores,
+            torch.tensor(lengths, dtype=torch.long),
+        )
         if sampling_params.num_beams == 1:
-            lengths = [len(seq.token_ids) for seq in seqs]
-            max_len = max(lengths)
-            # Histories differ in length: left-pad with -1, which every logits rule ignores.
-            histories = [
-                [-1] * (max_len - len(seq.token_ids)) + seq.token_ids for seq in seqs
-            ]
-            scores = logits_processor(
-                torch.tensor(histories, dtype=torch.long),
-                logits.float(),
-                torch.tensor(lengths, dtype=torch.long),
-            )
             return scores.argmax(dim=-1).tolist()
+        return self._beam_search(seqs, scores, sampling_params)
 
-        num_beams = sampling_params.num_beams
-        vocab_size = logits.shape[-1]
-        by_request: dict[int, list[int]] = defaultdict(list)
-        for index, seq in enumerate(seqs):
-            by_request[seq.request_id].append(index)
-        groups: dict[tuple[int, int], list] = defaultdict(list)
-        for request_id, indices in by_request.items():
-            groups[(len(indices), len(seqs[indices[0]].token_ids))].append(
-                (request_id, indices)
+    def _beam_search(self, seqs, scores, sampling_params) -> dict[int, list]:
+        """Return each request's top-k (parent, token_id, cum_logprob) candidates.
+
+        scores holds processed log-probs, one row per seq; it is updated in place.
+        """
+        vocab_size = scores.shape[-1]
+        # Keep top K = max(2, 1 + n_eos_tokens) * num_beams continuations.
+        n_eos_tokens = len(sampling_params.eos_ids())
+        beams_to_keep = max(2, 1 + n_eos_tokens) * sampling_params.num_beams
+        cum_logprobs = torch.tensor(
+            [seq.cum_logprob for seq in seqs], dtype=torch.float32
+        )
+        scores += cum_logprobs.unsqueeze(-1)
+
+        # The scheduler keeps a request's beams adjacent, so each request is one
+        # contiguous slice of scores.
+        requests = [
+            (request_id, list(beams))
+            for request_id, beams in groupby(seqs, key=lambda seq: seq.request_id)
+        ]
+        assert len({request_id for request_id, _ in requests}) == len(requests), (
+            "beams of a request must be adjacent"
+        )
+        beam_counts = {len(beams) for _, beams in requests}
+        if len(beam_counts) == 1:
+            # Usual case, every request has the same live beam count: one topk
+            # over [requests, beams * vocab] (a view, no copy).
+            flat = scores.view(len(requests), -1)
+            top_scores, top_indices = torch.topk(
+                flat, min(beams_to_keep, flat.shape[-1]), dim=-1
             )
+            tops = zip(top_scores.tolist(), top_indices.tolist())
+        else:
+            # A request on its first step has 1 beam; topk each request separately.
+            tops = []
+            start = 0
+            for _, beams in requests:
+                flat = scores[start : start + len(beams)].flatten()
+                top_scores, top_indices = torch.topk(
+                    flat, min(beams_to_keep, flat.numel())
+                )
+                tops.append((top_scores.tolist(), top_indices.tolist()))
+                start += len(beams)
+
         topk_candidates = {}
-        for (beam_count, _), group in groups.items():
-            rows = [i for _, seq_indices in group for i in seq_indices]
-            input_ids = torch.tensor(
-                [seqs[i].token_ids for i in rows], dtype=torch.long
-            )
-            log_probs = logits_processor(
-                input_ids, torch.log_softmax(logits[rows].float(), dim=-1)
-            )
-            running_beam_scores = torch.tensor(
-                [
-                    [seqs[i].cum_logprob for i in seq_indices]
-                    for _, seq_indices in group
-                ],
-                dtype=torch.float32,
-            ).unsqueeze(-1)
-            log_probs = (
-                log_probs.reshape(len(group), beam_count, vocab_size)
-                + running_beam_scores
-            ).reshape(len(group), -1)
-            # Keep top K = max(2, 1 + n_eos_tokens) * num_beams continuations.
-            n_eos_tokens = len(sampling_params.eos_ids())
-            beams_to_keep = min(
-                max(2, 1 + n_eos_tokens) * num_beams, log_probs.shape[-1]
-            )
-            topk_log_probs, topk_indices = torch.topk(log_probs, beams_to_keep, dim=-1)
-            for (request_id, seq_indices), log_probs_row, indices_row in zip(
-                group, topk_log_probs.tolist(), topk_indices.tolist()
-            ):
-                topk_candidates[request_id] = [
-                    (
-                        seqs[seq_indices[idx // vocab_size]],
-                        idx % vocab_size,
-                        cum_logprob,
-                    )
-                    for idx, cum_logprob in zip(indices_row, log_probs_row)
-                ]
+        for (request_id, beams), (request_scores, request_indices) in zip(
+            requests, tops
+        ):
+            candidates = []
+            for index, cum_logprob in zip(request_indices, request_scores):
+                beam, token_id = divmod(index, vocab_size)
+                candidates.append((beams[beam], token_id, cum_logprob))
+            topk_candidates[request_id] = candidates
         return topk_candidates
 
     @torch.no_grad()
