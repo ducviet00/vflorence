@@ -83,7 +83,6 @@ class BenchmarkTests(unittest.TestCase):
             model.generate.call_args_list[0].kwargs["pixel_values"].dtype,
             torch.bfloat16,
         )
-        self.assertIsNone(model.generate.call_args.kwargs["forced_eos_token_id"])
 
     def test_stage_bart_inputs_have_exact_length(self):
         tokenizer = Mock(

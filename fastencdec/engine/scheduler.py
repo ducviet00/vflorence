@@ -19,23 +19,11 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence) -> None:
-        if seq.sampling_params.num_beams > self.max_num_seqs:
-            raise ValueError(
-                f"num_beams ({seq.sampling_params.num_beams}) exceeds "
-                f"max_num_seqs ({self.max_num_seqs})"
-            )
         self.waiting.append(seq)
 
     def remove(self, seq: Sequence) -> None:
         self.running.remove(seq)
         self.block_manager.deallocate(seq)
-
-    def _fork(
-        self, parent: Sequence, token_id: int, cum_logprob: float = 0.0
-    ) -> Sequence:
-        child = parent.fork(token_id, cum_logprob)
-        self.block_manager.fork(parent, child)
-        return child
 
     def schedule(self) -> tuple[list[Sequence], list[tuple[int, int]]]:
         """Admit waiting sequences up to max_num_seqs, allocate KV blocks, and return (running, copies)."""
