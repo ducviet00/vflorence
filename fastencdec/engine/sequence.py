@@ -7,6 +7,19 @@ from ..sampling_params import SamplingParams
 
 
 @dataclass
+class Request:
+    input_ids: list[int]
+    pixel_values: torch.Tensor | None = None
+
+
+@dataclass
+class RequestOut:
+    input_ids: list[int]
+    completion_token_ids: list[int]
+    pixel_values: torch.Tensor | None = None
+
+
+@dataclass
 class Sequence:
     """State and paged KV-cache bookkeeping for a single decoder hypothesis."""
 
@@ -32,6 +45,9 @@ class Sequence:
             h = hashlib.sha256(f"{tuple(px.shape)}{px.dtype}".encode())
             h.update(px.view(torch.uint8).numpy())
             self.mm_hash = h.hexdigest()
+
+    def append_token(self, token_id: int) -> None:
+        self.token_ids.append(token_id)
 
     @property
     def num_generated(self) -> int:

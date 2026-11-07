@@ -74,6 +74,36 @@ Reading order: `engine/sequence.py` -> `engine/block_manager.py` ->
 `layers/attention.py` -> `models/bart.py`. The step-by-step flow is in
 [AGENTS.md section 4](AGENTS.md#4-how-a-step-works).
 
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant E as LLMEngine
+    participant S as Scheduler
+    participant B as BlockManager
+    participant R as ModelRunner
+
+    U->>E: generate(requests, sampling_params)
+    loop for req in requests
+        E->>S: add(Sequence)
+    end
+    loop while not is_finished()
+        E->>S: schedule()
+        S->>B: ensure_capacity(seq)
+        B-->>S: copies (CoW block pairs)
+        S-->>E: seqs, copies
+        E->>R: run(seqs, copies)
+        Note over R: _encode(fresh) -> encoder_kv_cache<br/>_prepare(seqs, copies) + stage_cross<br/>decode_fn(input_ids, positions)<br/>_sample(seqs, logits)
+        R-->>E: sample_out (tokens / beam top-k)
+        E->>S: postprocess(seqs, sample_out)
+        S->>B: fork(parent, child) / deallocate(seq)
+        S-->>E: finished (request_id, RequestOut)
+        loop for request_id, _ in finished
+            E->>R: clear_request(request_id)
+        end
+    end
+    E-->>U: list[RequestOut]
+```
+
 * **Paged KV cache.** Keys and values live in fixed blocks; beams share blocks and
   only copy one when they write into a shared block.
 * **Continuous batching.** Requests join and leave the running batch freely.
