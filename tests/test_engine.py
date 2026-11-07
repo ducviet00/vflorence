@@ -65,7 +65,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(llm.is_finished())
         self.assertEqual(blocks.num_free_blocks, blocks.num_blocks)
         self.assertTrue(not any(blocks.ref_counts))
-        self.assertFalse(llm._finished_beams)
+        self.assertFalse(llm.scheduler._finished_beams)
         for layer in llm.runner.decoder_layers:
             self.assertFalse(layer.encoder_attn.encoder_kv_cache)
         self.assertIsNone(llm.runner._cross_staged)
@@ -111,7 +111,7 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(
                 [o.input_ids for o in completions], [REQUEST.input_ids] * 2
             )
-            self.assertFalse(llm.results)
+            self.assert_clean(llm)
         self.assertEqual(llm.generate([], params), [])
 
     def test_generation_releases_global_cross_cache(self):
@@ -195,7 +195,10 @@ class EngineTests(unittest.TestCase):
         blocks = llm.scheduler.block_manager
         blocks.ensure_capacity(parent)
         parent.num_cached_tokens = 1
-        children = [llm._fork(parent, 4, 0), llm._fork(parent, 5, 0)]
+        children = [
+            llm.scheduler._fork(parent, 4, 0),
+            llm.scheduler._fork(parent, 5, 0),
+        ]
         self.assertEqual(blocks.required_new_blocks(children), 2)
         blocks.deallocate(parent)
         self.assertEqual(blocks.required_new_blocks(children), 1)
@@ -206,7 +209,7 @@ class EngineTests(unittest.TestCase):
         parent = Sequence(0, [1], [3], SamplingParams())
         self.assertIsNone(blocks.ensure_capacity(parent))
         parent.num_cached_tokens = 1
-        child = llm._fork(parent, 4, 0)
+        child = llm.scheduler._fork(parent, 4, 0)
         src = parent.block_table[0]
         dst = blocks.ensure_capacity(child)[1]
         self.assertEqual(child.block_table, [dst])

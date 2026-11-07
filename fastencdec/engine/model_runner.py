@@ -8,6 +8,8 @@ import vllm_cpu_attn
 
 from ..config import Config
 from ..layers import attention
+from ..layers.logits_processor import LogitsProcessor
+from ..sampling_params import SamplingParams
 from ..utils.context import set_context
 from ..utils.loader import load_hf_weights
 
@@ -53,6 +55,8 @@ class ModelRunner:
         # Cross-attention K/V staged for the current batch, keyed by its request ids.
         self._cross_key = None
         self._cross_staged = None
+        self._logits_processor: LogitsProcessor | None = None
+        self._sampling_params: SamplingParams | None = None
 
         # Separate tensors per layer: views of one shared tensor break Inductor codegen.
         # zeros, not empty: the kernel reads whole blocks, and 0 * NaN from garbage
@@ -196,7 +200,6 @@ class ModelRunner:
             input_ids.append(seq.token_ids[pos])
             positions.append(pos)
             new_slots.append(seq.block_table[pos // bs] * bs + pos % bs)
-            seq.num_cached_tokens = pos + 1
             context_lens.append(pos + 1)
             seq_block_tables.append(seq.block_table)
 
@@ -236,9 +239,82 @@ class ModelRunner:
             torch.tensor(positions, dtype=torch.long),
         )
 
+    def _get_logits_processor(self, params: SamplingParams) -> LogitsProcessor:
+        if params is not self._sampling_params or self._logits_processor is None:
+            # Lengths count the single decoder start token, as transformers does.
+            self._logits_processor = LogitsProcessor(
+                params,
+                vocab_size=self.model.lm_head.out_features,
+                max_length=1 + params.max_tokens,
+                begin_index=1 + int(params.forced_bos_token_id is not None),
+            )
+            self._sampling_params = params
+        return self._logits_processor
+
+    def _sample(self, seqs, logits):
+        """Apply LogitsProcessor and return greedy token IDs or beam top-k candidates."""
+        params = seqs[0].sampling
+        processor = self._get_logits_processor(params)
+        if params.num_beams == 1:
+            lens = [len(s.token_ids) for s in seqs]
+            w = max(lens)
+            # Histories differ in length: left-pad with -1, which every logits rule ignores.
+            histories = [[-1] * (w - len(s.token_ids)) + s.token_ids for s in seqs]
+            scores = processor(
+                torch.tensor(histories, dtype=torch.long),
+                logits.float(),
+                torch.tensor(lens, dtype=torch.long),
+            )
+            return scores.argmax(dim=-1).tolist()
+
+        num_beams = params.num_beams
+        vocab = logits.shape[-1]
+        by_request: dict[int, list[int]] = defaultdict(list)
+        for index, seq in enumerate(seqs):
+            by_request[seq.request_id].append(index)
+        groups: dict[tuple[int, int], list] = defaultdict(list)
+        for request_id, indices in by_request.items():
+            groups[(len(indices), len(seqs[indices[0]].token_ids))].append(
+                (request_id, indices)
+            )
+        candidates = {}
+        for (beam_count, _), group in groups.items():
+            rows = [i for _, seq_indices in group for i in seq_indices]
+            input_ids = torch.tensor(
+                [seqs[i].token_ids for i in rows], dtype=torch.long
+            )
+            logprobs = processor(
+                input_ids, torch.log_softmax(logits[rows].float(), dim=-1)
+            )
+            cumulative = torch.tensor(
+                [
+                    [seqs[i].cum_logprob for i in seq_indices]
+                    for _, seq_indices in group
+                ],
+                dtype=torch.float32,
+            ).unsqueeze(-1)
+            scores = (
+                logprobs.reshape(len(group), beam_count, vocab) + cumulative
+            ).reshape(len(group), -1)
+            # Keep enough candidates that num_beams live ones remain after EOS
+            # candidates are set aside (same rule as transformers).
+            keep = min(max(2, 1 + len(params.eos_ids())) * num_beams, scores.shape[-1])
+            top_values, top_indices = torch.topk(scores, keep, dim=-1)
+            for (request_id, _), vals, idxs in zip(
+                group, top_values.tolist(), top_indices.tolist()
+            ):
+                candidates[request_id] = (
+                    [k // vocab for k in idxs],
+                    [k % vocab for k in idxs],
+                    vals,
+                )
+        return candidates
+
     @torch.no_grad()
     def run(self, seqs, copies=()):
-        """Encode any fresh sequences, run one decoder step, and return next-token logits."""
+        """Encode any fresh sequences, run one decoder step, and return sampled candidates."""
+        if not seqs:
+            return []
         fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
         if fresh:
             self._encode(fresh)
@@ -246,9 +322,10 @@ class ModelRunner:
         try:
             input_ids, positions = self._prepare(seqs, copies)
             with self._inductor_ctx(len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW):
-                return self.decode_fn(input_ids, positions)
+                logits = self.decode_fn(input_ids, positions)
         finally:
             set_context()
+        return self._sample(seqs, logits)
 
     def _inductor_ctx(self, freeze=True):
         """Freezing lets Inductor pack weights into oneDNN layouts; it only applies when compiled."""
