@@ -31,7 +31,7 @@ export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
 ## Quick Start
 
 See `examples/` for runnable scripts. `LLM` takes `dtype` (`torch.float32` or `torch.bfloat16`),
-`num_blocks`, `block_size`, `max_num_seqs`, `compile` (default `True`) and `compile_mm_encoder`:
+`max_num_seqs`, `compile` (default `True`) and `mm_cache_size`:
 
 ```python
 from transformers import AutoTokenizer

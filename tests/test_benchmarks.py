@@ -103,7 +103,7 @@ class BenchmarkTests(unittest.TestCase):
         for pixels in (None, torch.zeros(2, 3, 2, 2)):
             with self.subTest(vision=pixels is not None):
                 llm = Mock(decoder_start_token_id=2)
-                llm.engine.runner._inductor_ctx.side_effect = nullcontext
+                llm.runner._inductor_ctx.side_effect = nullcontext
                 with patch("fastencdec.LLM", return_value=llm):
                     stages, generate = stage_latency.fast_stages(
                         args, ids, pixels, torch.float32
@@ -113,7 +113,7 @@ class BenchmarkTests(unittest.TestCase):
                     {"vision", "encode"} if pixels is not None else {"encode"},
                 )
                 stages["encode"]()
-                self.assertIs(llm.engine.runner.encode_fn.call_args.args[0], ids)
+                self.assertIs(llm.runner.encode_fn.call_args.args[0], ids)
                 generate(7)
                 requests, params = llm.generate.call_args.args
                 self.assertEqual(requests[0].input_ids, [0, 4, 2])

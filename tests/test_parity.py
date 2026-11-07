@@ -36,7 +36,7 @@ def main():
 
     with TemporaryDirectory() as tmpdir:
         hf.save_pretrained(tmpdir)
-        llm = LLM(tmpdir, num_blocks=64, block_size=16)
+        llm = LLM(tmpdir, max_num_seqs=8)
 
     for beams in (1, 2, 4):
         params = SamplingParams(max_tokens=12, num_beams=beams)
@@ -79,7 +79,7 @@ def main():
         hf.final_logits_bias[0, config.eos_token_id] += 0.2
     with TemporaryDirectory() as tmpdir:
         hf.save_pretrained(tmpdir)
-        llm = LLM(tmpdir, num_blocks=64, block_size=16)
+        llm = LLM(tmpdir, max_num_seqs=8)
     for beams in (2, 4):
         for early_stopping in (False, True):
             params = SamplingParams(

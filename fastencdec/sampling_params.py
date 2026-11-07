@@ -10,7 +10,7 @@ class SamplingParams:
     max_tokens: int = 64
     num_beams: int = 1
     repetition_penalty: float = 1.0
-    eos_token_id: int | list[int] | None = None
+    eos_token_id: int | list[int] | None = 2
     length_penalty: float = 1.0
     no_repeat_ngram_size: int = 0
     min_length: int = 0
@@ -66,7 +66,7 @@ class SamplingParams:
     def from_generation_config(
         cls,
         config,
-        eos_token_id: int | list[int] | None = None,
+        eos_token_id: int | list[int] | None = 2,
         decoder_prompt_len: int = 1,
     ) -> "SamplingParams":
         val = lambda x, default: default if x is None else x

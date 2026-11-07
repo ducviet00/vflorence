@@ -52,15 +52,15 @@ Mirrors nano-vllm's package layout (`engine/`, `layers/`, `models/`, `utils/`).
 ```
 fastencdec/
   __init__.py          package exports (LLM, Request, RequestOut, SamplingParams)
-  config.py            Config (engine hyperparameters)
-  llm.py               unified LLM facade (BART + Florence-2), Request / RequestOut
+  config.py            Config (engine hyperparameters + HF/text/generation configs)
+  llm.py               LLM facade (subclass of LLMEngine)
   sampling_params.py   SamplingParams (greedy + beam search)
   engine/
     sequence.py        Sequence
     block_manager.py   paged blocks: allocate / fork / copy-on-write / free
     scheduler.py       continuous batching
-    model_runner.py    batching, KV cache, encoder caching, forward
-    llm_engine.py      LLMEngine: step loop, greedy, beam search
+    model_runner.py    model weights, batching, KV cache, encoder caching, forward
+    llm_engine.py      LLMEngine, Request, RequestOut: step loop, greedy, beam search
   layers/
     attention.py       vllm_cpu_attn custom ops (decoder self/cross attention + staging)
     logits_processor.py  pure-torch LogitsProcessor (built once per generate)
