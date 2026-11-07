@@ -26,17 +26,11 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 import torch
 
 from fastencdec import LLM, Request, SamplingParams
-from fastencdec.config import default_block_size
 
 BART = "facebook/bart-large-cnn"
 FLORENCE = "florence-community/Florence-2-base"
 IMAGE = "/tmp/fastencdec/florence2_bench.jpg"
 IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
-
-
-def block_config(tokens):
-    block_size = default_block_size()
-    return max(1, tokens // block_size), block_size
 
 
 def load_image():
@@ -77,13 +71,9 @@ def _check_tokens(a, b, dtype):
 def bart(dtype, beams, max_tokens):
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-    num_blocks, block_size = block_config(
-        2048 * (16 if dtype is not torch.float32 else 4)
-    )
     llm = LLM(
         BART,
-        num_blocks=num_blocks,
-        block_size=block_size,
+        max_num_seqs=len(BART_TEXTS) * beams,
         dtype=dtype,
     )
     tokenizer = AutoTokenizer.from_pretrained(BART)
@@ -126,13 +116,9 @@ def florence(dtype, beams, max_tokens):
     from transformers import Florence2ForConditionalGeneration as HFFlorence2
 
     image = load_image()
-    num_blocks, block_size = block_config(
-        4096 * (16 if dtype is not torch.float32 else 4)
-    )
     llm = LLM(
         FLORENCE,
-        num_blocks=num_blocks,
-        block_size=block_size,
+        max_num_seqs=len(FLORENCE_PROMPTS) * beams,
         dtype=dtype,
     )
     processor = AutoProcessor.from_pretrained(FLORENCE)

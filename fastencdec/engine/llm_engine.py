@@ -1,15 +1,27 @@
 from collections import defaultdict
-from dataclasses import replace
+from dataclasses import dataclass
 
 import torch
 
 from ..config import Config
 from ..layers.logits_processor import LogitsProcessor
-from ..utils.context import set_context
-from .block_manager import BlockManager
+from ..sampling_params import SamplingParams
 from .model_runner import ModelRunner
 from .scheduler import Scheduler
 from .sequence import Sequence
+
+
+@dataclass
+class Request:
+    input_ids: list[int]
+    pixel_values: torch.Tensor | None = None
+
+
+@dataclass
+class RequestOut:
+    input_ids: list[int]
+    completion_token_ids: list[int]
+    pixel_values: torch.Tensor | None = None
 
 
 def _length_penalized(seq: Sequence, length_penalty: float) -> float:
@@ -29,41 +41,36 @@ def select_beam_candidates(
 class LLMEngine:
     """Step-level execution engine driving scheduling, forward passes, greedy, and beam search."""
 
-    def __init__(
-        self, model, config: Config, eos_token_id: int | list[int] | None = None
-    ):
-        self.block_manager = BlockManager(config.num_blocks, config.block_size)
-        self.runner = ModelRunner(
-            model,
-            self.block_manager,
-            config.dtype,
-            compile=config.compile,
-            compile_mm_encoder=config.compile_mm_encoder,
-            mm_cache_size=config.mm_cache_size,
-        )
+    def __init__(self, model: str, **kwargs):
+        config = Config(model, **kwargs)
+        self.config = config
+        self.runner = ModelRunner(config)
         self.scheduler = Scheduler(config)
-        text_config = model.config.get_text_config()
-        self.max_positions = text_config.max_position_embeddings
-        self.decoder_start_token_id = text_config.decoder_start_token_id
-        self.eos_token_id = eos_token_id
-        self.results: dict[int, list[int]] = {}
+        self.max_positions = config.text_config.max_position_embeddings
+        self.decoder_start_token_id = config.text_config.decoder_start_token_id
+        self.eos_token_id = config.text_config.eos_token_id
+        self.default_sampling_params = SamplingParams.from_generation_config(
+            config.generation_config, self.eos_token_id
+        )
+        self.results: dict[int, RequestOut] = {}
         self._finished_beams: dict[int, list[Sequence]] = defaultdict(list)
         self._logits_processor = None
         self._next_request_id = 0
 
-    def generate(self, requests, params) -> dict[int, list[int]]:
-        """Run a batch of Request instances to completion.
-
-        Returns {request_id: generated token ids}, in request order.
-        """
-        if not self.is_finished():
-            raise RuntimeError("finish pending requests before calling generate")
-        params.validate()
-        requests = list(requests)
+    @torch.inference_mode()
+    def generate(
+        self,
+        requests: Request | list[Request],
+        sampling_params: SamplingParams | None = None,
+    ) -> list[RequestOut]:
+        """Run batched generation on requests and return one RequestOut per request."""
+        if isinstance(requests, Request):
+            requests = [requests]
+        else:
+            requests = list(requests)
         if not requests:
-            return {}
-        if params.eos_token_id is None and self.eos_token_id is not None:
-            params = replace(params, eos_token_id=self.eos_token_id)
+            return []
+        params = sampling_params or self.default_sampling_params
         self._validate(requests, params)
 
         # Lengths count the single decoder start token, as transformers does.
@@ -76,25 +83,21 @@ class LLMEngine:
 
         decoder_token_ids = [self.decoder_start_token_id]
         request_ids = []
-        try:
-            for req in requests:
-                request_id = self._next_request_id
-                self._next_request_id += 1
-                self.scheduler.add(
-                    Sequence(
-                        request_id,
-                        decoder_token_ids,
-                        req.input_ids,
-                        params,
-                        req.pixel_values,
-                    )
+        for req in requests:
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            self.scheduler.add(
+                Sequence(
+                    request_id,
+                    decoder_token_ids,
+                    req.input_ids,
+                    params,
+                    req.pixel_values,
                 )
-                request_ids.append(request_id)
-            self.run()
-        except BaseException:
-            self._abort(request_ids)
-            raise
-        return {r: self.results.pop(r) for r in request_ids}
+            )
+            request_ids.append(request_id)
+        self.run()
+        return [self.results.pop(r) for r in request_ids]
 
     def _validate(self, requests, params) -> None:
         """Reject requests that would crash or run out of KV cache mid-batch."""
@@ -111,32 +114,20 @@ class LLMEngine:
                 )
         # shortcut: checks one request alone; a full batch can still run out.
         # Upgrade to preemption if that shows up in practice.
-        bs = self.block_manager.block_size
-        worst = params.num_beams * -(-params.max_tokens // bs)
-        if worst > self.block_manager.num_blocks:
+        bs = self.config.block_size
+        max_num_blocks = params.num_beams * (params.max_tokens // bs)
+        if max_num_blocks > self.config.num_blocks:
             raise ValueError(
-                f"one request may need {worst} KV blocks but num_blocks is "
-                f"{self.block_manager.num_blocks}; increase num_blocks"
+                f"one request may need {max_num_blocks} KV blocks but num_blocks is "
+                f"{self.config.num_blocks}; increase num_blocks"
             )
-
-    def _abort(self, request_ids) -> None:
-        """Discard a failed batch, including partially written decoder state."""
-        for request_id in request_ids:
-            self.runner.clear_request(request_id)
-        self.scheduler.waiting.clear()
-        self.scheduler.running.clear()
-        self._finished_beams.clear()
-        self.block_manager.reset()
-        self.results.clear()
-        self._logits_processor = None
-        set_context()
 
     def is_finished(self) -> bool:
         return self.scheduler.is_finished()
 
     def step(self) -> None:
-        seqs = self.scheduler.schedule()
-        logits = self.runner.run(seqs)
+        seqs, copies = self.scheduler.schedule()
+        logits = self.runner.run(seqs, copies)
         self._postprocess(seqs, logits)
 
     def run(self) -> None:
@@ -167,9 +158,12 @@ class LLMEngine:
             seq.token_ids.append(token)
             if token in eos_ids or seq.num_generated >= params.max_tokens:
                 self.scheduler.remove(seq)
-                self.block_manager.deallocate(seq)
                 self.runner.clear_request(seq.request_id)
-                self.results[seq.request_id] = seq.completion_token_ids
+                self.results[seq.request_id] = RequestOut(
+                    input_ids=seq.encoder_token_ids,
+                    completion_token_ids=seq.completion_token_ids,
+                    pixel_values=seq.pixel_values,
+                )
 
     def _postprocess_beam(self, seqs, logits) -> None:
         """Group beam requests by shape and run one batched topk per group."""
@@ -234,7 +228,7 @@ class LLMEngine:
         child.num_cached_tokens = parent.num_cached_tokens
         child.cum_logprob = score
         if share_blocks:
-            self.block_manager.fork(parent, child)
+            self.scheduler.block_manager.fork(parent, child)
         return child
 
     def _beam_advance(self, request_id, beams, params, parents, tokens, top_values):
@@ -258,7 +252,6 @@ class LLMEngine:
         ]
         for beam in beams:
             self.scheduler.remove(beam)
-            self.block_manager.deallocate(beam)
 
         lp = params.length_penalty
         finished = self._finished_beams[request_id]
@@ -280,10 +273,14 @@ class LLMEngine:
         if done:
             self._finished_beams.pop(request_id, None)
             for s in live:
-                self.block_manager.deallocate(s)
+                self.scheduler.block_manager.deallocate(s)
             self.runner.clear_request(request_id)
-            self.results[request_id] = (
-                finished[0].completion_token_ids if finished else []
+            self.results[request_id] = RequestOut(
+                input_ids=beams[0].encoder_token_ids,
+                completion_token_ids=(
+                    finished[0].completion_token_ids if finished else []
+                ),
+                pixel_values=beams[0].pixel_values,
             )
         else:
             self.scheduler.running.extend(live)
