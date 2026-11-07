@@ -261,7 +261,7 @@ class ModelRunner:
     def _sample(self, seqs, logits):
         """Apply LogitsProcessor and return greedy token IDs or beam top-k candidates."""
         sampling_params = seqs[0].sampling_params
-        processor = self._get_logits_processor(sampling_params)
+        logits_processor = self._get_logits_processor(sampling_params)
         if sampling_params.num_beams == 1:
             lengths = [len(seq.token_ids) for seq in seqs]
             max_len = max(lengths)
@@ -269,7 +269,7 @@ class ModelRunner:
             histories = [
                 [-1] * (max_len - len(seq.token_ids)) + seq.token_ids for seq in seqs
             ]
-            scores = processor(
+            scores = logits_processor(
                 torch.tensor(histories, dtype=torch.long),
                 logits.float(),
                 torch.tensor(lengths, dtype=torch.long),
@@ -292,7 +292,7 @@ class ModelRunner:
             input_ids = torch.tensor(
                 [seqs[i].token_ids for i in rows], dtype=torch.long
             )
-            log_probs = processor(
+            log_probs = logits_processor(
                 input_ids, torch.log_softmax(logits[rows].float(), dim=-1)
             )
             running_beam_scores = torch.tensor(
