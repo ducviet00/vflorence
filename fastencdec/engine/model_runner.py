@@ -1,3 +1,4 @@
+import logging
 import platform
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
@@ -5,9 +6,14 @@ from contextlib import nullcontext
 import torch
 import vllm_cpu_attn
 
+from ..config import Config
 from ..layers import attention
+from ..layers.logits_processor import LogitsProcessor
+from ..sampling_params import SamplingParams
 from ..utils.context import set_context
+from ..utils.loader import load_hf_weights
 
+logger = logging.getLogger(__name__)
 _COMPILED_RUNNERS = 0
 
 # On aarch64 with torch >= 2.15, oneDNN runs a plain (unpacked) weight fastest for
@@ -22,20 +28,12 @@ _UNFROZEN_SINGLE_ROW = (
 class ModelRunner:
     """Manages KV caches, encoder caching, step preparation, and model execution."""
 
-    def __init__(
-        self,
-        model,
-        block_manager,
-        dtype=torch.float32,
-        compile=True,
-        compile_mm_encoder=True,
-        mm_cache_size=256,
-    ):
-        self.model = model.eval()
-        self.block_manager = block_manager
-        self.block_size = block_manager.block_size
-        self.dtype = dtype
-        self.decoder_layers = list(model.decoder_layers)
+    def __init__(self, config: Config):
+        self.config = config
+        self.model = load_hf_weights(config)
+        self.block_size = config.block_size
+        self.dtype = config.dtype
+        self.decoder_layers = list(self.model.decoder_layers)
         self.num_heads = self.decoder_layers[0].self_attn.num_heads
         self.head_dim = self.decoder_layers[0].self_attn.head_dim
         if self.head_dim not in attention.HEAD_DIMS:
@@ -43,36 +41,58 @@ class ModelRunner:
                 f"vllm-cpu-attn does not support head_dim={self.head_dim}; "
                 f"must be one of {sorted(attention.HEAD_DIMS)}"
             )
-        self.isa = vllm_cpu_attn.get_isa(dtype, self.block_size, self.head_dim)
+        self.isa = vllm_cpu_attn.get_isa(self.dtype, self.block_size, self.head_dim)
         # Eager by default; _compile swaps in compiled versions.
-        self.compiled = compile
+        self.compiled = config.compile
         self.decode_fn = self.model
         self.encode_fn = self.model.encode
         self.image_fn = getattr(self.model, "get_image_features", None)
-        if compile:
-            self._compile(compile_mm_encoder)
+        if config.compile:
+            self._compile()
         # Multimodal encoder cache: LRU of mm_hash -> image embeddings, kept across calls.
         self.mm_cache = OrderedDict()
-        self.mm_cache_size = mm_cache_size
+        self.mm_cache_size = config.mm_cache_size
         self.mm_cache_hits = self.mm_cache_misses = 0
         # Cross-attention K/V staged for the current batch, keyed by its request ids.
         self._cross_key = None
         self._cross_staged = None
+        self._logits_processor: LogitsProcessor | None = None
+        self._sampling_params: SamplingParams | None = None
+        self.allocate_kv_cache()
 
+    def allocate_kv_cache(self) -> None:
         # Separate tensors per layer: views of one shared tensor break Inductor codegen.
         # zeros, not empty: the kernel reads whole blocks, and 0 * NaN from garbage
         # in a block's unused tail would poison the output.
         shape = (
-            block_manager.num_blocks,
+            self.config.num_blocks,
             self.num_heads,
             self.block_size,
             self.head_dim,
         )
         for layer in self.decoder_layers:
-            layer.self_attn.k_cache = torch.zeros(shape, dtype=dtype)
-            layer.self_attn.v_cache = torch.zeros(shape, dtype=dtype)
+            layer.self_attn.k_cache = torch.zeros(shape, dtype=self.dtype)
+            layer.self_attn.v_cache = torch.zeros(shape, dtype=self.dtype)
 
-    def _compile(self, compile_mm_encoder: bool) -> None:
+        weight_bytes = sum(
+            t.numel() * t.element_size()
+            for t in (*self.model.parameters(), *self.model.buffers())
+        )
+        kv_bytes = sum(
+            c.numel() * c.element_size()
+            for layer in self.decoder_layers
+            for c in (layer.self_attn.k_cache, layer.self_attn.v_cache)
+        )
+        logger.info(
+            "Allocated %.1f MB (weights %.1f MB + KV cache %.1f MB, %d blocks of %d tokens)",
+            (weight_bytes + kv_bytes) / (1024**2),
+            weight_bytes / (1024**2),
+            kv_bytes / (1024**2),
+            self.config.num_blocks,
+            self.block_size,
+        )
+
+    def _compile(self) -> None:
         global _COMPILED_RUNNERS
         _COMPILED_RUNNERS += 1
         # Each engine adds ~4 Dynamo cache entries; past the limit Dynamo silently
@@ -87,7 +107,7 @@ class ModelRunner:
         # One dynamic graph covers every batch size / encoder length.
         self.decode_fn = torch.compile(self.model, dynamic=True)
         self.encode_fn = torch.compile(self.model.encode, dynamic=True)
-        if self.image_fn is not None and compile_mm_encoder:
+        if self.image_fn is not None:
             self.image_fn = torch.compile(self.image_fn, dynamic=False)
 
     def _copy_blocks(self, copies: list[tuple[int, int]]) -> None:
@@ -123,15 +143,15 @@ class ModelRunner:
             for seq in seqs:
                 self.mm_cache[seq.mm_hash] = embeds[seq.mm_hash]
                 self.mm_cache.move_to_end(seq.mm_hash)
-            while len(self.mm_cache) > self.mm_cache_size:
-                self.mm_cache.popitem(last=False)
+                if len(self.mm_cache) > self.mm_cache_size:
+                    self.mm_cache.popitem(last=False)
         return embeds
 
     @torch.no_grad()
     def _encode(self, seqs) -> None:
         """Batch fresh sequences by (encoder_len, image_shape) and cache cross-attn K/V."""
-        images = [s for s in seqs if s.pixel_values is not None]
-        embeds = self._image_embeds(images) if images else {}
+        image_seqs = [seq for seq in seqs if seq.pixel_values is not None]
+        embeds = self._image_embeds(image_seqs) if image_seqs else {}
         groups = defaultdict(list)
         for seq in seqs:
             px_shape = (
@@ -139,16 +159,18 @@ class ModelRunner:
             )
             groups[(len(seq.encoder_token_ids), px_shape)].append(seq)
         for group in groups.values():
-            ids = torch.tensor([s.encoder_token_ids for s in group], dtype=torch.long)
+            input_ids = torch.tensor(
+                [seq.encoder_token_ids for seq in group], dtype=torch.long
+            )
             with self._inductor_ctx():
                 if group[0].pixel_values is None:
-                    hidden = self.encode_fn(ids)
+                    hidden = self.encode_fn(input_ids)
                 else:
-                    image_embeds = torch.stack([embeds[s.mm_hash] for s in group])
-                    hidden = self.encode_fn(ids, image_embeds=image_embeds)
+                    image_embeds = torch.stack([embeds[seq.mm_hash] for seq in group])
+                    hidden = self.encode_fn(input_ids, image_embeds=image_embeds)
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
-                shape = (len(group), ids.shape[1], attn.num_heads, attn.head_dim)
+                shape = (len(group), input_ids.shape[1], attn.num_heads, attn.head_dim)
                 key, value = attn.kv_proj(hidden).chunk(2, dim=-1)
                 key, value = (
                     key.reshape(shape).contiguous(),
@@ -163,39 +185,33 @@ class ModelRunner:
             layer.encoder_attn.encoder_kv_cache.pop(request_id, None)
         self._cross_key = self._cross_staged = None
 
-    def _prepare(self, seqs):
-        """Allocate KV blocks and build input_ids, positions, and Context tensors for the step."""
-        bs = self.block_size
+    def _prepare(self, seqs, copies=()):
+        """Build input_ids, positions, and Context tensors for the step."""
+        block_size = self.block_size
         for seq in seqs:
             num_new = len(seq.token_ids) - seq.num_cached_tokens
             if num_new != 1:
                 raise ValueError(
                     f"each step must feed 1 token per sequence, got {num_new}"
                 )
-        if (
-            self.block_manager.required_new_blocks(seqs)
-            > self.block_manager.num_free_blocks
-        ):
-            raise RuntimeError("KV cache is full; increase num_blocks")
 
-        input_ids, positions, new_slots = [], [], []
-        context_lens, seq_block_tables, copies = [], [], []
-        for seq in seqs:
-            if (copy := self.block_manager.ensure_capacity(seq)) is not None:
-                copies.append(copy)
-            pos = seq.num_cached_tokens
-            input_ids.append(seq.token_ids[pos])
-            positions.append(pos)
-            new_slots.append(seq.block_table[pos // bs] * bs + pos % bs)
-            seq.num_cached_tokens = pos + 1
-            context_lens.append(pos + 1)
-            seq_block_tables.append(seq.block_table)
-        # Safe to copy after the loop: a dst is a fresh block, never another pair's src.
         if copies:
             self._copy_blocks(copies)
 
-        max_blocks = max(len(t) for t in seq_block_tables)
-        padded = [t + [0] * (max_blocks - len(t)) for t in seq_block_tables]
+        input_ids, positions, slot_mapping = [], [], []
+        context_lens, block_tables = [], []
+        for seq in seqs:
+            pos = seq.num_cached_tokens
+            input_ids.append(seq.token_ids[pos])
+            positions.append(pos)
+            slot_mapping.append(
+                seq.block_table[pos // block_size] * block_size + pos % block_size
+            )
+            context_lens.append(pos + 1)
+            block_tables.append(seq.block_table)
+
+        max_blocks = max(len(t) for t in block_tables)
+        padded_tables = [t + [0] * (max_blocks - len(t)) for t in block_tables]
         context_lens_t = torch.tensor(context_lens, dtype=torch.int32)
         query_start_loc = torch.arange(len(seqs) + 1, dtype=torch.int32)
         self_metadata = vllm_cpu_attn.get_scheduler_metadata(
@@ -208,18 +224,18 @@ class ModelRunner:
             query_start_loc=query_start_loc,
             causal=False,
             isa=self.isa,
-            block_size=bs,
+            block_size=block_size,
         )
         request_ids = tuple(seq.request_id for seq in seqs)
         if request_ids != self._cross_key:
             self._cross_staged = attention.stage_cross(
-                self.decoder_layers, request_ids, bs, self.isa
+                self.decoder_layers, request_ids, block_size, self.isa
             )
             self._cross_key = request_ids
         set_context(
             context_lens=context_lens_t,
-            block_tables=torch.tensor(padded, dtype=torch.int32),
-            slot_mapping=torch.tensor(new_slots, dtype=torch.int64),
+            block_tables=torch.tensor(padded_tables, dtype=torch.int32),
+            slot_mapping=torch.tensor(slot_mapping, dtype=torch.int64),
             query_start_loc=query_start_loc,
             self_metadata=self_metadata,
             isa=self.isa,
@@ -230,19 +246,84 @@ class ModelRunner:
             torch.tensor(positions, dtype=torch.long),
         )
 
+    def _get_logits_processor(self, sampling_params: SamplingParams) -> LogitsProcessor:
+        if sampling_params != self._sampling_params or self._logits_processor is None:
+            # Lengths count the single decoder start token, as transformers does.
+            self._logits_processor = LogitsProcessor(
+                sampling_params,
+                vocab_size=self.model.lm_head.out_features,
+                max_length=1 + sampling_params.max_tokens,
+                begin_index=1 + int(sampling_params.forced_bos_token_id is not None),
+            )
+            self._sampling_params = sampling_params
+        return self._logits_processor
+
+    def _sample(self, seqs, logits):
+        """Apply LogitsProcessor and return greedy token IDs or beam top-k candidates."""
+        sampling_params = seqs[0].sampling_params
+        logits_processor = self._get_logits_processor(sampling_params)
+        lengths = [len(seq.token_ids) for seq in seqs]
+        max_len = max(lengths)
+        # Histories differ in length: left-pad with -1, which every logits rule ignores.
+        histories = [
+            [-1] * (max_len - len(seq.token_ids)) + seq.token_ids for seq in seqs
+        ]
+        # One float buffer for the whole batch; .float() is a no-op for fp32 logits.
+        scores = logits.float()
+        if sampling_params.num_beams > 1:
+            scores = torch.log_softmax(scores, dim=-1)
+        scores = logits_processor(  # in place
+            torch.tensor(histories, dtype=torch.long),
+            scores,
+            torch.tensor(lengths, dtype=torch.long),
+        )
+        if sampling_params.num_beams == 1:
+            return scores.argmax(dim=-1).tolist()
+        return self._beam_search(seqs, scores, sampling_params)
+
+    def _beam_search(self, seqs, scores, sampling_params) -> dict[int, list]:
+        """Return each request's top-k (parent, token_id, cum_logprob) candidates.
+        scores holds processed log-probs, one row per seq.
+        """
+        # Keep top K = max(2, 1 + n_eos_tokens) * num_beams continuations.
+        n_eos_tokens = len(sampling_params.eos_ids())
+        beams_to_keep = max(2, 1 + n_eos_tokens) * sampling_params.num_beams
+        # topk each row over the vocab, then add cum_logprob to the survivors only.
+        top_scores, top_ids = torch.topk(
+            scores, min(beams_to_keep, scores.shape[-1]), dim=-1
+        )
+        top_scores += torch.tensor(
+            [seq.cum_logprob for seq in seqs], dtype=torch.float32
+        ).unsqueeze(-1)
+
+        topk_candidates = defaultdict(list)
+        for seq, row_scores, row_ids in zip(
+            seqs, top_scores.tolist(), top_ids.tolist()
+        ):
+            topk_candidates[seq.request_id].extend(
+                zip([seq] * len(row_ids), row_ids, row_scores)
+            )
+        for candidates in topk_candidates.values():
+            candidates.sort(key=lambda candidate: candidate[2], reverse=True)
+            del candidates[beams_to_keep:]
+        return dict(topk_candidates)
+
     @torch.no_grad()
-    def run(self, seqs):
-        """Encode any fresh sequences, run one decoder step, and return next-token logits."""
+    def run(self, seqs, copies=()):
+        """Encode any fresh sequences, run one decoder step, and return sampled candidates."""
+        if not seqs:
+            return []
         fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
         if fresh:
             self._encode(fresh)
 
         try:
-            input_ids, positions = self._prepare(seqs)
+            input_ids, positions = self._prepare(seqs, copies)
             with self._inductor_ctx(len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW):
-                return self.decode_fn(input_ids, positions)
+                logits = self.decode_fn(input_ids, positions)
         finally:
             set_context()
+        return self._sample(seqs, logits)
 
     def _inductor_ctx(self, freeze=True):
         """Freezing lets Inductor pack weights into oneDNN layouts; it only applies when compiled."""

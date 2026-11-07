@@ -27,11 +27,10 @@ class BlockManager:
 
     def required_new_blocks(self, seqs) -> int:
         """Count new blocks and copy-on-write blocks needed to append 1 token per sequence."""
-        bs = self.block_size
         # The last holder of a shared block writes in place; every other holder copies.
         required, remaining = 0, {}
         for seq in seqs:
-            idx = seq.num_cached_tokens // bs
+            idx = seq.num_cached_tokens // self.block_size
             if idx >= len(seq.block_table):
                 required += 1
             else:

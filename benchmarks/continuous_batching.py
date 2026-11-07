@@ -51,17 +51,10 @@ def prepare_inputs(processor, num_requests):
 
 def run_fast(args, input_token_ids, pixels, dtype):
     from fastencdec import LLM, Request, SamplingParams
-    from fastencdec.config import default_block_size
 
-    block_size = default_block_size()
-    num_sequences = args.max_num_seq * args.beamsearch
-    # Include the decoder start token and one extra block per beam for copy-on-write.
-    blocks_per_sequence = (args.max_tokens + 1 + block_size - 1) // block_size + 1
     llm = LLM(
         args.model,
-        num_blocks=num_sequences * blocks_per_sequence,
-        block_size=block_size,
-        max_num_seqs=num_sequences,
+        max_num_seqs=args.max_num_seq * args.beamsearch,
         dtype=dtype,
         mm_cache_size=args.mm_cache_size,
     )
@@ -74,7 +67,7 @@ def run_fast(args, input_token_ids, pixels, dtype):
         Request(ids, image_pixels) for ids, image_pixels in zip(input_token_ids, pixels)
     ]
 
-    runner = llm.engine.runner
+    runner = llm.runner
 
     def once():
         # Cold cache each run: only reuse within the batch (4 tasks per image) counts.
@@ -114,8 +107,6 @@ def run_hf(args, input_token_ids, pixels, dtype, tokenizer):
                 num_beams=args.beamsearch,
                 # Override checkpoint defaults to match fast-encdec's decoding.
                 do_sample=False,
-                forced_bos_token_id=None,
-                forced_eos_token_id=None,
                 early_stopping=False,
                 length_penalty=1.0,
                 no_repeat_ngram_size=0,

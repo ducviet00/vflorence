@@ -36,7 +36,7 @@ def main():
 
     with TemporaryDirectory() as tmpdir:
         hf.save_pretrained(tmpdir)
-        llm = LLM(tmpdir, num_blocks=64, block_size=16)
+        llm = LLM(tmpdir, max_num_seqs=8)
 
     for beams in (1, 2, 4):
         params = SamplingParams(max_tokens=12, num_beams=beams)
@@ -47,8 +47,6 @@ def main():
                 max_new_tokens=12,
                 num_beams=beams,
                 do_sample=False,
-                forced_bos_token_id=None,
-                forced_eos_token_id=None,
             )
         ref_tokens = ref[0].tolist()[1:]
         assert ours == ref_tokens, (beams, ours, ref_tokens)
@@ -79,7 +77,7 @@ def main():
         hf.final_logits_bias[0, config.eos_token_id] += 0.2
     with TemporaryDirectory() as tmpdir:
         hf.save_pretrained(tmpdir)
-        llm = LLM(tmpdir, num_blocks=64, block_size=16)
+        llm = LLM(tmpdir, max_num_seqs=8)
     for beams in (2, 4):
         for early_stopping in (False, True):
             params = SamplingParams(
@@ -99,8 +97,6 @@ def main():
                     early_stopping=early_stopping,
                     min_length=4,
                     do_sample=False,
-                    forced_bos_token_id=None,
-                    forced_eos_token_id=None,
                 )
             ref_tokens = [t for t in ref[0].tolist()[1:] if t != config.pad_token_id]
             assert ours == ref_tokens, (beams, early_stopping, ours, ref_tokens)

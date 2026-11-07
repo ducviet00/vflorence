@@ -69,21 +69,14 @@ def prepare_inputs(args, florence, dtype):
 def fast_stages(args, input_token_ids, pixels, dtype):
     """Return {stage: callable} for fast-encdec."""
     from fastencdec import LLM, Request, SamplingParams
-    from fastencdec.config import default_block_size
 
-    block_size = default_block_size()
-    num_sequences = args.batch * args.beams
-    # Decoder start token plus one copy-on-write block per sequence.
-    blocks_per_sequence = (args.max_tokens + 1 + block_size - 1) // block_size + 1
     llm = LLM(
         args.model,
-        num_blocks=num_sequences * blocks_per_sequence,
-        block_size=block_size,
-        max_num_seqs=num_sequences,
+        max_num_seqs=args.batch * args.beams,
         dtype=dtype,
         mm_cache_size=0,  # stages time the vision encoder on every call
     )
-    runner = llm.engine.runner
+    runner = llm.runner
 
     @torch.no_grad()
     def vision():
@@ -156,8 +149,6 @@ def hf_stages(args, input_token_ids, pixels, dtype):
             min_new_tokens=tokens,  # Suppress EOS so every request generates exactly N tokens.
             num_beams=args.beams,
             do_sample=False,
-            forced_bos_token_id=None,
-            forced_eos_token_id=None,
             early_stopping=False,
             length_penalty=1.0,
             no_repeat_ngram_size=0,

@@ -52,15 +52,15 @@ Mirrors nano-vllm's package layout (`engine/`, `layers/`, `models/`, `utils/`).
 ```
 fastencdec/
   __init__.py          package exports (LLM, Request, RequestOut, SamplingParams)
-  config.py            Config (engine hyperparameters)
-  llm.py               unified LLM facade (BART + Florence-2), Request / RequestOut
+  config.py            Config (engine hyperparameters + HF/text/generation configs)
+  llm.py               LLM facade (subclass of LLMEngine)
   sampling_params.py   SamplingParams (greedy + beam search)
   engine/
     sequence.py        Sequence
     block_manager.py   paged blocks: allocate / fork / copy-on-write / free
     scheduler.py       continuous batching
-    model_runner.py    batching, KV cache, encoder caching, forward
-    llm_engine.py      LLMEngine: step loop, greedy, beam search
+    model_runner.py    model weights, batching, KV cache, encoder caching, forward
+    llm_engine.py      LLMEngine, Request, RequestOut: step loop, greedy, beam search
   layers/
     attention.py       vllm_cpu_attn custom ops (decoder self/cross attention + staging)
     logits_processor.py  pure-torch LogitsProcessor (built once per generate)
@@ -103,10 +103,13 @@ LLMEngine.step()                  # argmax (greedy) or beam-expand; append; free
 `LLMEngine.generate(requests, params)` is the offline entrypoint: it adds the
 whole batch under a single `SamplingParams` and runs to completion.
 
-`LLMEngine._postprocess` groups sequences by request, then batches every beam
-request that shares a `(beam width, live beam count, decoder length)` into one
-`_beam_group`: a single `log_softmax` + logits-processor call + `topk` over
-`[num_requests, beam_count * vocab]`.
+`ModelRunner._sample` runs `log_softmax` (beams only) and the logits processor
+once over the whole batch, with histories left-padded by -1 and true lengths
+passed in, so sequences of different decoder lengths share one call.
+`_beam_search` then runs one `topk` per row over the vocab, adds each beam's
+`cum_logprob` to those survivors only (it is constant per row, so a request's
+top K always lies within its rows' top K), and merges each request's rows in
+Python. `Scheduler._postprocess_beam` forks the surviving candidates.
 
 `models/bart.py` uses `F.scaled_dot_product_attention` for `BartEncoderSelfAttention`
 (dense, no cache) and calls the opaque `decoder_self_attention` and
