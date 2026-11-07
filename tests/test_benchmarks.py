@@ -86,12 +86,9 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIsNone(model.generate.call_args.kwargs["forced_eos_token_id"])
 
     def test_stage_bart_inputs_have_exact_length(self):
-        tokenizer = Mock(return_value={"input_ids": [4, 5, 6]})
-        tokenizer.build_inputs_with_special_tokens.side_effect = lambda ids: [
-            0,
-            *ids,
-            2,
-        ]
+        tokenizer = Mock(
+            return_value={"input_ids": [4, 5, 6]}, bos_token_id=0, eos_token_id=2
+        )
         args = SimpleNamespace(model="unused", enc_len=10, batch=2)
         with patch(
             "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer

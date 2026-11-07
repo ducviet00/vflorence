@@ -154,7 +154,7 @@ def main():
     ap.add_argument(
         "--mm-cache-size", type=int, default=256, help="fast only; 0 disables"
     )
-    ap.add_argument("--warmup", type=int, default=1)
+    ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--model", default="florence-community/Florence-2-base")
     args = ap.parse_args()
