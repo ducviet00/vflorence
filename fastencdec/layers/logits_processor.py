@@ -33,15 +33,17 @@ def _no_repeat_ngram(scores: torch.Tensor, input_ids: torch.Tensor, n: int):
 
 
 class LogitsProcessor:
-    def __init__(self, params, *, vocab_size: int, max_length: int, begin_index: int):
-        self.params = params
+    def __init__(
+        self, sampling_params, *, vocab_size: int, max_length: int, begin_index: int
+    ):
+        self.sampling_params = sampling_params
         self.max_length = max_length
         self.begin_index = begin_index
-        self.eos = _valid(sorted(params.eos_ids()), vocab_size)
-        self.suppress = _valid(params.suppress_tokens, vocab_size)
-        self.begin_suppress = _valid(params.begin_suppress_tokens, vocab_size)
-        self.forced_bos = _valid(params.forced_bos_token_id, vocab_size)
-        self.forced_eos = _valid(params.forced_eos_token_id, vocab_size)
+        self.eos = _valid(sorted(sampling_params.eos_ids()), vocab_size)
+        self.suppress = _valid(sampling_params.suppress_tokens, vocab_size)
+        self.begin_suppress = _valid(sampling_params.begin_suppress_tokens, vocab_size)
+        self.forced_bos = _valid(sampling_params.forced_bos_token_id, vocab_size)
+        self.forced_eos = _valid(sampling_params.forced_eos_token_id, vocab_size)
 
     def __call__(
         self, input_ids: torch.Tensor, scores: torch.Tensor, lengths=None
@@ -51,19 +53,19 @@ class LogitsProcessor:
         ``input_ids`` is [batch, width], left-padded with -1; ``lengths`` holds each
         row's true length (default: every row is ``width`` long).
         """
-        p = self.params
+        sp = self.sampling_params
         if lengths is None:
             lengths = torch.full((input_ids.shape[0],), input_ids.shape[1])
-        if p.repetition_penalty != 1.0:
-            _repetition_penalty(scores, input_ids, p.repetition_penalty)
-        if p.no_repeat_ngram_size > 0:
-            _no_repeat_ngram(scores, input_ids, p.no_repeat_ngram_size)
+        if sp.repetition_penalty != 1.0:
+            _repetition_penalty(scores, input_ids, sp.repetition_penalty)
+        if sp.no_repeat_ngram_size > 0:
+            _no_repeat_ngram(scores, input_ids, sp.no_repeat_ngram_size)
 
         def rows(mask: torch.Tensor) -> torch.Tensor:
             return mask.nonzero()  # [k, 1]: indexes rows, broadcasts over columns
 
-        if p.min_length > 0 and self.eos:
-            scores[rows(lengths < p.min_length), self.eos] = _NEG_INF
+        if sp.min_length > 0 and self.eos:
+            scores[rows(lengths < sp.min_length), self.eos] = _NEG_INF
         if self.forced_bos:
             _force(scores, rows(lengths == 1), self.forced_bos)
         if self.forced_eos:

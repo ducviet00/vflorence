@@ -63,33 +63,36 @@ class LLMEngine:
             requests = list(requests)
         if not requests:
             return []
-        params = sampling_params or self.default_sampling_params
-        self._validate(requests, params)
+        sampling_params = sampling_params or self.default_sampling_params
+        self._validate(requests, sampling_params)
 
-        request_ids = [self.add_request(req, params) for req in requests]
+        request_ids = [
+            self.add_request(request, sampling_params) for request in requests
+        ]
         outputs: dict[int, RequestOut] = {}
         while not self.is_finished():
             for request_id, out in self.step():
                 outputs[request_id] = out
-        return [outputs[r] for r in request_ids]
+        return [outputs[request_id] for request_id in request_ids]
 
-    def _validate(self, requests, params) -> None:
+    def _validate(self, requests, sampling_params: SamplingParams) -> None:
         """Reject requests that would crash or run out of KV cache mid-batch."""
-        if params.max_tokens > self.max_positions:
+        if sampling_params.max_tokens > self.max_positions:
             raise ValueError(
-                f"max_tokens ({params.max_tokens}) exceeds the model's "
+                f"max_tokens ({sampling_params.max_tokens}) exceeds the model's "
                 f"max_position_embeddings ({self.max_positions})"
             )
-        for req in requests:
-            if len(req.input_ids) > self.max_positions:
+        for request in requests:
+            if len(request.input_ids) > self.max_positions:
                 raise ValueError(
-                    f"encoder prompt has {len(req.input_ids)} tokens; the model "
+                    f"encoder prompt has {len(request.input_ids)} tokens; the model "
                     f"supports at most {self.max_positions}"
                 )
         # shortcut: checks one request alone; a full batch can still run out.
         # Upgrade to preemption if that shows up in practice.
-        bs = self.config.block_size
-        max_num_blocks = params.num_beams * (params.max_tokens // bs)
+        max_num_blocks = sampling_params.num_beams * (
+            sampling_params.max_tokens // self.config.block_size
+        )
         if max_num_blocks > self.config.num_blocks:
             raise ValueError(
                 f"one request may need {max_num_blocks} KV blocks but num_blocks is "
