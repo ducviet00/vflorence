@@ -53,7 +53,10 @@ class ModelRunner:
         self.mm_cache = OrderedDict()
         self.mm_cache_size = config.mm_cache_size
         self.mm_cache_hits = self.mm_cache_misses = 0
-        # Cross-attention K/V staged for the current batch, keyed by its request ids.
+        # Cross-attention pool: request_id -> (pages, enc_len), and the unused pages.
+        self._cross_pages: dict[int, tuple[torch.Tensor, int]] = {}
+        self._cross_free: list[int] = []
+        # Cross-attention metadata staged for the current batch, keyed by its request ids.
         self._cross_key = None
         self._cross_staged = None
         self._logits_processor: LogitsProcessor | None = None
@@ -73,6 +76,9 @@ class ModelRunner:
         for layer in self.decoder_layers:
             layer.self_attn.k_cache = torch.zeros(shape, dtype=self.dtype)
             layer.self_attn.v_cache = torch.zeros(shape, dtype=self.dtype)
+            # The encoder K/V pool starts empty and grows on demand.
+            layer.encoder_attn.k_cache = torch.zeros((0, *shape[1:]), dtype=self.dtype)
+            layer.encoder_attn.v_cache = torch.zeros((0, *shape[1:]), dtype=self.dtype)
 
         weight_bytes = sum(
             t.numel() * t.element_size()
@@ -117,6 +123,25 @@ class ModelRunner:
             for cache in (layer.self_attn.k_cache, layer.self_attn.v_cache):
                 cache.index_copy_(0, dst, cache.index_select(0, src))
 
+    def _allocate_cross_pages(self, num_pages: int) -> list[int]:
+        """Take pages from the encoder K/V pool, at least doubling it when it runs out."""
+        short = num_pages - len(self._cross_free)
+        if short > 0:
+            size = self.decoder_layers[0].encoder_attn.k_cache.shape[0]
+            grow = max(short, size)
+            for layer in self.decoder_layers:
+                attn = layer.encoder_attn
+                # zeros: the kernel reads whole pages, including the unused tail.
+                tail = torch.zeros((grow, *attn.k_cache.shape[1:]), dtype=self.dtype)
+                attn.k_cache = torch.cat([attn.k_cache, tail])
+                attn.v_cache = torch.cat([attn.v_cache, tail])
+            self._cross_free.extend(range(size, size + grow))
+            self._cross_key = None  # staged tuples point at the old tensors
+        # A slice, not pops: keeps a request's pages in ascending memory order.
+        pages = self._cross_free[-num_pages:]
+        del self._cross_free[-num_pages:]
+        return pages
+
     def _image_embeds(self, seqs) -> dict[str, torch.Tensor]:
         """Return {mm_hash: image embeddings}; run the vision encoder only on cache misses."""
         embeds, misses = {}, {}
@@ -149,7 +174,7 @@ class ModelRunner:
 
     @torch.no_grad()
     def _encode(self, seqs) -> None:
-        """Batch fresh sequences by (encoder_len, image_shape) and cache cross-attn K/V."""
+        """Batch fresh sequences by (encoder_len, image_shape) and page their cross-attn K/V."""
         image_seqs = [seq for seq in seqs if seq.pixel_values is not None]
         embeds = self._image_embeds(image_seqs) if image_seqs else {}
         groups = defaultdict(list)
@@ -168,21 +193,34 @@ class ModelRunner:
                 else:
                     image_embeds = torch.stack([embeds[seq.mm_hash] for seq in group])
                     hidden = self.encode_fn(input_ids, image_embeds=image_embeds)
+            # Each request owns ceil(enc_len / block_size) pages; slots are its tokens' places.
+            enc_len, block_size = input_ids.shape[1], self.block_size
+            pages = torch.tensor(
+                self._allocate_cross_pages(len(group) * -(-enc_len // block_size)),
+                dtype=torch.int32,
+            ).view(len(group), -1)
+            token = torch.arange(enc_len)
+            slots = pages[:, token // block_size].long() * block_size
+            slots = (slots + token % block_size).flatten()
+            for seq, seq_pages in zip(group, pages):
+                self._cross_pages[seq.request_id] = (seq_pages, enc_len)
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
-                shape = (len(group), input_ids.shape[1], attn.num_heads, attn.head_dim)
+                shape = (len(group) * enc_len, attn.num_heads, attn.head_dim)
                 key, value = attn.kv_proj(hidden).chunk(2, dim=-1)
-                key, value = (
+                vllm_cpu_attn.reshape_and_cache(
                     key.reshape(shape).contiguous(),
                     value.reshape(shape).contiguous(),
+                    attn.k_cache,
+                    attn.v_cache,
+                    slots,
+                    isa=self.isa,
                 )
-                for j, seq in enumerate(group):
-                    attn.encoder_kv_cache[seq.request_id] = (key[j], value[j])
 
     def clear_request(self, request_id: int) -> None:
-        """Release cached encoder K/V and staged cross-attention state for a finished request."""
-        for layer in self.decoder_layers:
-            layer.encoder_attn.encoder_kv_cache.pop(request_id, None)
+        """Return a finished request's encoder K/V pages and drop the staged cross-attention state."""
+        pages, _ = self._cross_pages.pop(request_id, ((), 0))
+        self._cross_free.extend(int(page) for page in pages)
         self._cross_key = self._cross_staged = None
 
     def _prepare(self, seqs, copies=()):
@@ -228,8 +266,9 @@ class ModelRunner:
         )
         request_ids = tuple(seq.request_id for seq in seqs)
         if request_ids != self._cross_key:
+            pages, enc_lens = zip(*(self._cross_pages[rid] for rid in request_ids))
             self._cross_staged = attention.stage_cross(
-                self.decoder_layers, request_ids, block_size, self.isa
+                self.decoder_layers, pages, enc_lens, block_size, self.isa
             )
             self._cross_key = request_ids
         set_context(

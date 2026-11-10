@@ -90,7 +90,7 @@ tests/test_logits_processor.py
 Scheduler.schedule()              # admit waiting up to max_num_seqs; return ALL running
 ModelRunner.run(seqs)
     fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
-    _encode(fresh)                # batched encoder (grouped by length/image shape) -> dense cross-attn K/V
+    _encode(fresh)                # batched encoder (grouped by length/image shape) -> paged cross-attn K/V
                                   #   vision encoder runs only on mm_cache misses
     _prepare(seqs)                # input_ids/positions/slot_mapping/self_metadata; ensure blocks/CoW
     set_context(...)              # Context: context_lens, block_tables, slot_mapping,
@@ -114,8 +114,8 @@ Python. `Scheduler._postprocess_beam` forks the surviving candidates.
 `models/bart.py` uses `F.scaled_dot_product_attention` for `BartEncoderSelfAttention`
 (dense, no cache) and calls the opaque `decoder_self_attention` and
 `decoder_cross_attention` custom ops from `layers/attention.py`. Before the
-decoder forward, `ModelRunner.run` stages each layer's dense encoder K/V into a
-paged cache (`attention.stage_cross` -> `Context.cross_staged`); the opaque
+decoder forward, `ModelRunner.run` points the step's sequences at their pages of
+each layer's encoder K/V pool (`attention.stage_cross` -> `Context.cross_staged`); the opaque
 cross-attention op reads that per-step state at call time so it stays out of the
 compiled graph.
 
@@ -133,12 +133,15 @@ compiled graph.
    with internal layout determined by the selected ISA (`vec` / `amx` on x86,
    `neon` on arm64) and `block_size` (32 on x86, 16 on arm64; must be a
    multiple of 16). `head_dim` must be in `{32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 512}`.
-4. **Cross-attention staging.** Each `BartDecoderCrossAttention` holds
-   `encoder_kv_cache: dict[request_id -> (k, v)]`, each
-   `[enc_len, num_heads, head_dim]`, filled once in `_encode`, shared by all
-   beams of a request and freed in `ModelRunner.clear_request`. `stage_cross`
-   packs the active requests into a paged cache (plus scheduler metadata) memoized
-   on `ModelRunner._cross_staged` keyed by `tuple(request_ids)`.
+4. **Cross-attention pool.** Each `BartDecoderCrossAttention` holds a paged
+   encoder K/V pool `k_cache` / `v_cache`
+   (`[num_pages, num_heads, block_size, head_dim]`), which starts empty and at
+   least doubles when it runs out (it never shrinks). `_encode` writes a
+   request's K/V once into pages from `ModelRunner._cross_free` and records
+   `_cross_pages[request_id] = (pages, enc_len)`; all beams of a request share
+   them and `ModelRunner.clear_request` returns them. `stage_cross` copies
+   nothing: it builds the step's block table and scheduler metadata, memoized on
+   `ModelRunner._cross_staged` keyed by `tuple(request_ids)`.
 5. **Beam search = sequences + block sharing.** Every beam is an ordinary
    `Sequence` with the request's `request_id`. `BlockManager.fork` shares the
    parent's blocks (`refcount++`); `BlockManager.ensure_capacity` copy-on-writes
