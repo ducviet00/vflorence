@@ -115,7 +115,7 @@ class ModelRunner:
         src, dst = (torch.tensor(ids) for ids in zip(*copies))
         for layer in self.decoder_layers:
             for cache in (layer.self_attn.k_cache, layer.self_attn.v_cache):
-                cache[dst] = cache[src]
+                cache.index_copy_(0, dst, cache.index_select(0, src))
 
     def _image_embeds(self, seqs) -> dict[str, torch.Tensor]:
         """Return {mm_hash: image embeddings}; run the vision encoder only on cache misses."""
