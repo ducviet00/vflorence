@@ -67,8 +67,10 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(blocks.num_free_blocks, blocks.num_blocks)
         self.assertTrue(not any(blocks.ref_counts))
         self.assertFalse(llm.scheduler._finished_beams)
-        for layer in llm.runner.decoder_layers:
-            self.assertFalse(layer.encoder_attn.encoder_kv_cache)
+        runner = llm.runner
+        self.assertFalse(runner._cross_pages)
+        pool = runner.decoder_layers[0].encoder_attn.k_cache.shape[0]
+        self.assertEqual(sorted(runner._cross_free), list(range(pool)))
         self.assertIsNone(llm.runner._cross_staged)
 
     def test_cache_full_raises(self):

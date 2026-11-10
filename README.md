@@ -92,7 +92,7 @@ sequenceDiagram
         B-->>S: copies (CoW block pairs)
         S-->>E: seqs, copies
         E->>R: run(seqs, copies)
-        Note over R: _encode(fresh) -> encoder_kv_cache<br/>_prepare(seqs, copies) + stage_cross<br/>decode_fn(input_ids, positions)<br/>_sample(seqs, logits)
+        Note over R: _encode(fresh) -> paged encoder K/V<br/>_prepare(seqs, copies) + stage_cross<br/>decode_fn(input_ids, positions)<br/>_sample(seqs, logits)
         R-->>E: sample_out (tokens / beam top-k)
         E->>S: postprocess(seqs, sample_out)
         S->>B: fork(parent, child) / deallocate(seq)

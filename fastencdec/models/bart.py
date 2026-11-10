@@ -132,8 +132,8 @@ class BartDecoderCrossAttention(_BartAttentionBase):
         self.kv_proj = nn.Linear(embed_dim, 2 * embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
-        # request_id -> (key, value) [enc_len, num_heads, head_dim]
-        self.encoder_kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Paged encoder K/V pool [num_pages, num_heads, block_size, head_dim]; ModelRunner owns it.
+        self.k_cache = self.v_cache = None
         self.layer_idx = layer_idx
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
