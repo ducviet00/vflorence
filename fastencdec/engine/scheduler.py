@@ -86,6 +86,8 @@ class Scheduler:
 
             # Split top-K continuations into finished (only if rank < num_beams) and running beams.
             for rank, (parent, token_id, cum_logprob) in enumerate(candidates):
+                if rank >= num_beams and len(running_beams) >= num_beams:
+                    break  # nothing past here can be kept
                 child = parent.fork(token_id, cum_logprob)
                 if child.is_finished:
                     if rank < num_beams:
