@@ -144,6 +144,7 @@ class ModelRunner:
 
     def _image_embeds(self, seqs) -> dict[str, torch.Tensor]:
         """Return {mm_hash: image embeddings}; run the vision encoder only on cache misses."""
+        # Split into cache hits and misses (the same image twice in a step is one miss).
         embeds, misses = {}, {}
         for seq in seqs:
             key = seq.mm_hash
@@ -155,6 +156,7 @@ class ModelRunner:
             else:
                 misses[key] = seq.pixel_values
                 self.mm_cache_misses += 1
+        # Batch misses of equal shape into one vision-encoder call; different shapes can't be stacked.
         by_shape = defaultdict(list)
         for key, px in misses.items():
             by_shape[px.shape].append(key)
@@ -163,6 +165,7 @@ class ModelRunner:
                 out = self.image_fn(torch.stack([misses[k] for k in keys]))
             for key, emb in zip(keys, out):
                 embeds[key] = emb.clone()  # own storage, not a view of the batch
+        # Store everything and evict the least recently used entries beyond the cache size.
         if self.mm_cache_size:
             # Update recency in request order, so hits and misses rank by last use.
             for seq in seqs:
@@ -175,8 +178,11 @@ class ModelRunner:
     @torch.no_grad()
     def _encode(self, seqs) -> None:
         """Batch fresh sequences by (encoder_len, image_shape) and page their cross-attn K/V."""
+        # Vision tower first (Florence-2 only): its output is spliced into the encoder input.
         image_seqs = [seq for seq in seqs if seq.pixel_values is not None]
         embeds = self._image_embeds(image_seqs) if image_seqs else {}
+        # Sequences with the same encoder length and image shape share one batched forward,
+        # so no padding is needed.
         groups = defaultdict(list)
         for seq in seqs:
             px_shape = (
@@ -187,6 +193,7 @@ class ModelRunner:
             input_ids = torch.tensor(
                 [seq.encoder_token_ids for seq in group], dtype=torch.long
             )
+            # Encoder forward: the hidden states are what every decoder layer cross-attends to.
             with self._inductor_ctx():
                 if group[0].pixel_values is None:
                     hidden = self.encode_fn(input_ids)
@@ -202,8 +209,11 @@ class ModelRunner:
             token = torch.arange(enc_len)
             slots = pages[:, token // block_size].long() * block_size
             slots = (slots + token % block_size).flatten()
+            # Remember the pages so decode steps can find them and clear_request can free them.
             for seq, seq_pages in zip(group, pages):
                 self._cross_pages[seq.request_id] = (seq_pages, enc_len)
+            # Cross-attn K/V depend only on the encoder output, so compute them once here
+            # and every decode step just reads the pages.
             for layer in self.decoder_layers:
                 attn = layer.encoder_attn
                 shape = (len(group) * enc_len, attn.num_heads, attn.head_dim)
@@ -226,6 +236,7 @@ class ModelRunner:
     def _prepare(self, seqs, copies=()):
         """Build input_ids, positions, and Context tensors for the step."""
         block_size = self.block_size
+        # Invariant: every step feeds exactly one uncached token per sequence.
         for seq in seqs:
             num_new = len(seq.token_ids) - seq.num_cached_tokens
             if num_new != 1:
@@ -233,9 +244,12 @@ class ModelRunner:
                     f"each step must feed 1 token per sequence, got {num_new}"
                 )
 
+        # Copy-on-write must finish before this step writes into the (now private) blocks.
         if copies:
             self._copy_blocks(copies)
 
+        # Per sequence: the token to feed, its position, the cache slot its K/V goes to,
+        # and how much context it attends to (including itself).
         input_ids, positions, slot_mapping = [], [], []
         context_lens, block_tables = [], []
         for seq in seqs:
@@ -248,10 +262,12 @@ class ModelRunner:
             context_lens.append(pos + 1)
             block_tables.append(seq.block_table)
 
+        # Pad block tables to a rectangle; the kernel only reads up to each context_len.
         max_blocks = max(len(t) for t in block_tables)
         padded_tables = [t + [0] * (max_blocks - len(t)) for t in block_tables]
         context_lens_t = torch.tensor(context_lens, dtype=torch.int32)
         query_start_loc = torch.arange(len(seqs) + 1, dtype=torch.int32)
+        # Kernel scheduling metadata for self-attention: one query token per sequence.
         self_metadata = vllm_cpu_attn.get_scheduler_metadata(
             num_reqs=len(seqs),
             num_heads=self.num_heads,
@@ -264,6 +280,7 @@ class ModelRunner:
             isa=self.isa,
             block_size=block_size,
         )
+        # Rebuild the cross-attn block tables only when the batch composition changed.
         request_ids = tuple(seq.request_id for seq in seqs)
         if request_ids != self._cross_key:
             pages, enc_lens = zip(*(self._cross_pages[rid] for rid in request_ids))
@@ -271,6 +288,7 @@ class ModelRunner:
                 self.decoder_layers, pages, enc_lens, block_size, self.isa
             )
             self._cross_key = request_ids
+        # Publish the step state; the attention custom ops read it via get_context().
         set_context(
             context_lens=context_lens_t,
             block_tables=torch.tensor(padded_tables, dtype=torch.int32),
@@ -298,9 +316,10 @@ class ModelRunner:
         return self._logits_processor
 
     def _sample(self, seqs, logits):
-        """Apply LogitsProcessor and return greedy token IDs or beam top-k candidates."""
+        """Apply LogitsProcessor; return a token id per seq (greedy) or {request_id: candidates} (beam)."""
         sampling_params = seqs[0].sampling_params
         logits_processor = self._get_logits_processor(sampling_params)
+        # Some rules (repetition, min length, ...) need each sequence's token history.
         lengths = [len(seq.token_ids) for seq in seqs]
         histories = None
         if logits_processor.needs_history:
@@ -319,6 +338,7 @@ class ModelRunner:
             scores,
             torch.tensor(lengths, dtype=torch.long),
         )
+        # Greedy takes the best token per row; beam search keeps top-k candidates for the scheduler.
         if sampling_params.num_beams == 1:
             return scores.argmax(dim=-1).tolist()
         return self._beam_search(seqs, scores, sampling_params)
@@ -338,6 +358,7 @@ class ModelRunner:
             [seq.cum_logprob for seq in seqs], dtype=torch.float32
         ).unsqueeze(-1)
 
+        # Group the rows by request: a request's beams compete with each other.
         topk_candidates = defaultdict(list)
         for seq, row_scores, row_ids in zip(
             seqs, top_scores.tolist(), top_ids.tolist()
@@ -345,6 +366,7 @@ class ModelRunner:
             topk_candidates[seq.request_id].extend(
                 zip([seq] * len(row_ids), row_ids, row_scores)
             )
+        # Keep each request's best candidates overall (not per beam).
         for candidates in topk_candidates.values():
             candidates.sort(key=lambda candidate: candidate[2], reverse=True)
             del candidates[beams_to_keep:]
@@ -352,13 +374,15 @@ class ModelRunner:
 
     @torch.no_grad()
     def run(self, seqs, copies=()):
-        """Encode any fresh sequences, run one decoder step, and return sampled candidates."""
+        """Encode any fresh sequences, run one decoder step, and return `_sample`'s result ([] if no seqs)."""
         if not seqs:
             return []
+        # Nothing cached yet means a new request: run its encoder and page its cross-attn K/V first.
         fresh = [seq for seq in seqs if seq.num_cached_tokens == 0]
         if fresh:
             self._encode(fresh)
 
+        # The context is global, so always reset it, even if the forward raises.
         try:
             input_ids, positions = self._prepare(seqs, copies)
             with self._inductor_ctx(len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW):
