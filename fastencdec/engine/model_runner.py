@@ -263,17 +263,20 @@ class ModelRunner:
         sampling_params = seqs[0].sampling_params
         logits_processor = self._get_logits_processor(sampling_params)
         lengths = [len(seq.token_ids) for seq in seqs]
-        max_len = max(lengths)
-        # Histories differ in length: left-pad with -1, which every logits rule ignores.
-        histories = [
-            [-1] * (max_len - len(seq.token_ids)) + seq.token_ids for seq in seqs
-        ]
+        histories = None
+        if logits_processor.needs_history:
+            max_len = max(lengths)
+            # Histories differ in length: left-pad with -1, which every logits rule ignores.
+            histories = torch.tensor(
+                [[-1] * (max_len - len(seq.token_ids)) + seq.token_ids for seq in seqs],
+                dtype=torch.long,
+            )
         # One float buffer for the whole batch; .float() is a no-op for fp32 logits.
         scores = logits.float()
         if sampling_params.num_beams > 1:
             scores = torch.log_softmax(scores, dim=-1)
         scores = logits_processor(  # in place
-            torch.tensor(histories, dtype=torch.long),
+            histories,
             scores,
             torch.tensor(lengths, dtype=torch.long),
         )

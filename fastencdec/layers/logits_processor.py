@@ -13,6 +13,8 @@ class LogitsProcessor:
         self.max_length = max_length
         self.begin_index = begin_index
         sp = sampling_params
+        # Only these two rules read the token history; the rest need lengths alone.
+        self.needs_history = sp.repetition_penalty != 1.0 or sp.no_repeat_ngram_size > 0
         self.eos = _in_vocab(sorted(sp.eos_ids()), vocab_size)
         self.suppress = _in_vocab(sp.suppress_tokens, vocab_size)
         self.begin_suppress = _in_vocab(sp.begin_suppress_tokens, vocab_size)
@@ -24,7 +26,8 @@ class LogitsProcessor:
     ) -> torch.Tensor:
         """Apply every enabled rule to ``scores`` in place, in transformers' order.
 
-        ``input_ids`` is [batch, width], left-padded with -1; ``lengths`` holds each
+        ``input_ids`` is [batch, width], left-padded with -1 (may be None when
+        ``needs_history`` is False and ``lengths`` is given); ``lengths`` holds each
         row's true length (default: every row is ``width`` long).
         """
         sp = self.sampling_params
