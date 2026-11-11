@@ -5,22 +5,25 @@ from numbers import Real
 
 @dataclass(slots=True)
 class SamplingParams:
-    """Decoding parameters; num_beams == 1 uses greedy, num_beams > 1 uses beam search."""
+    """Decoding parameters; num_beams == 1 uses greedy, num_beams > 1 uses beam search.
 
-    max_tokens: int = 64
-    num_beams: int = 1
-    repetition_penalty: float = 1.0
-    eos_token_id: int | list[int] | None = (
-        None  # None: checkpoint default; []: never stop
-    )
-    length_penalty: float = 1.0
-    no_repeat_ngram_size: int = 0
-    min_length: int = 0
+    Every field defaults to None, meaning "use the checkpoint's
+    generation_config.json"; the engine fills those in when it admits a request,
+    so set only what you want to override.
+    """
+
+    max_tokens: int | None = None
+    num_beams: int | None = None
+    repetition_penalty: float | None = None
+    eos_token_id: int | list[int] | None = None  # []: never stop
+    length_penalty: float | None = None
+    no_repeat_ngram_size: int | None = None
+    min_length: int | None = None
     forced_bos_token_id: int | None = None
     forced_eos_token_id: int | list[int] | None = None
     suppress_tokens: list[int] | None = None
     begin_suppress_tokens: list[int] | None = None
-    early_stopping: bool = False
+    early_stopping: bool | None = None
 
     def __post_init__(self) -> None:
         self.validate()
@@ -33,13 +36,15 @@ class SamplingParams:
             ("min_length", 0),
         ):
             value = getattr(self, name)
-            if type(value) is not int or value < minimum:
+            if value is not None and (type(value) is not int or value < minimum):
                 raise ValueError(f"{name} must be an integer >= {minimum}")
-        if not _is_number(self.repetition_penalty) or self.repetition_penalty <= 0:
+        if self.repetition_penalty is not None and (
+            not _is_number(self.repetition_penalty) or self.repetition_penalty <= 0
+        ):
             raise ValueError("repetition_penalty must be a positive finite number")
-        if not _is_number(self.length_penalty):
+        if self.length_penalty is not None and not _is_number(self.length_penalty):
             raise ValueError("length_penalty must be a finite number")
-        if type(self.early_stopping) is not bool:
+        if self.early_stopping is not None and type(self.early_stopping) is not bool:
             raise ValueError("early_stopping must be True or False")
         # Token ids: single id, id or list, or list only.
         if self.forced_bos_token_id is not None and not _is_id(

@@ -99,7 +99,6 @@ def bart(dtype, beams, max_tokens):
             min_new_tokens=max_tokens,
             num_beams=beams,
             do_sample=False,
-            early_stopping=False,
             length_penalty=2.0,
             no_repeat_ngram_size=3,
         )
@@ -148,10 +147,8 @@ def florence(dtype, beams, max_tokens):
             **inputs,
             max_new_tokens=max_tokens,
             num_beams=beams,
+            # Everything else is the checkpoint's generation config, as in fast-encdec.
             do_sample=False,
-            early_stopping=False,
-            length_penalty=1.0,
-            no_repeat_ngram_size=0,
         )
     ref = []
     for row in out:

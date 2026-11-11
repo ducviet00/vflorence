@@ -140,11 +140,8 @@ def run_hf(args, input_token_ids, pixels, dtype, tokenizer):
                 **batch,
                 max_new_tokens=args.max_tokens,
                 num_beams=args.beamsearch,
-                # Override checkpoint defaults to match fast-encdec's decoding.
+                # Everything else is the checkpoint's generation config, as in fast-encdec.
                 do_sample=False,
-                early_stopping=False,
-                length_penalty=1.0,
-                no_repeat_ngram_size=0,
             )
             for batch in batches
         ]

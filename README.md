@@ -45,6 +45,10 @@ outputs = llm.generate(request, SamplingParams(max_tokens=64, num_beams=4))
 print(tokenizer.decode(outputs[0].completion_token_ids, skip_special_tokens=True))
 ```
 
+`SamplingParams` fields you leave unset take the checkpoint's
+`generation_config.json` values (beams, `no_repeat_ngram_size`, length penalty, ...),
+as in `transformers`; set only what you want to override.
+
 Florence-2 takes an image plus a task prompt, and the answer is parsed with the
 processor:
 

@@ -13,6 +13,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from transformers import GenerationConfig
+
 from fastencdec.engine.scheduler import Scheduler
 from fastencdec.engine.sequence import Sequence
 from fastencdec.sampling_params import SamplingParams
@@ -35,7 +37,7 @@ def run_case(stopped: list[bool], num_beams: int) -> tuple[list[int], list[int]]
     eos_ids = [100 + r for r in range(len(stopped))]
     params = SamplingParams(
         num_beams=num_beams, max_tokens=10, eos_token_id=eos_ids, early_stopping=False
-    )
+    ).with_defaults(SamplingParams.from_generation_config(GenerationConfig()))
     sched = Scheduler(SimpleNamespace(max_num_seqs=8, num_blocks=8, block_size=16))
     parent = Sequence(0, [1], [3], params)
     sched.add(parent)

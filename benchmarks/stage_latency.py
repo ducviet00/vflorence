@@ -148,10 +148,8 @@ def hf_stages(args, input_token_ids, pixels, dtype):
             max_new_tokens=tokens,
             min_new_tokens=tokens,  # Suppress EOS so every request generates exactly N tokens.
             num_beams=args.beams,
+            # Everything else is the checkpoint's generation config, as in fast-encdec.
             do_sample=False,
-            early_stopping=False,
-            length_penalty=1.0,
-            no_repeat_ngram_size=0,
         )
 
     stages = {"encode": encode}
