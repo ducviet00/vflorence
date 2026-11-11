@@ -188,3 +188,16 @@ PYTHONPATH=. $P benchmarks/stage_latency.py --backend fast
 PYTHONPATH=. $P benchmarks/stage_latency.py --backend fast --model facebook/bart-large-cnn --enc-len 512
 PYTHONPATH=. $P benchmarks/continuous_batching.py --backend fast --beamsearch 1   # and 4; --mm-cache-size 0 disables the image cache
 ```
+
+## 7. Known issues
+
+- **CRITICAL: Florence-2-large produces garbage (open, not yet investigated).**
+  `florence-community/Florence-2-large`, bf16, greedy, max num seq 32 on
+  `c4a-standard-16` (2026-11-11, `benchmarks/continuous_batching.py`): 84 of 128
+  requests decode only repeated `<s>` tokens until `max_tokens` (512). Every
+  `<REFERRING_EXPRESSION_SEGMENTATION>` request fails, plus 28/32 `<OCR>` and 23/32
+  `<OD>`; most `<DETAILED_CAPTION>` outputs look correct. Florence-2-base is fine
+  on the same box. Not yet compared against HF (not checked whether HF large
+  behaves, or whether fp32 / x86 differ). Start with one failing request, e.g.
+  `<OD>` on COCO `000000002153.jpg`, fast vs HF in bf16 and fp32. Do not publish
+  Florence-2-large numbers until this is fixed.
