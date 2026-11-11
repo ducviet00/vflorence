@@ -116,34 +116,53 @@ sequenceDiagram
 
 ## Benchmark
 
-Measured on GCP `c4a-standard-8` (Arm Neoverse-V2, 8 physical cores) and
-`c4-standard-8` (Intel Xeon 8581C, **4** physical cores, AMX) with
-`torch 2.15.0+cpu`, `transformers 5.22.2` and `vllm-cpu-attn 0.1.0`, bf16.
-Both backends on the Xeon box run with tcmalloc (`LD_PRELOAD`, see Installation).
-Wall times are not like-for-like across the two machines: the Xeon box has
-half the physical cores. Cells are fast-encdec / HF (speedup).
+Measured on GCP `c4a-standard-8` / `c4a-standard-16` (Arm Neoverse-V2, 8 / 16
+physical cores) and `c4-standard-8` / `c4-standard-16` (Intel Xeon 8581C,
+**4 / 8** physical cores, AMX) with `torch 2.15.0+cpu`, `transformers 5.22.2` and
+`vllm-cpu-attn 0.1.0`, bf16. Both backends on the Xeon boxes run with tcmalloc
+(`LD_PRELOAD`, see Installation). Wall times are not like-for-like across Arm and
+x86: at the same vCPU count the Xeon box has half the physical cores.
 
-**Continuous batching** (`benchmarks/continuous_batching.py`): 32 Florence-2-base
-requests (8 COCO images x `<OD>`, `<OCR>`, `<DETAILED_CAPTION>`,
-`<REFERRING_EXPRESSION_SEGMENTATION>`), 8 requests in flight, up to 512 tokens.
-fast-encdec refills a slot as soon as a request finishes, and its multimodal cache
-(on by default, cleared before each run) runs the vision encoder once per image:
-8 misses, 24 hits. HF runs 4 padded batches of 8 and encodes every image, and
-68-75% of its decoded positions are padding. One timed run after 3 warmup runs;
-cells are wall time and generated tokens/s, speedup over HF is by wall time.
+**Continuous batching** (`benchmarks/continuous_batching.py`): 128 Florence-2-base
+requests (32 COCO images x `<OD>`, `<OCR>`, `<DETAILED_CAPTION>`,
+`<REFERRING_EXPRESSION_SEGMENTATION>`, shuffled), up to 512 tokens each.
+fast-encdec keeps `--max-num-seq` requests in flight and refills a slot as soon as a
+request finishes; its multimodal cache (on by default, cleared before each run)
+runs the vision encoder once per image: 32 misses, 96 hits. HF runs padded batches
+of 8 and encodes every image, and 64-71% of its decoded positions are padding.
+HF takes a long time, so it is only benchmarked at batch size 8 for now; every
+speedup is fast-encdec over HF batch 8 on the same machine, by wall time. Cells are
+wall time and generated tokens/s. Greedy: one timed run after 3 warmup runs;
+beams=4: best of 2 timed runs after 1 warmup run.
 
-<table>
-<tr><th>config</th><th>engine</th><th align="right">c4a-standard-8</th><th align="right">c4-standard-8</th></tr>
-<tr><td rowspan="2">greedy</td><td>fast-encdec</td><td align="right">7.3 s, 497 tok/s (<b>4.46x</b>)</td><td align="right">6.9 s, 520 tok/s (<b>5.40x</b>)</td></tr>
-<tr><td>HF</td><td align="right">32.7 s, 112 tok/s</td><td align="right">37.5 s, 101 tok/s</td></tr>
-<tr><td rowspan="2">beams=4</td><td>fast-encdec</td><td align="right">13.4 s, 387 tok/s (<b>5.54x</b>)</td><td align="right">12.5 s, 416 tok/s (<b>10.26x</b>)</td></tr>
-<tr><td>HF</td><td align="right">74.3 s, 70 tok/s</td><td align="right">128.4 s, 39 tok/s</td></tr>
-</table>
+With beam search every request runs as 4 sequences, so `max num seq` 64 with
+beams=4 decodes 64 x 4 = 256 sequences per step, not 64 as with greedy.
+
+Greedy:
+
+| max num seq | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
+|---|---:|---:|---:|---:|
+| 8 | 26.1 s, 509 tok/s (**4.26x**) | 20.7 s, 649 tok/s (**5.45x**) | 18.3 s, 723 tok/s (**4.50x**) | 14.4 s, 954 tok/s (**4.86x**) |
+| 16 | 23.9 s, 554 tok/s (**4.64x**) | 18.9 s, 719 tok/s (**5.96x**) | 15.6 s, 852 tok/s (**5.28x**) | 12.5 s, 1091 tok/s (**5.60x**) |
+| 32 | 22.4 s, 591 tok/s (**4.95x**) | 17.6 s, 775 tok/s (**6.40x**) | 14.0 s, 946 tok/s (**5.87x**) | 10.5 s, 1287 tok/s (**6.65x**) |
+| 64 | – | – | 13.5 s, 978 tok/s (**6.07x**) | 10.0 s, 1349 tok/s (**6.99x**) |
+| HF, batch 8 | 110.9 s, 123 tok/s | 112.7 s, 119 tok/s | 82.2 s, 166 tok/s | 69.8 s, 192 tok/s |
+
+Beams=4 (sequences in flight = 4 x max num seq):
+
+| max num seq | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
+|---|---:|---:|---:|---:|
+| 8 | 46.8 s, 392 tok/s (**5.29x**) | 40.7 s, 477 tok/s (**9.37x**) | 34.0 s, 540 tok/s (**5.88x**) | 26.6 s, 736 tok/s (**9.60x**) |
+| 16 | 41.2 s, 445 tok/s (**6.01x**) | 35.6 s, 543 tok/s (**10.70x**) | 26.1 s, 702 tok/s (**7.66x**) | 21.6 s, 888 tok/s (**11.84x**) |
+| 32 | 37.7 s, 486 tok/s (**6.57x**) | 33.4 s, 571 tok/s (**11.40x**) | 23.1 s, 792 tok/s (**8.64x**) | 20.0 s, 951 tok/s (**12.79x**) |
+| 64 | – | – | 21.4 s, 855 tok/s (**9.32x**) | 19.0 s, 1003 tok/s (**13.49x**) |
+| HF, batch 8 | 247.5 s, 80 tok/s | 381.1 s, 51 tok/s | 199.8 s, 100 tok/s | 255.7 s, 75 tok/s |
 
 **Per stage** (`benchmarks/stage_latency.py`): batch 8; Florence-2-base with
 `<DETAILED_CAPTION>` (590 encoder tokens), BART-large-cnn with 512 encoder tokens.
 The multimodal cache is off here so the vision stage runs every call.
-The decode step is averaged over 128 steps with EOS suppressed.
+The decode step is averaged over 128 steps with EOS suppressed. 8-vCPU boxes;
+cells are fast-encdec / HF (speedup).
 
 | stage | c4a-standard-8 | c4-standard-8 |
 |---|---:|---:|
@@ -169,5 +188,5 @@ PYTHONPATH=. python tests/verify_parity.py          # real checkpoints (BART + F
 # one backend per run; run with --backend fast and --backend hf and compare
 PYTHONPATH=. python benchmarks/stage_latency.py --backend fast         # Florence-2: vision / encode / decode-step ms
 PYTHONPATH=. python benchmarks/stage_latency.py --backend fast --model facebook/bart-large-cnn
-PYTHONPATH=. python benchmarks/continuous_batching.py --backend fast   # 32 mixed Florence-2 requests, 8 in flight (hf: padded batches of 8)
+PYTHONPATH=. python benchmarks/continuous_batching.py --backend fast   # 128 mixed Florence-2 requests, 8 in flight (hf: padded batches of 8)
 ```
