@@ -130,7 +130,7 @@ x86: at the same vCPU count the Xeon box has half the physical cores.
 **Continuous batching** (`benchmarks/continuous_batching.py`): 128 Florence-2-base
 requests (32 COCO images x `<OD>`, `<OCR>`, `<DETAILED_CAPTION>`,
 `<REFERRING_EXPRESSION_SEGMENTATION>`, shuffled), up to 512 tokens each.
-fast-encdec keeps `--max-num-seq` requests in flight and refills a slot as soon as a
+fast-encdec keeps `--max-num-req` requests in flight and refills a slot as soon as a
 request finishes; its multimodal cache (on by default, cleared before each run)
 runs the vision encoder once per image: 32 misses, 96 hits. HF runs padded batches
 of 8 and encodes every image, and 64-71% of its decoded positions are padding.

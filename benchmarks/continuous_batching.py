@@ -2,9 +2,9 @@
 
 Requests are shuffled once (seed 42) and mix long tasks (<OD>, segmentation)
 with short ones (<OCR>, <DETAILED_CAPTION>). ``--backend fast`` keeps
-``--max-num-seq`` requests in flight and refills a slot as soon as a request
+``--max-num-req`` requests in flight and refills a slot as soon as a request
 finishes; ``--backend hf`` runs the same requests as back-to-back padded
-batches of ``--max-num-seq``. One backend/config per run -- run twice and compare.
+batches of ``--max-num-req``. One backend/config per run -- run twice and compare.
 
   PYTHONPATH=. python benchmarks/continuous_batching.py --backend fast
   PYTHONPATH=. python benchmarks/continuous_batching.py --backend hf --beamsearch 4
@@ -86,7 +86,7 @@ def run_fast(args, input_token_ids, pixels, dtype):
 
     llm = LLM(
         args.model,
-        max_num_seqs=args.max_num_seq * args.beamsearch,
+        max_num_seqs=args.max_num_req * args.beamsearch,
         dtype=dtype,
         mm_cache_size=args.mm_cache_size,
     )
@@ -125,8 +125,8 @@ def run_hf(args, input_token_ids, pixels, dtype, tokenizer):
         args.model, dtype=dtype
     ).eval()
     batches = []
-    for start in range(0, len(input_token_ids), args.max_num_seq):
-        end = start + args.max_num_seq
+    for start in range(0, len(input_token_ids), args.max_num_req):
+        end = start + args.max_num_req
         batch = tokenizer.pad(
             {"input_ids": input_token_ids[start:end]}, padding=True, return_tensors="pt"
         )
@@ -165,7 +165,7 @@ def main():
     ap.add_argument("--backend", required=True, choices=["fast", "hf"])
     ap.add_argument("--num-req", type=int, default=128)
     ap.add_argument(
-        "--max-num-seq",
+        "--max-num-req",
         type=int,
         default=8,
         help="requests in flight (fast) / padded batch size (hf)",
@@ -180,8 +180,8 @@ def main():
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--model", default="florence-community/Florence-2-base")
     args = ap.parse_args()
-    if args.num_req < 1 or args.max_num_seq < 1 or args.beamsearch < 1:
-        ap.error("--num-req, --max-num-seq and --beamsearch must be >= 1")
+    if args.num_req < 1 or args.max_num_req < 1 or args.beamsearch < 1:
+        ap.error("--num-req, --max-num-req and --beamsearch must be >= 1")
 
     if args.max_tokens < 1 or args.warmup < 0 or args.repeats < 1:
         ap.error("need --max-tokens >= 1, --warmup >= 0 and --repeats >= 1")
@@ -203,7 +203,8 @@ def main():
     print(
         f"\nbackend={args.backend}  model={args.model}  dtype={args.dtype}  "
         f"threads={torch.get_num_threads()}  num_req={args.num_req}  "
-        f"max_num_seq={args.max_num_seq}  beams={args.beamsearch}  "
+        f"max_num_req={args.max_num_req}  beams={args.beamsearch}  "
+        f"seqs/step<={args.max_num_req * args.beamsearch}  "
         f"max_tokens={args.max_tokens}\n"
     )
     for i, ((task, cid), toks) in enumerate(zip(labels, rows)):

@@ -45,7 +45,7 @@ class BenchmarkTests(unittest.TestCase):
     def test_hf_batches_preprocessed_inputs_and_counts_padding(self):
         args = SimpleNamespace(
             model="unused",
-            max_num_seq=2,
+            max_num_req=2,
             max_tokens=4,
             beamsearch=1,
             warmup=0,
