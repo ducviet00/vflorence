@@ -36,7 +36,7 @@ placeholders; the decoder is unchanged.
 
 ## 2. Environment
 
-- Python env: `.venv/bin/python` (Python >= 3.12, CPU PyTorch, `vllm-cpu-attn`, `transformers`, `safetensors`, `Pillow`).
+- Python env: `.venv/bin/python` (Python >= 3.12, CPU PyTorch, `vllm-cpu-attn`, `transformers`, `safetensors`, `Pillow`, `xxhash`).
 - Dev CPU: AMD Ryzen 7 7840H (Zen 4) — has `avx512_bf16`, **no** AMX, **no** `avx512_fp16`. Prefer `bfloat16` or `float32`; never `float16`. Do not run heavy full benchmarks on this laptop (smoke tests / unit tests only); run full benchmarks on disposable GCP spot VMs (`spot-bench-gcp` skill: `bench-start axion` for `c4a-standard-8` and `bench-start xeon` for `c4-standard-8`, then `bench-stop` immediately when done).
 - Install in a Python 3.12+ venv:
   ```bash
@@ -151,8 +151,8 @@ compiled graph.
 6. **Multimodal cache.** `ModelRunner.mm_cache` is an LRU (`Config.mm_cache_size`
    entries, 0 disables) of `Sequence.mm_hash -> image_embeds` (vision tower +
    projector output), kept across `generate` calls; `mm_cache_hits` /
-   `mm_cache_misses` count lookups. `mm_hash` is the sha256 of `pixel_values`
-   (~3 ms for 768x768 fp32); the processor still runs every time (~2.5 ms).
+   `mm_cache_misses` count lookups. `mm_hash` is the xxh3_128 of `pixel_values`
+   (~0.1 ms for 768x768 fp32; not cryptographic); the processor still runs every time (~2.5 ms).
 7. **Scheduling.** `Scheduler.schedule()` returns *all* running sequences each
    step, so a request's beams are never split. Keep `max_num_seqs >= num_beams`.
 8. **Global context.** `utils/context.set_context(...)` is called once per
