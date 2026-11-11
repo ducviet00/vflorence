@@ -102,6 +102,10 @@ LLMEngine.step()                  # argmax (greedy) or beam-expand; append; free
 `LLMEngine.run()` loops `step()` until `is_finished()`.
 `LLMEngine.generate(requests, params)` is the offline entrypoint: it adds the
 whole batch under a single `SamplingParams` and runs to completion.
+Every `SamplingParams` field defaults to `None` = "use the checkpoint's
+`generation_config.json`" (`LLMEngine._sampling_params`, filled in by
+`add_request`), as in `transformers`' `generate()`; callers set only what they
+override.
 
 `ModelRunner._sample` runs `log_softmax` (beams only) and the logits processor
 once over the whole batch, with histories left-padded by -1 and true lengths
@@ -191,13 +195,15 @@ PYTHONPATH=. $P benchmarks/continuous_batching.py --backend fast --beamsearch 1 
 
 ## 7. Known issues
 
-- **CRITICAL: Florence-2-large produces garbage (open, not yet investigated).**
-  `florence-community/Florence-2-large`, bf16, greedy, max num seq 32 on
-  `c4a-standard-16` (2026-11-11, `benchmarks/continuous_batching.py`): 84 of 128
-  requests decode only repeated `<s>` tokens until `max_tokens` (512). Every
-  `<REFERRING_EXPRESSION_SEGMENTATION>` request fails, plus 28/32 `<OCR>` and 23/32
-  `<OD>`; most `<DETAILED_CAPTION>` outputs look correct. Florence-2-base is fine
-  on the same box. Not yet compared against HF (not checked whether HF large
-  behaves, or whether fp32 / x86 differ). Start with one failing request, e.g.
-  `<OD>` on COCO `000000002153.jpg`, fast vs HF in bf16 and fp32. Do not publish
-  Florence-2-large numbers until this is fixed.
+- **Florence-2-large needs `no_repeat_ngram_size=3` (checkpoint behaviour, not an engine bug).**
+  With greedy decoding and `no_repeat_ngram_size=0`, `florence-community/Florence-2-large`
+  repeats `<s>` until `max_tokens` on most `<OD>` / `<OCR>` /
+  `<REFERRING_EXPRESSION_SEGMENTATION>` requests: after the forced `<s>` its top
+  token is `<s>` again, with the same logits every step. HF does the same in bf16
+  and fp32 (`<OD>` on COCO `000000002153.jpg`); the checkpoint's default
+  `no_repeat_ngram_size=3` breaks the loop. `SamplingParams` now inherits it (the
+  benchmarks used to force 0 on both backends), so do not override it to 0 for
+  this model. With 3, fast and HF agree on 128 requests (bf16, `c4a-standard-8`,
+  2026-11-11): no `<s>` loops, 95/128 rows identical, the rest bf16 near-tie
+  drift. Benchmark numbers recorded before this change used
+  `no_repeat_ngram_size=0` / `early_stopping=False` and need a re-run.

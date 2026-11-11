@@ -8,7 +8,7 @@ len == max-1 for forced EOS, begin_index).
 import itertools
 
 import torch
-from transformers import LogitsProcessorList
+from transformers import GenerationConfig, LogitsProcessorList
 from transformers.generation.logits_process import (
     ForcedBOSTokenLogitsProcessor,
     ForcedEOSTokenLogitsProcessor,
@@ -23,6 +23,7 @@ from fastencdec.layers.logits_processor import LogitsProcessor
 from fastencdec.sampling_params import SamplingParams
 
 VOCAB = 37
+DEFAULTS = SamplingParams.from_generation_config(GenerationConfig())
 EOS = [2, 7]
 
 
@@ -49,6 +50,7 @@ def reference(params, input_ids, scores):
 
 
 def check(params, rows):
+    params = params.with_defaults(DEFAULTS)
     torch.manual_seed(rows)
     input_ids = torch.randint(0, VOCAB, (4, rows))
     scores = torch.randn(4, VOCAB) * 3
@@ -64,6 +66,7 @@ def check(params, rows):
 
 
 def check_padded(params, true_lens):
+    params = params.with_defaults(DEFAULTS)
     torch.manual_seed(sum(true_lens) * 131 + len(true_lens))
     rows = [torch.randint(0, VOCAB, (L,)) for L in true_lens]
     scores = torch.randn(len(rows), VOCAB) * 3
@@ -130,7 +133,9 @@ def main():
 
     # Padded -1 must not alias real token 0 in the repetition penalty, even
     # when both share the scatter (pads on the left, real 0 on the right).
-    rep = SamplingParams(eos_token_id=EOS, repetition_penalty=1.3)
+    rep = SamplingParams(eos_token_id=EOS, repetition_penalty=1.3).with_defaults(
+        DEFAULTS
+    )
     torch.manual_seed(0)
     scores = torch.randn(4, VOCAB) * 3
     true_rows = [

@@ -40,6 +40,8 @@ def model(activation="gelu"):
 
 
 REQUEST = Request([3, 4, 5])
+# What the engine fills unset fields with when a checkpoint ships no generation config.
+DEFAULTS = SamplingParams.from_generation_config(GenerationConfig())
 
 
 class EngineTests(unittest.TestCase):
@@ -75,7 +77,7 @@ class EngineTests(unittest.TestCase):
 
     def test_cache_full_raises(self):
         llm = self.engine(max_num_seqs=1)
-        params = SamplingParams(max_tokens=3, min_length=4)
+        params = SamplingParams(max_tokens=3, min_length=4).with_defaults(DEFAULTS)
         llm.scheduler.running = [
             Sequence(i, [1], [3], params)
             for i in range(llm.scheduler.block_manager.num_blocks + 1)
@@ -188,7 +190,7 @@ class EngineTests(unittest.TestCase):
     def test_runner_failure_releases_global_cross_cache(self):
         llm = self.engine()
         self.addCleanup(set_context)
-        llm.scheduler.add(Sequence(0, [1], [3, 4, 5], SamplingParams()))
+        llm.scheduler.add(Sequence(0, [1], [3, 4, 5], DEFAULTS))
         seqs, copies = llm.scheduler.schedule()
         with (
             patch.object(
@@ -203,11 +205,22 @@ class EngineTests(unittest.TestCase):
         llm = self.engine()
         llm._sampling_params = SamplingParams(
             max_tokens=3, min_length=10, eos_token_id=2
-        )
+        ).with_defaults(DEFAULTS)
         (out,) = llm.generate([REQUEST])  # no params: checkpoint defaults as-is
         self.assertEqual(len(out.completion_token_ids), 3)
         filled = SamplingParams(max_tokens=5).with_defaults(llm._sampling_params)
         self.assertEqual((filled.max_tokens, filled.eos_token_id), (5, 2))
+        self.assertEqual(filled.min_length, 10)  # unset, not a hard-coded 0
+        # A checkpoint's no_repeat_ngram_size reaches a request that leaves it unset
+        # (Florence-2-large loops on <s> without its default of 3).
+        llm._sampling_params = SamplingParams.from_generation_config(
+            GenerationConfig(no_repeat_ngram_size=3, num_beams=2)
+        )
+        llm.add_request(REQUEST, SamplingParams(max_tokens=2, num_beams=1))
+        params = llm.scheduler.waiting[0].sampling_params
+        self.assertEqual((params.no_repeat_ngram_size, params.num_beams), (3, 1))
+        while not llm.is_finished():
+            llm.step()
 
     def test_beam_search_mixed_beam_counts_match_per_request(self):
         llm = self.engine()
