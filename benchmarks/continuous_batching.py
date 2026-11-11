@@ -105,7 +105,10 @@ def run_fast(args, input_token_ids, pixels, dtype):
         # Cold cache each run: only reuse within the batch (4 tasks per image) counts.
         runner.mm_cache.clear()
         runner.mm_cache_hits = runner.mm_cache_misses = 0
-        return [o.completion_token_ids for o in llm.generate(requests, params)]
+        rows = [o.completion_token_ids for o in llm.generate(requests, params)]
+        # generate() logs a rejected request and returns it empty; a real one has >= 1 token.
+        assert all(rows), "fast-encdec rejected requests; see the log above"
+        return rows
 
     seconds, rows = timed(once, args.warmup, args.repeats)
     print(
@@ -150,9 +153,8 @@ def run_hf(args, input_token_ids, pixels, dtype, tokenizer):
     rows, padding = [], []
     for output in outputs:
         for row in output.tolist():
-            tokens = row[
-                1:
-            ]  # HF includes the decoder start token; fast-encdec does not.
+            # HF includes the decoder start token; fast-encdec does not.
+            tokens = row[1:]
             length = len(tokens)
             while tokens and tokens[-1] == tokenizer.pad_token_id:
                 tokens.pop()
