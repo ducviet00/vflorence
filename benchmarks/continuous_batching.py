@@ -1,16 +1,17 @@
-"""Continuous batching vs padded batches: Florence-2, 8 real images x 4 tasks.
+"""Continuous batching vs padded batches: Florence-2, 32 real images x 4 tasks.
 
-Requests mix long tasks (<OD>, segmentation) with short ones (<OCR>,
-<DETAILED_CAPTION>). ``--backend fast`` keeps ``--max-num-seq`` requests in
-flight and refills a slot as soon as a request finishes; ``--backend hf`` runs
-the same requests as back-to-back padded batches of ``--max-num-seq``. One
-backend/config per run -- run twice and compare.
+Requests are shuffled once (seed 42) and mix long tasks (<OD>, segmentation)
+with short ones (<OCR>, <DETAILED_CAPTION>). ``--backend fast`` keeps
+``--max-num-seq`` requests in flight and refills a slot as soon as a request
+finishes; ``--backend hf`` runs the same requests as back-to-back padded
+batches of ``--max-num-seq``. One backend/config per run -- run twice and compare.
 
   PYTHONPATH=. python benchmarks/continuous_batching.py --backend fast
   PYTHONPATH=. python benchmarks/continuous_batching.py --backend hf --beamsearch 4
 """
 
 import argparse
+import random
 
 import torch
 
@@ -25,15 +26,39 @@ IMAGE_URLs = [  # (image URL, referring expression)
     ("http://images.cocodataset.org/val2017/000000000776.jpg", "the teddy bear"),
     ("http://images.cocodataset.org/val2017/000000000785.jpg", "the skier"),
     ("http://images.cocodataset.org/val2017/000000000802.jpg", "the oven"),
+    ("http://images.cocodataset.org/val2017/000000000872.jpg", "the baseball glove"),
+    ("http://images.cocodataset.org/val2017/000000000885.jpg", "the tennis racket"),
+    ("http://images.cocodataset.org/val2017/000000001000.jpg", "the boy in red"),
+    ("http://images.cocodataset.org/val2017/000000001296.jpg", "the phone"),
+    ("http://images.cocodataset.org/val2017/000000001353.jpg", "the red train car"),
+    ("http://images.cocodataset.org/val2017/000000001490.jpg", "the paddle"),
+    ("http://images.cocodataset.org/val2017/000000001503.jpg", "the keyboard"),
+    ("http://images.cocodataset.org/val2017/000000001532.jpg", "the green road sign"),
+    ("http://images.cocodataset.org/val2017/000000001584.jpg", "the red bus"),
+    ("http://images.cocodataset.org/val2017/000000001675.jpg", "the cat"),
+    ("http://images.cocodataset.org/val2017/000000001761.jpg", "the bridge"),
+    ("http://images.cocodataset.org/val2017/000000001818.jpg", "the zebra"),
+    ("http://images.cocodataset.org/val2017/000000001993.jpg", "the bed"),
+    ("http://images.cocodataset.org/val2017/000000002006.jpg", "the purple bus"),
+    ("http://images.cocodataset.org/val2017/000000002149.jpg", "the right apple"),
+    ("http://images.cocodataset.org/val2017/000000002153.jpg", "the batter"),
+    ("http://images.cocodataset.org/val2017/000000002157.jpg", "the cake"),
+    ("http://images.cocodataset.org/val2017/000000002261.jpg", "the surfer"),
+    ("http://images.cocodataset.org/val2017/000000002431.jpg", "the wine glass"),
+    ("http://images.cocodataset.org/val2017/000000002473.jpg", "the skier in the air"),
+    ("http://images.cocodataset.org/val2017/000000002532.jpg", "the skier"),
+    ("http://images.cocodataset.org/val2017/000000002587.jpg", "the banana"),
+    ("http://images.cocodataset.org/val2017/000000002592.jpg", "the knife"),
+    ("http://images.cocodataset.org/val2017/000000002685.jpg", "the woman in black"),
 ]
 
 TASKS = ["<OD>", "<OCR>", "<DETAILED_CAPTION>", "<REFERRING_EXPRESSION_SEGMENTATION>"]
 
 
 def prepare_inputs(processor, num_requests):
-    """Cycle through four tasks per image; process each request before timing."""
+    """Four tasks per image, processed before timing, then shuffled with seed 42."""
     images = {}
-    labels, input_token_ids, pixels = [], [], []
+    requests = []  # ((task, image file), input token ids, pixel values)
     for i in range(num_requests):
         url, phrase = IMAGE_URLs[(i // len(TASKS)) % len(IMAGE_URLs)]
         task = TASKS[i % len(TASKS)]
@@ -43,10 +68,17 @@ def prepare_inputs(processor, num_requests):
         if url not in images:
             images[url] = load_image(url)
         inputs = processor(text=prompt, images=images[url], return_tensors="pt")
-        labels.append((task, url.rsplit("/", 1)[-1]))
-        input_token_ids.append(inputs["input_ids"][0].tolist())
-        pixels.append(inputs["pixel_values"][0])
-    return labels, input_token_ids, pixels
+        requests.append(
+            (
+                (task, url.rsplit("/", 1)[-1]),
+                inputs["input_ids"][0].tolist(),
+                inputs["pixel_values"][0],
+            )
+        )
+    # Both backends get this one list, so they run the same random order.
+    random.Random(42).shuffle(requests)
+    labels, input_token_ids, pixels = zip(*requests)
+    return list(labels), list(input_token_ids), list(pixels)
 
 
 def run_fast(args, input_token_ids, pixels, dtype):
@@ -132,7 +164,7 @@ def run_hf(args, input_token_ids, pixels, dtype, tokenizer):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--backend", required=True, choices=["fast", "hf"])
-    ap.add_argument("--num-req", type=int, default=32)
+    ap.add_argument("--num-req", type=int, default=128)
     ap.add_argument(
         "--max-num-seq",
         type=int,
