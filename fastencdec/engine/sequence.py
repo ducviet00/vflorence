@@ -1,8 +1,8 @@
 import copy
-import hashlib
 from dataclasses import dataclass, field
 
 import torch
+import xxhash
 
 from ..sampling_params import SamplingParams
 
@@ -43,7 +43,7 @@ class Sequence:
         self.token_ids = list(self.decoder_token_ids)
         if self.pixel_values is not None and self.mm_hash is None:
             px = self.pixel_values.contiguous()
-            h = hashlib.sha256(f"{tuple(px.shape)}{px.dtype}".encode())
+            h = xxhash.xxh3_128(f"{tuple(px.shape)}{px.dtype}".encode())
             h.update(px.view(torch.uint8).numpy())
             self.mm_hash = h.hexdigest()
 

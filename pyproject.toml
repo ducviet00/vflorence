@@ -13,6 +13,7 @@ dependencies = [
   "torch>=2.4.0",
   "torchvision",
   "vllm-cpu-attn",
+  "xxhash",
 ]
 
 [tool.uv]
