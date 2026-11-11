@@ -18,7 +18,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(last, 4)
         self.assertGreaterEqual(seconds, 0)
 
-    def test_prepare_inputs_cycles_tasks_and_processes_requests(self):
+    def test_prepare_inputs_shuffles_tasks_and_processes_requests(self):
         processor = Mock(
             return_value={
                 "input_ids": torch.tensor([[3, 4]]),
@@ -26,20 +26,21 @@ class BenchmarkTests(unittest.TestCase):
             }
         )
         with patch.object(continuous_batching, "load_image") as load:
-            labels, ids, pixels = continuous_batching.prepare_inputs(processor, 32)
+            labels, ids, pixels = continuous_batching.prepare_inputs(processor, 128)
         self.assertEqual(load.call_count, len(continuous_batching.IMAGE_URLs))
-        self.assertEqual(ids, [[3, 4]] * 32)
-        self.assertEqual(len(pixels), 32)
+        self.assertEqual(ids, [[3, 4]] * 128)
+        self.assertEqual(len(pixels), 128)
         self.assertEqual(pixels[0].shape, (3, 2, 2))
-        for start in range(0, 32, 8):
-            self.assertEqual(
-                {task for task, _ in labels[start : start + 8]},
-                set(continuous_batching.TASKS),
-            )
+        # every image x task pair exactly once, not in image order
+        self.assertEqual(len(set(labels)), 128)
+        self.assertNotEqual(labels, sorted(labels, key=lambda label: label[1]))
         self.assertEqual(
             processor.call_args_list[3].kwargs["text"],
             continuous_batching.TASKS[3] + continuous_batching.IMAGE_URLs[0][1],
         )
+        with patch.object(continuous_batching, "load_image"):
+            again, _, _ = continuous_batching.prepare_inputs(processor, 128)
+        self.assertEqual(labels, again)  # same order for every backend and run
 
     def test_hf_batches_preprocessed_inputs_and_counts_padding(self):
         args = SimpleNamespace(
