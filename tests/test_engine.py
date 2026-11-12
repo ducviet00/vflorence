@@ -110,6 +110,22 @@ class EngineTests(unittest.TestCase):
             llm.add_request(Request([3], torch.zeros(1)), SamplingParams())
         self.assert_clean(llm)
 
+    def test_empty_and_out_of_vocab_prompts_are_rejected(self):
+        llm = self.engine()
+        for input_ids, message in [
+            ([], "empty"),
+            ([3, 32], "vocab_size"),
+            ([-1, 3], "vocab_size"),
+        ]:
+            with (
+                self.subTest(input_ids=input_ids),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                llm.add_request(Request(input_ids), SamplingParams(max_tokens=2))
+            self.assert_clean(llm)
+        llm.generate([Request([0, 31])], SamplingParams(max_tokens=2), use_tqdm=False)
+        self.assert_clean(llm)
+
     def test_rejected_request_returns_empty_and_others_run(self):
         llm = self.engine()
         bad1 = Request([3] * 129)  # longer than max_position_embeddings

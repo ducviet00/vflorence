@@ -134,6 +134,13 @@ class LLMEngine:
                 f"max_tokens ({sampling_params.max_tokens}) exceeds the engine's "
                 f"max_decoder_len ({self.config.max_decoder_len})"
             )
+        vocab_size = self.config.text_config.vocab_size
+        if not request.input_ids:
+            raise ValueError("encoder prompt is empty")
+        if not 0 <= min(request.input_ids) <= max(request.input_ids) < vocab_size:
+            raise ValueError(
+                f"encoder prompt has token ids outside [0, vocab_size={vocab_size})"
+            )
         if len(request.input_ids) > self.config.max_encoder_len:
             raise ValueError(
                 f"encoder prompt has {len(request.input_ids)} tokens; the engine "
