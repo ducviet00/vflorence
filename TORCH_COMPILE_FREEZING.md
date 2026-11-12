@@ -354,7 +354,20 @@ ms/step. The laptop numbers are smoke-scale.
   kernels. On Axion fp32 it matches the unfrozen graph; on x86 bf16 it helps
   batch 1 only (-22% on the laptop). It costs 2-4x the compile time (61 s +
   52 s against 20 s + 12 s on the laptop) and picks kernels by timing them, so
-  it is not the default.
+  it is on only where it measured a clear win: the **decode graph on x86 bf16**
+  (`ModelRunner._compile`). On 16-vCPU boxes with Florence-2-large
+  (`c4-standard-16` Xeon 8581C, `c4a-standard-16` Axion), default → max-autotune:
+
+  | stage | Xeon bf16 | Xeon fp32 | Axion bf16 | Axion fp32 |
+  |---|---:|---:|---:|---:|
+  | vision, 1 image (ms) | 339 → 369 | 1514 → 1485 | 443 → 444 | 1317 → 1286 |
+  | encode, batch 8 (ms) | 494 → 445 | 1311 → 1559 | 448 → 450 | 1309 → 1315 |
+  | encode, batch 1 (ms) | 45 → 45 | 166 → 167 | 62 → 63 | 168 → 168 |
+  | decode, batch 8 (ms/step) | 12.35 → 10.91 | 22.66 → 23.94 | 11.96 → 12.38 | 15.89 → 13.91 |
+  | decode, batch 1 (ms/step) | 8.57 → 6.52 | 12.44 → 11.73 | 5.23 → 5.39 | 6.68 → 6.64 |
+
+  (Axion batch 1 is the unfrozen graph; frozen + max-autotune there is 9.49 bf16
+  / 5.84 fp32.) fp32 stays token-exact vs HF under max-autotune on both boxes.
 - **Memory**: every frozen graph keeps its own packed copy of the weights.
   bart-large bf16 (~0.8 GB of weights) grew RSS by ~1.0 GB for the batch>=2
   graphs and ~0.7 GB more for the batch-1 graphs on x86.
