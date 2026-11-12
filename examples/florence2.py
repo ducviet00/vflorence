@@ -20,7 +20,7 @@ TASK = "<OD>"
 def main():
     image = Image.open(requests.get(URL, stream=True).raw).convert("RGB")
     processor = AutoProcessor.from_pretrained(MODEL)
-    llm = LLM(MODEL, dtype=torch.bfloat16)
+    llm = LLM(MODEL, dtype=torch.bfloat16, max_decoder_len=1024)
 
     inputs = processor(text=TASK, images=image, return_tensors="pt")
     request = Request(inputs["input_ids"][0].tolist(), inputs["pixel_values"][0])

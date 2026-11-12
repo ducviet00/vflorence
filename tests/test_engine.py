@@ -60,7 +60,7 @@ class EngineTests(unittest.TestCase):
             self._tmpdir.name,
             max_num_seqs=max_num_seqs,
             compile=False,
-            **kwargs,
+            **{"max_decoder_len": 128, **kwargs},
         )
 
     def assert_clean(self, llm):
@@ -297,7 +297,7 @@ class EngineTests(unittest.TestCase):
         llm = self.engine(max_num_seqs=2)
         cases = [
             (Request([3] * 129), SamplingParams(max_tokens=2), "encoder prompt"),
-            (REQUEST, SamplingParams(max_tokens=129), "max_position_embeddings"),
+            (REQUEST, SamplingParams(max_tokens=129), "max_decoder_len"),
             (REQUEST, SamplingParams(max_tokens=128, num_beams=9), "max_num_seqs"),
         ]
         for request, params, message in cases:
@@ -316,6 +316,20 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "KV blocks"):
             llm.add_request(REQUEST, SamplingParams(max_tokens=128))
         self.assert_clean(llm)
+
+    def test_kv_pools_are_fixed_by_decoder_and_encoder_len(self):
+        llm = self.engine(max_num_seqs=2, max_decoder_len=40, max_encoder_len=10)
+        bs = llm.config.block_size
+        self.assertEqual(llm.config.num_blocks, 2 * -(-40 // bs))
+        pool = llm.runner.decoder_layers[0].encoder_attn.k_cache
+        self.assertEqual(pool.shape[0], 2 * -(-10 // bs))
+        llm.generate([Request([3] * 10)] * 3, SamplingParams(max_tokens=40))
+        self.assertIs(llm.runner.decoder_layers[0].encoder_attn.k_cache, pool)
+        self.assert_clean(llm)
+        with self.assertRaisesRegex(ValueError, "max_encoder_len"):
+            llm.add_request(Request([3] * 11), SamplingParams(max_tokens=2))
+        with self.assertRaisesRegex(ValueError, "max_decoder_len must be"):
+            self.engine(max_decoder_len=129)
 
     def test_shared_beams_fit_two_blocks(self):
         llm = self.engine(max_num_seqs=2)

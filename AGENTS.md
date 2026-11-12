@@ -137,10 +137,18 @@ compiled graph.
    with internal layout determined by the selected ISA (`vec` / `amx` on x86,
    `neon` on arm64) and `block_size` (32 on x86, 16 on arm64; must be a
    multiple of 16). `head_dim` must be in `{32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 512}`.
+   Both KV pools are allocated once and never grow: `num_blocks` defaults to
+   `max_num_seqs * ceil(Config.max_decoder_len / block_size)` (`max_decoder_len`
+   defaults to the generation config's max tokens; a request needs
+   `max_tokens <= max_decoder_len`, as the last generated token is never fed).
 4. **Cross-attention pool.** Each `BartDecoderCrossAttention` holds a paged
    encoder K/V pool `k_cache` / `v_cache`
-   (`[num_pages, num_heads, block_size, head_dim]`), which starts empty and at
-   least doubles when it runs out (it never shrinks). `_encode` writes a
+   (`[num_cross_blocks, num_heads, block_size, head_dim]`), fixed at
+   `max_num_seqs * ceil(Config.max_encoder_len / block_size)` pages
+   (`max_encoder_len` defaults to `image_seq_length` + 64 text tokens from
+   `preprocessor_config.json`, i.e. 641 for Florence-2, else
+   `max_position_embeddings`; both length defaults round up to whole blocks,
+   so 672 on x86; longer prompts are rejected). `_encode` writes a
    request's K/V once into pages from `ModelRunner._cross_free` and records
    `_cross_pages[request_id] = (pages, enc_len)`; all beams of a request share
    them and `ModelRunner.clear_request` returns them. `stage_cross` copies

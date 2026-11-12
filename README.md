@@ -60,7 +60,9 @@ from transformers import AutoProcessor
 from fastencdec import LLM, Request, SamplingParams
 
 processor = AutoProcessor.from_pretrained("florence-community/Florence-2-base")
-llm = LLM("florence-community/Florence-2-base", dtype=torch.bfloat16)
+llm = LLM(
+    "florence-community/Florence-2-base", dtype=torch.bfloat16, max_decoder_len=256
+)
 image = Image.open("car.jpg")
 inputs = processor(text="<OD>", images=image, return_tensors="pt")
 outputs = llm.generate(

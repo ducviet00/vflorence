@@ -22,7 +22,6 @@ class LLMEngine:
         self.config = config
         self.runner = ModelRunner(config)
         self.scheduler = Scheduler(config)
-        self.max_positions = config.text_config.max_position_embeddings
         self.decoder_start_token_id = config.text_config.decoder_start_token_id
         self.eos_token_id = config.text_config.eos_token_id
         self._sampling_params = SamplingParams.from_generation_config(
@@ -101,15 +100,15 @@ class LLMEngine:
         active = self.scheduler.waiting or self.scheduler.running
         if active and active[0].sampling_params != sampling_params:
             raise ValueError("all active requests must share the same SamplingParams")
-        if sampling_params.max_tokens > self.max_positions:
+        if sampling_params.max_tokens > self.config.max_decoder_len:
             raise ValueError(
-                f"max_tokens ({sampling_params.max_tokens}) exceeds the model's "
-                f"max_position_embeddings ({self.max_positions})"
+                f"max_tokens ({sampling_params.max_tokens}) exceeds the engine's "
+                f"max_decoder_len ({self.config.max_decoder_len})"
             )
-        if len(request.input_ids) > self.max_positions:
+        if len(request.input_ids) > self.config.max_encoder_len:
             raise ValueError(
-                f"encoder prompt has {len(request.input_ids)} tokens; the model "
-                f"supports at most {self.max_positions}"
+                f"encoder prompt has {len(request.input_ids)} tokens; the engine "
+                f"supports at most max_encoder_len={self.config.max_encoder_len}"
             )
         if sampling_params.num_beams > self.config.max_num_seqs:
             raise ValueError(

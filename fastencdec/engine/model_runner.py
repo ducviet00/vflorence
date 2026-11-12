@@ -55,7 +55,7 @@ class ModelRunner:
         self.mm_cache_hits = self.mm_cache_misses = 0
         # Cross-attention pool: request_id -> (pages, enc_len), and the unused pages.
         self._cross_pages: dict[int, tuple[torch.Tensor, int]] = {}
-        self._cross_free: list[int] = []
+        self._cross_free = list(range(config.num_cross_blocks))
         # Cross-attention metadata staged for the current batch, keyed by its request ids.
         self._cross_key = None
         self._cross_staged = None
@@ -76,9 +76,9 @@ class ModelRunner:
         for layer in self.decoder_layers:
             layer.self_attn.k_cache = torch.zeros(shape, dtype=self.dtype)
             layer.self_attn.v_cache = torch.zeros(shape, dtype=self.dtype)
-            # The encoder K/V pool starts empty and grows on demand.
-            layer.encoder_attn.k_cache = torch.zeros((0, *shape[1:]), dtype=self.dtype)
-            layer.encoder_attn.v_cache = torch.zeros((0, *shape[1:]), dtype=self.dtype)
+            cross = (self.config.num_cross_blocks, *shape[1:])
+            layer.encoder_attn.k_cache = torch.zeros(cross, dtype=self.dtype)
+            layer.encoder_attn.v_cache = torch.zeros(cross, dtype=self.dtype)
 
         weight_bytes = sum(
             t.numel() * t.element_size()
@@ -87,14 +87,16 @@ class ModelRunner:
         kv_bytes = sum(
             c.numel() * c.element_size()
             for layer in self.decoder_layers
-            for c in (layer.self_attn.k_cache, layer.self_attn.v_cache)
+            for attn in (layer.self_attn, layer.encoder_attn)
+            for c in (attn.k_cache, attn.v_cache)
         )
         logger.info(
-            "Allocated %.1f MB (weights %.1f MB + KV cache %.1f MB, %d blocks of %d tokens)",
+            "Allocated %.1f MB (weights %.1f MB + KV cache %.1f MB, %d self + %d cross blocks of %d tokens)",
             (weight_bytes + kv_bytes) / (1024**2),
             weight_bytes / (1024**2),
             kv_bytes / (1024**2),
             self.config.num_blocks,
+            self.config.num_cross_blocks,
             self.block_size,
         )
 
@@ -124,19 +126,9 @@ class ModelRunner:
                 cache.index_copy_(0, dst, cache.index_select(0, src))
 
     def _allocate_cross_pages(self, num_pages: int) -> list[int]:
-        """Take pages from the encoder K/V pool, at least doubling it when it runs out."""
-        short = num_pages - len(self._cross_free)
-        if short > 0:
-            size = self.decoder_layers[0].encoder_attn.k_cache.shape[0]
-            grow = max(short, size)
-            for layer in self.decoder_layers:
-                attn = layer.encoder_attn
-                # zeros: the kernel reads whole pages, including the unused tail.
-                tail = torch.zeros((grow, *attn.k_cache.shape[1:]), dtype=self.dtype)
-                attn.k_cache = torch.cat([attn.k_cache, tail])
-                attn.v_cache = torch.cat([attn.v_cache, tail])
-            self._cross_free.extend(range(size, size + grow))
-            self._cross_key = None  # staged tuples point at the old tensors
+        """Take pages from the fixed encoder K/V pool."""
+        if num_pages > len(self._cross_free):
+            raise RuntimeError("encoder K/V pool is full; increase max_encoder_len")
         # A slice, not pops: keeps a request's pages in ascending memory order.
         pages = self._cross_free[-num_pages:]
         del self._cross_free[-num_pages:]

@@ -11,8 +11,6 @@ batches of ``--max-num-req``. One backend/config per run -- run twice and compar
 """
 
 import argparse
-import math
-import platform
 import random
 
 import torch
@@ -92,13 +90,12 @@ def run_fast(args, input_token_ids, pixels, dtype):
     from fastencdec import LLM, Request, SamplingParams
 
     max_num_seqs = args.max_num_req * args.beamsearch
-    # The default KV cache covers max_position_embeddings per sequence (4096 on
-    # Florence-2-large: ~26 GB at 128 seqs); size it for max_tokens instead.
-    block_size = 16 if platform.machine().lower() in ("arm64", "aarch64") else 32
+    # Size both KV pools for this workload, not max_position_embeddings (4096 on Florence-2-large).
     llm = LLM(
         args.model,
         max_num_seqs=max_num_seqs,
-        num_blocks=max_num_seqs * (math.ceil((args.max_tokens + 2) / block_size) + 1),
+        max_decoder_len=args.max_tokens,
+        max_encoder_len=max(len(ids) for ids in input_token_ids),
         dtype=dtype,
         mm_cache_size=args.mm_cache_size,
     )
