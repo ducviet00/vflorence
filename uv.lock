@@ -74,7 +74,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "pillow" },
-    { name = "torch", specifier = ">=2.4.0", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "torch", specifier = "==2.15.0", index = "https://download.pytorch.org/whl/cpu" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cpu" },
     { name = "tqdm" },
     { name = "transformers" },

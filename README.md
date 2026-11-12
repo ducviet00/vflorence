@@ -13,7 +13,7 @@ A small, readable CPU inference engine for **BART** and **Florence-2**, in the s
 ## Installation
 
 ```bash
-uv pip install torch torchvision setuptools --index-url https://download.pytorch.org/whl/cpu
+uv pip install torch==2.15.0 torchvision setuptools --index-url https://download.pytorch.org/whl/cpu
 uv pip install --no-build-isolation git+https://github.com/ducviet00/vllm-cpu-attention.git
 uv pip install --no-build-isolation -e .
 ```
