@@ -1,5 +1,6 @@
 """Summarize an article with BART."""
 
+import logging
 import time
 
 from transformers import AutoTokenizer
@@ -16,7 +17,7 @@ ARTICLE = (
 
 def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    llm = LLM(MODEL)
+    llm = LLM(MODEL, max_num_seqs=4)  # 1 request x 4 beams
 
     # bart-large-cnn needs these decoding heuristics; without them raw decoding
     # collapses to short, repetitive output.
@@ -36,4 +37,6 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(format="%(name)s: %(message)s")
+    logging.getLogger("fastencdec").setLevel(logging.INFO)  # memory usage
     main()

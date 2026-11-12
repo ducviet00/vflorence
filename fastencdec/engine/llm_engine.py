@@ -88,7 +88,19 @@ class LLMEngine:
         while not self.is_finished():
             for request_id, out in self.step():
                 outputs[request_id] = out
+        self._log_memory()
         return [outputs[s] if isinstance(s, int) else s for s in slots]
+
+    def _log_memory(self) -> None:
+        mm_cache = self.runner.mm_cache
+        mm_bytes = sum(emb.nbytes for emb in mm_cache.values())
+        mb = 1024**2
+        logger.info(
+            "mm cache %.1f MB (%d/%d images)",
+            mm_bytes / mb,
+            len(mm_cache),
+            self.config.mm_cache_size,
+        )
 
     def _validate(self, request: Request, sampling_params: SamplingParams) -> None:
         """Reject a request that would crash or run out of KV cache mid-step."""

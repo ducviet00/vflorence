@@ -1,5 +1,6 @@
 """Florence-2 object detection on a real image (DaViT + paged BART decoder)."""
 
+import logging
 import time
 
 import requests
@@ -35,4 +36,6 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(format="%(name)s: %(message)s")
+    logging.getLogger("fastencdec").setLevel(logging.INFO)  # memory usage
     main()
