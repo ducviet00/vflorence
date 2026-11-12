@@ -1,14 +1,14 @@
 # fast-encdec
 
-A small, readable CPU inference engine for **BART** and **Florence-2**, in the spirit of
+A small CPU inference engine for **BART** and **Florence-2**. The code is easy to read, as in
 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
 
-## Key Features
+## Features
 
-* **Fast offline CPU inference** - paged KV cache, continuous batching, greedy and beam search
-* **Readable codebase** - minimal PyTorch + [vllm-cpu-attention](https://github.com/ducviet00/vllm-cpu-attention) kernels
-* **Two models, one engine** - BART for summarisation, Florence-2 for vision-language tasks
-* **FP32 and BF16** - frozen `torch.compile` weight packing (oneDNN / ACL) + SIMD/AMX paged attention
+* **Fast offline CPU inference**: paged KV cache, continuous batching, greedy search and beam search.
+* **Small codebase**: PyTorch and the [vllm-cpu-attention](https://github.com/ducviet00/vllm-cpu-attention) kernels only.
+* **Two models, one engine**: BART for summaries, Florence-2 for vision-language tasks.
+* **FP32 and BF16**: `torch.compile` with frozen weights (oneDNN / ACL) and SIMD/AMX paged attention.
 
 ## Installation
 
@@ -18,10 +18,10 @@ uv pip install --no-build-isolation git+https://github.com/ducviet00/vllm-cpu-at
 uv pip install --no-build-isolation -e .
 ```
 
-**On x86, use tcmalloc.** glibc malloc hands large freed buffers back to the OS, so every
-Florence-2 vision forward page-faults them in again. On Xeon (c4-standard-8) tcmalloc makes
-the vision stage ~1.9x faster and end-to-end throughput ~10% higher; on Axion (aarch64) it
-makes no measurable difference.
+**On x86, use tcmalloc.** glibc malloc gives large freed buffers back to the OS. Thus each
+Florence-2 vision forward causes the same page faults again. On Xeon (`c4-standard-8`),
+tcmalloc makes the vision stage ~1.9x faster and increases end-to-end throughput by ~10%.
+On Axion (aarch64), there is no measurable difference.
 
 ```bash
 sudo apt-get install -y libgoogle-perftools4t64   # older Ubuntu/Debian: libgoogle-perftools4
@@ -30,8 +30,9 @@ export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
 
 ## Quick Start
 
-See `examples/` for runnable scripts. `LLM` takes `dtype` (`torch.float32` or `torch.bfloat16`),
-`max_num_seqs`, `compile` (default `True`) and `mm_cache_size`:
+The `examples/` directory contains scripts that you can run. `LLM` has these parameters:
+`dtype` (`torch.float32` or `torch.bfloat16`), `max_num_seqs`, `compile` (default `True`)
+and `mm_cache_size`.
 
 ```python
 from transformers import AutoTokenizer
@@ -45,12 +46,11 @@ outputs = llm.generate(request, SamplingParams(max_tokens=64, num_beams=4))
 print(tokenizer.decode(outputs[0].completion_token_ids, skip_special_tokens=True))
 ```
 
-`SamplingParams` fields you leave unset take the checkpoint's
-`generation_config.json` values (beams, `no_repeat_ngram_size`, length penalty, ...),
-as in `transformers`; set only what you want to override.
+If you do not set a `SamplingParams` field, the engine uses the value from the checkpoint's
+`generation_config.json` (beams, `no_repeat_ngram_size`, length penalty, ...), as
+`transformers` does. Set only the fields that you want to change.
 
-Florence-2 takes an image plus a task prompt, and the answer is parsed with the
-processor:
+Florence-2 uses an image and a task prompt. Use the processor to parse the answer:
 
 ```python
 import torch
@@ -75,10 +75,10 @@ parsed = processor.post_process_generation(text, task="<OD>", image_size=image.s
 
 ## How It Works
 
-Reading order: `engine/sequence.py` -> `engine/block_manager.py` ->
+Read the code in this sequence: `engine/sequence.py` -> `engine/block_manager.py` ->
 `engine/scheduler.py` -> `engine/model_runner.py` -> `engine/llm_engine.py` ->
-`layers/attention.py` -> `models/bart.py`. The step-by-step flow is in
-[AGENTS.md section 4](AGENTS.md#4-how-a-step-works).
+`layers/attention.py` -> `models/bart.py`.
+[AGENTS.md section 4](AGENTS.md#4-how-a-step-works) gives the procedure for one step.
 
 ```mermaid
 sequenceDiagram
@@ -110,41 +110,55 @@ sequenceDiagram
     E-->>U: list[RequestOut]
 ```
 
-* **Paged KV cache.** Keys and values live in fixed blocks; beams share blocks and
-  only copy one when they write into a shared block.
-* **Continuous batching.** Requests join and leave the running batch freely.
-* **No padding.** One token per sequence per step, and attention reads exactly the
-  cached length of each sequence, so mixed lengths waste nothing.
-* **Beam search** runs on the same cache, ranked by length-penalised score.
-* **CPU attention.** Decoder self- and cross-attention call `vllm-cpu-attention`
-  (`vllm_cpu_attn`) through opaque `torch.library.custom_op`s so the decoder,
-  LM head, and encoder compile cleanly with Inductor weight freezing.
+* **Paged KV cache.** Keys and values are in blocks of a fixed size. Beams share blocks.
+  A beam copies a shared block only before it writes into that block.
+* **Continuous batching.** A request can go into or out of the batch at each step.
+* **No padding.** Each step feeds one token for each sequence. Attention reads only the
+  cached length of each sequence. Thus mixed lengths do not waste compute.
+* **Beam search.** Beam search uses the same cache. The engine ranks the beams by their
+  score with the length penalty.
+* **CPU attention.** Decoder self-attention and cross-attention call `vllm-cpu-attention`
+  (`vllm_cpu_attn`) through opaque `torch.library.custom_op`s. Thus Inductor can compile
+  the decoder, the LM head and the encoder with frozen weights.
 
 ## Benchmark
 
-Measured on GCP `c4a-standard-8` / `c4a-standard-16` (Arm Neoverse-V2, 8 / 16
-physical cores) and `c4-standard-8` / `c4-standard-16` (Intel Xeon 8581C,
-**4 / 8** physical cores, AMX) with `torch 2.15.0+cpu`, `transformers 5.22.2` and
-`vllm-cpu-attn 0.1.0`, bf16. Both backends on the Xeon boxes run with tcmalloc
-(`LD_PRELOAD`, see Installation). Wall times are not like-for-like across Arm and
-x86: at the same vCPU count the Xeon box has half the physical cores.
+Machines (GCP):
 
-**Continuous batching** (`benchmarks/continuous_batching.py`): 128 Florence-2
-requests (32 COCO images x `<OD>`, `<CAPTION>`, `<DETAILED_CAPTION>`,
-`<REFERRING_EXPRESSION_SEGMENTATION>`, shuffled), up to 512 tokens each, with the
-checkpoint's generation config (`no_repeat_ngram_size=3`, ...) on both backends.
-fast-encdec keeps `--max-num-req` requests in flight and refills a slot as soon as a
-request finishes; its multimodal cache (on by default, cleared before each run)
-runs the vision encoder once per image: 32 misses, 96 hits. HF runs padded batches
-of the same size and encodes every image; 68-81% of its decoded positions are
-padding. Cells are fast-encdec / HF wall time (**speedup**), median of 3 timed runs
-after 1 warmup, and below it fast-encdec / HF generated tokens per second of wall
-time. The fast-encdec Florence-2-large numbers on `c4-standard-16` were re-measured
-on 2026-11-12 with the per-image vision tower and the max-autotune decode graph;
-every other cell predates both. With beam search every request runs as 4
-sequences, so 64 requests
-with beams=4 decode 256 sequences per step. HF OOM: killed by the kernel on the
-30 GB `c4-standard-8`.
+* `c4a-standard-8` / `c4a-standard-16`: Arm Neoverse-V2, 8 / 16 physical cores.
+* `c4-standard-8` / `c4-standard-16`: Intel Xeon 8581C, **4 / 8** physical cores, AMX.
+
+Software: `torch 2.15.0+cpu`, `transformers 5.22.2`, `vllm-cpu-attn 0.1.0`, bf16.
+On the Xeon machines, the two backends use tcmalloc (`LD_PRELOAD`, see Installation).
+
+Do not compare wall times between Arm and x86 directly. For the same vCPU count, the Xeon
+machine has half the physical cores.
+
+### Continuous batching
+
+Script: `benchmarks/continuous_batching.py`.
+
+* Workload: 128 Florence-2 requests, a maximum of 512 tokens each. The requests are
+  32 COCO images x `<OD>`, `<CAPTION>`, `<DETAILED_CAPTION>`,
+  `<REFERRING_EXPRESSION_SEGMENTATION>`, in random order.
+* The two backends use the checkpoint's generation config (`no_repeat_ngram_size=3`, ...).
+* fast-encdec keeps `--max-num-req` requests in the batch. When a request is complete,
+  a new request immediately takes its slot.
+* The multimodal cache of fast-encdec is on (the default) and is cleared before each run.
+  Thus the vision encoder runs one time for each image: 32 misses, 96 hits.
+* HF runs padded batches of the same size and encodes the image of each request.
+  68-81% of its decoded positions are padding.
+* With beam search, each request runs as 4 sequences. Thus 64 requests with beams=4
+  decode 256 sequences in each step.
+
+How to read the cells:
+
+* Line 1: fast-encdec / HF wall time (**speedup**), the median of 3 timed runs after 1 warmup.
+* Line 2: fast-encdec / HF generated tokens for each second of wall time.
+* HF OOM: the kernel stopped the process on the 30 GB `c4-standard-8`.
+* The fast-encdec Florence-2-large numbers on `c4-standard-16` are from 2026-11-12. They
+  include the per-image vision tower and the max-autotune decode graph. All other cells
+  are older than these two changes.
 
 Florence-2-base, greedy:
 
@@ -182,11 +196,17 @@ Florence-2-large, beams=4:
 | 32 | 87.0 s / 558.9 s (**6.42x**)<br>148 / 23 tok/s | 73.1 s / 1038.1 s (**14.20x**)<br>173 / 12 tok/s | 51.5 s / 352.0 s (**6.83x**)<br>249 / 36 tok/s | 35.3 s / 620.9 s (**17.61x**)<br>362 / 20 tok/s |
 | 64 | 85.6 s / 532.6 s (**6.22x**)<br>150 / 24 tok/s | 73.1 s / HF OOM<br>173 / – tok/s | 50.6 s / 341.9 s (**6.76x**)<br>254 / 37 tok/s | 34.6 s / 629.1 s (**18.16x**)<br>371 / 20 tok/s |
 
-**Per stage** (`benchmarks/stage_latency.py`): batch 8; Florence-2-base with
-`<DETAILED_CAPTION>` (590 encoder tokens), BART-large-cnn with 512 encoder tokens.
-The multimodal cache is off here so the vision stage runs every call.
-The decode step is averaged over 128 steps with EOS suppressed; each number is the
-median of 3 timed runs after 1 warmup. Cells are fast-encdec / HF (speedup).
+### Per stage
+
+Script: `benchmarks/stage_latency.py`.
+
+* Batch size: 8.
+* Florence-2-base uses `<DETAILED_CAPTION>` (590 encoder tokens). BART-large-cnn uses
+  512 encoder tokens.
+* The multimodal cache is off. Thus the vision stage runs on each call.
+* The decode step is the average of 128 steps with EOS suppressed.
+* Each number is the median of 3 timed runs after 1 warmup.
+* Each cell shows fast-encdec / HF (speedup).
 
 | stage | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
 |---|---:|---:|---:|---:|
