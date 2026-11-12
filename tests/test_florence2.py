@@ -163,6 +163,36 @@ def main():
         assert list(runner.mm_cache) == [hash_a] and calls == [1, 1, 1, 1], calls
         print("[OK] mm cache: dedup, cross-call hit, LRU eviction, hit stats")
 
+        # Image and <image> tokens must match: none of these may run or pass silently.
+        engine = LLM(tmpdir, max_num_seqs=8, compile=False)
+        text_ids = [t for t in ids_a if t != config.image_token_id]
+        short_ids = list(ids_a)
+        short_ids.remove(config.image_token_id)
+        for request, message in [
+            (Request(ids_a), "given together"),
+            (Request(text_ids, image_a), "given together"),
+            (Request(ids_a, image_a.unsqueeze(0)), "[3, H, W]"),
+        ]:
+            try:
+                engine.add_request(request, params)
+            except ValueError as e:
+                assert message in str(e), (message, e)
+            else:
+                raise AssertionError(f"accepted a bad image request: {message}")
+        # The token count is only known after the vision tower, so these fail in the step.
+        for bad_ids in (short_ids, ids_a + [config.image_token_id]):
+            try:
+                LLM(tmpdir, max_num_seqs=8, compile=False).generate(
+                    [Request(bad_ids, image_a)], params
+                )
+            except ValueError as e:
+                assert "<image> tokens" in str(e), e
+            else:
+                raise AssertionError("accepted a miscounted image prompt")
+        (out,) = engine.generate([Request(text_ids)], params)  # text-only still runs
+        assert out.completion_token_ids
+        print("[OK] image validation: missing, extra, batched and miscounted images")
+
 
 if __name__ == "__main__":
     main()

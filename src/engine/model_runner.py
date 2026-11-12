@@ -197,6 +197,14 @@ class ModelRunner:
                     hidden = self.encode_fn(input_ids)
                 else:
                     image_embeds = torch.stack([embeds[seq.mm_hash] for seq in group])
+                    # masked_scatter would silently truncate or cross-splice images.
+                    image_token_id = self.model.config.image_token_id
+                    num_image_tokens = (input_ids == image_token_id).sum(1)
+                    if (num_image_tokens != image_embeds.shape[1]).any():
+                        raise ValueError(
+                            f"prompt has {num_image_tokens.tolist()} <image> tokens but "
+                            f"the image yields {image_embeds.shape[1]}"
+                        )
                     hidden = self.encode_fn(input_ids, image_embeds=image_embeds)
             # Each request owns ceil(enc_len / block_size) pages; slots are its tokens' places.
             enc_len, block_size = input_ids.shape[1], self.block_size

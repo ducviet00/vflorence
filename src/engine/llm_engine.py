@@ -125,6 +125,14 @@ class LLMEngine:
             raise ValueError(
                 "pixel_values are only supported for Florence-2 checkpoints"
             )
+        if request.pixel_values is not None and request.pixel_values.ndim != 3:
+            raise ValueError(
+                "pixel_values must be one [3, H, W] image, got shape "
+                f"{tuple(request.pixel_values.shape)}"
+            )
+        image_token_id = getattr(self.config.hf_config, "image_token_id", None)
+        if (request.pixel_values is None) != (image_token_id not in request.input_ids):
+            raise ValueError("pixel_values and <image> tokens must be given together")
 
         active = self.scheduler.waiting or self.scheduler.running
         if active and active[0].sampling_params != sampling_params:
