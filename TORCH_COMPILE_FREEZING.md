@@ -1,14 +1,17 @@
 # Why `torch.compile` + graph freezing does (does not) produce `mkldnn._linear_pointwise` weight prepacking
 
-Findings, 2026-10-17. Environment: dev box (AMD Ryzen 7 7840H, Zen 4, `avx512_bf16`,
-no AMX), Python 3.11, **torch 2.14.0+cpu**. The §4.2/§6.1 break-census numbers
+Findings, 2026-10-17, written on torch 2.14; **re-audited 2026-11-12 on torch
+2.15.0+cpu** (the pinned version; Python 3.12) on the dev box (AMD Ryzen 7 7840H,
+Zen 4, `avx512_bf16`, no AMX) and a `c4a-standard-8` (Neoverse-V2, ACL). Source
+line numbers below are from the 2.15 wheel; the audit's corrections are inline
+and its new measurements are in §6.3. The §4.2/§6.1 break-census numbers
 were taken on a dev tree that also carried a (later unmerged) AMX attention
 experiment; this branch carries everything else described here.
 
 Answers for the three questions that motivated this doc:
 
 1. **Does `torch.compile` + graph freezing emit `torch.ops.mkldnn._linear_pointwise`
-   with prepacked weights?** On torch 2.14, **yes** — for bf16, for bf16 under
+   with prepacked weights?** On torch 2.15, **yes** — for bf16, for bf16 under
    `torch.amp.autocast`, and even with dynamic batch sizes. It also does it on
    *this engine*, graph breaks and all: the frozen decoder emits and executes
    **48 packed GEMMs per decoder forward** (runtime-verified). The prior note in
@@ -19,11 +22,11 @@ Answers for the three questions that motivated this doc:
    shattered graph.
 2. **Where does "no `_linear_pointwise`" actually come from?** Five concrete,
    silent traps (§3). The two that apply to us: freezing is *off by default* and
-   in torch 2.14 the weight-pack pass exists **only inside the freezing
+   in torch 2.15 the weight-pack pass exists **only inside the freezing
    pipeline** — `config.cpp.weight_prepack=True` alone does nothing; and
-   compiling a *free function* (the `enable_compile` helpers, the "linear+gelu
-   post-op fusion" plumbing) can never pack because the weights arrive as
-   **user arguments**, not frozen constants.
+   compiling a *free function* over plain weight tensors (the old
+   `enable_compile` helpers) never packs because those weights are **user
+   arguments**, not frozen constants (`nn.Parameter` arguments do pack, §3).
 3. **Do we need `torch.amp()`?** **No.** Autocast is *sufficient* but not
    *necessary*. The pass keys off (weight = frozen constant, dtype bf16/fp16, or
    fp32 with `mkldnn.matmul.fp32_precision` fast-math) — not off autocast.
@@ -31,15 +34,15 @@ Answers for the three questions that motivated this doc:
 
 ---
 
-## 1. The gate chain in torch 2.14 source
+## 1. The gate chain in torch 2.15 source
 
 Weight prepacking on CPU is implemented as *freezing* FX patterns. This is why
 the 2024 blogs' excerpt (`torch/_inductor/mkldnn.py:mkldnn_fuse_fx` /
-`pack_module`) is stale: that entry point no longer exists in 2.14
+`pack_module`) is stale: that entry point no longer exists in 2.15
 (`grep -r mkldnn_fuse_fx torch/_inductor/` → 0 hits).
 
 Decision tree, all paths pinned to the installed source
-(`torch/_inductor/`, line numbers from the installed 2.14 wheel):
+(`torch/_inductor/`, line numbers from the installed 2.15 wheel):
 
 ```
 torch.compile(model)  ──  first forward call is the trigger
@@ -62,17 +65,17 @@ torch.compile(model)  ──  first forward call is the trigger
          → all linears stay `extern_kernels.addmm` (verified on disk)
 ```
 
-- `[*] compile_fx.py:3181`
+- `[*] compile_fx.py:3414`
   `if config.freezing and not torch.is_grad_enabled():` — grad mode is sampled
   **at trace time** (inside the first call). Note that the choice between
   `fw_compiler` (grad) and `inference_compiler` is made here; AOTAutograd later
   picks the inference compiler when the graph doesn't need grad.
-- `[**] fx_passes/freezing_patterns.py:91-101` —
+- `[**] fx_passes/freezing_patterns.py:92-102` —
   `lazy_init()` registers `_mkldnn_weight_pack_init()` **only** if
   `torch._C._has_mkldnn and config.cpp.weight_prepack`; these patterns are
   registered into `pass_patterns[]` which is applied *only* from
   `freezing_passes()` (line 37-89), i.e. only inside `freezing._freeze()`
-  (`freezing.py:74-144`).
+  (`freezing.py:77-147`).
 - `[***] fx_passes/mkldnn_fusion.py:1288-1370` — `_is_packable_linear`:
   - weight arg must be a **graph constant** (`get_attr`) or a `cat` of constants
     (`is_const_or_cat_by_const`, lines 1293-1298) — the frozen params satisfy
@@ -80,10 +83,10 @@ torch.compile(model)  ──  first forward call is the trigger
   - both args 2-D, on CPU, not fp64;
   - fp32 requires MKL (x86) or ACL (aarch64), lines 1332-1339;
   - bf16/fp16 require oneDNN's low-precision support
-    (`is_mkldnn_bf16_supported`, `utils.py:4289`).
+    (`is_mkldnn_bf16_supported`, `utils.py:5220`).
 
-Defaults (torch 2.14, `_inductor/config.py`): `cpp.weight_prepack` is **already
-True** (line 1822); `freezing` is **False** (line 1672) — so of the pair in the
+Defaults (`_inductor/config.py`): `cpp.weight_prepack` is **already
+True** (line 1971); `freezing` is **False** (line 1821) — so of the pair in the
 classic recipe, the relay that actually matters is `freezing`.
 
 ## 2. Which packed op you get, by dtype
@@ -96,7 +99,7 @@ From `mkldnn_fusion.py:109-159` (`pack_linear_weight` / `pack_linear`):
 | fp32 | `torch._C.has_mkl` and no fast-math | `torch.ops.mkl._mkl_linear` |
 | fp32 | `torch.backends.mkldnn.matmul.fp32_precision ∈ {bf16, tf32}`* | `torch.ops.mkldnn._linear_pointwise` |
 | fp32 on aarch64 | ACL supported | `torch.ops.mkldnn._linear_pointwise` |
-| dynamic batch (`has_free_symbols`) | linear kernels only | force the mkldnn path (`reorder` with `optimization_hint(batch)`) |
+| any dtype, dynamic batch (`has_free_symbols`) | — | `torch.ops.mkldnn._linear_pointwise` (weight reordered with `optimization_hint(batch)`); so fp32 uses MKL only in static graphs |
 
 \* this is exactly the setting the AWS Graviton blog imports via
 `DNNL_DEFAULT_FPMATH_MODE=BF16`; setting
@@ -112,7 +115,7 @@ fast-math/autocast is itself a mistaken expectation — you get `mkl._mkl_linear
 
 Each one exercised on this box (see §4 evidence column):
 
-1. **`config.freezing` not set** (torch 2.14 default False, `config.py:1672`).
+1. **`config.freezing` not set** (default False, `config.py:1821`).
    The pack pass lives only in the freeze pipeline; `weight_prepack=True` alone
    does nothing, and the GEMMs compile to plain `extern_kernels.addmm`.
 2. **The first (compiling) call made with grad enabled** — `freezing` silently
@@ -120,12 +123,11 @@ Each one exercised on this box (see §4 evidence column):
    *call made under `no_grad`* afterwards recompiles with guards on grad mode
    and packs then, so you pay for two compiles instead of one (24-pack before
    and 24 after; useful first-call lesson, not a correctness trap).
-3. **`torch.compile` over a free function** (weights are plain *user args*,
-   e.g. our `models/bart.py:enable_compile` helpers `_add_layer_norm(x, …, w, b)`
-   or the "fuse linear+gelu" helper idea): `params_flat` is empty, weights are
-   never frozen constants, `is_const_or_cat_by_const` fails → **zero packing**.
-   This is inherent, not fixable by flags; the model's own forward must be the
-   compiled entry point so AOT sees module parameters.
+3. **`torch.compile` over a free function whose weights are plain tensors**
+   (passed as arguments or captured in a closure): they are never frozen
+   constants, `is_const_or_cat_by_const` fails → **zero packing** (measured 0/2).
+   `nn.Parameter`s passed as arguments *are* frozen and packed (measured 2/2 and
+   24/24), so this is about the tensor type, not about free functions as such.
 4. **Manual prepacking (`layers/packed_linear.py`) replaces `nn.Linear.forward`
    with a closure wrapped in `@torch.compiler.disable`.** Those GEMMs are
    invisible to Dynamo by construction — Inductor cannot pack weights it never
@@ -161,7 +163,8 @@ node rewritten to `reorder_linear_weight (+ bias) + pointwise linear`.
 | fp32 + `mkldnn.matmul.fp32_precision="bf16"` | 24 | `_linear_pointwise` | — | — |
 | bf16 + `dynamic=True`, batch 8/1/3 | 24 | `_linear_pointwise` | 4.48 | 6.04 |
 | bf16 + opaque-packaged weights + explicit `_linear_pointwise`, **no** `compiler.disable` | n/a | `_linear_pointwise` extern (60× in code) | 4.58 | 4.53 |
-| `torch.compile` over a free function (weights = args) | **0** | plain `mm`/`addmm` externs | — | — |
+| `torch.compile` over a free function, weights = plain tensor args | **0** | plain `mm`/`addmm` externs | — | — |
+| same, weights = `nn.Parameter` args | 24 | `_linear_pointwise` | 4.60 | 5.82 |
 
 Blogs' environment check: the same recipe was measured on Graviton (ACL) and on
 x86 with `DNNL_DEFAULT_FPMATH_MODE` (cf. §2); those posts show the packed op
@@ -274,33 +277,44 @@ compiles too and verifies **token-exact vs HF**).  What built on §6.1:
 
 - **Two or three graphs per runner**, all wrapped in
   `torch._inductor.config.patch(freezing=True)` contexts:
-  `model.forward` = decoder + `compute_logits` (lm head packs inside the graph —
-  72 `_linear_pointwise`, 0 `aten.addmm`; dynamic B: one artifact for every
-  batch size), `model.encode` (the encoder GEMMs, dynamic over batch + encoder
-  length), and for Florence-2 the vision tower + projector
+  `model.forward` = decoder + lm head (packs inside the graph —
+  73 `_linear_pointwise`, 0 `aten.addmm`; dynamic B: one artifact for every
+  batch size >= 2 plus one for batch 1, Dynamo's 0/1 specialization),
+  `model.encode` (48 encoder GEMMs, dynamic over batch + encoder length), and
+  for Florence-2 the vision tower + projector
   (`get_image_features`, its own **static** graph — see below).
 - **Semantics preserved**: the CUDA decode path is untouched (`use_cudagraph`
   captures the eager decoder); a batch of separate LLM instances co-exists —
-  now with the Dynamo budget to match: each engine costs ~4 cache entries (two
-  frames × the batch-1 specialization), so `ModelRunner.__init__` raises
-  `torch._dynamo.config.recompile_limit` to `2 * engines + 4`.  Without that, a
-  process with six engines (the default `benchmark.py` run) silently ran the
-  last two eager.
-- **The compile is once per *engine*, ~4 s at cache hit** (the graph is guarded
-  on weight identity, so a new model re-traces even on an artifact-cache hit);
-  first run pays ~10-25 s per graph (Inductor compile_threads capped at 4 so the
+  now with the Dynamo budget to match. `encode` and the vision tower are bound
+  methods, so they share **one** Dynamo frame (`external_utils.inner`): per
+  engine up to 4 encode graphs (batch 1 / >1, with / without image) plus one
+  tower graph per image shape, next to 2 on `forward`. `ModelRunner._compile`
+  raises `torch._dynamo.config.recompile_limit` to `8 * engines`; past the
+  limit Dynamo silently runs eager.
+- **The compile is once per *engine* and once per *process*.** Frozen graphs
+  bypass the Inductor FX graph cache (`fxgraph_cache_bypass` on every graph), so
+  only the C++ kernels are reused: bart-large bf16 measured 19.9 s + 11.8 s
+  (batch>=2 pair, then batch-1 pair) in a second process against 27.7 s + 13.9 s
+  cold; budget ~10-25 s per graph (Inductor compile_threads capped at 4 so the
   parallel C++ workers don't spike GBs on small boxes).
 - Benchmark table: the new dev-box baseline in `AGENTS.md` ("Benchmark
   baseline") records this state.  The per-shape memory bound measured above
   (0.74 GB bf16 / 1.6 GB fp32 per STATIC artifact for bart-large) is real; the
   decode and all text-encoder graphs are therefore `dynamic=True` (one artifact
-  across all batch sizes / encoder lengths).  Only the Florence-2 tower compiles
+  across all batch sizes >= 2 / encoder lengths).  Only the Florence-2 tower compiles
   static, because dynamic convs mis-stride DaViT (`assert_tensor_metadata`
-  failures in the generated kernel) — the runner keeps it out of the text
+  failures in the generated kernel); `_image_embeds` therefore always calls it
+  with **one image**, otherwise every distinct number of cache misses is its own
+  ~20 s / ~230 MB graph. Batching buys nothing anyway: at 16 and 32 images a
+  static batched graph was 1.2-1.9x slower per image on a Xeon 8581C and
+  1.1-1.2x slower on Axion (Florence-2 base and large; only Axion fp32 base was
+  4% faster), with bit-identical output. The runner keeps the tower out of the text
   graph (it passes precomputed `image_embeds` into `encode`) so the two do not
   contaminate each other.
-- fp32 token-exactness: the freezing pack on fp32 lowers to `mkl._mkl_linear`
-  (a fused MKL GEMM) — verified token-for-token equal vs HF on BART beams=1/4,
+- fp32 token-exactness: on x86 the freezing pack on fp32 lowers to
+  `mkl._mkl_linear` only in the static batch-1 graph; the dynamic batch>=2
+  graphs (and everything on aarch64) use oneDNN `_linear_pointwise` — verified
+  token-for-token equal vs HF on BART beams=1/4,
   Florence beams=1/3 (`verify_parity.py --dtype float32`).
 - `verify_parity.py` now runs each (model, beams) phase in its own subprocess
   (fp32's two engines + reference + artifacts only fit an 11 GB box one phase
@@ -316,6 +330,34 @@ A third round (the "clean tensor API" refactor) moved the op bodies out of
 `layers/attention.py` into `layers/cpu_ops.py` and replaced the layer registry
 with per-step state the runner stages; §6.1's description of *those* two
 mechanisms is historical, and the note at the top of the section says so.
+
+### 6.3 Audit measurements (2026-11-12, torch 2.15)
+
+bart-large-cnn, 8 threads, 256-token encoder input, 64 greedy steps; decode
+ms/step. The laptop numbers are smoke-scale.
+
+| box, dtype | batch | eager | compiled (default) | frozen batch 1 | max-autotune, frozen batch 1 |
+|---|---|---:|---:|---:|---:|
+| Axion bf16 | 8 | 17.7 | 11.7 | 11.7 | 11.3 |
+| Axion bf16 | 1 | 7.1 | 6.4 (unfrozen) | 9.3 | 9.3 |
+| Axion fp32 | 8 | 24.4 | 19.2 | 19.8 | 19.3 |
+| Axion fp32 | 1 | 9.1 | 8.0 (unfrozen) | 12.0 | 8.0 |
+| Zen 4 laptop bf16 | 8 | 21.1 | 15.8 | same | 15.6 |
+| Zen 4 laptop bf16 | 1 | 13.9 | 13.3 | same | 10.3 |
+
+- **Unfrozen batch-1 decode on aarch64** (`_UNFROZEN_SINGLE_ROW` in
+  `engine/model_runner.py`): a packed weight is slower than a plain one for a
+  single row under ACL, so that graph compiles with `freezing=False`.
+- **`mode="max-autotune"`** (Inductor's C++ GEMM template, autotuned per GEMM
+  against the packed op) does not replace that: torch 2.15 has NEON/SVE
+  micro-kernels for fp32 only, and the Axion bf16 run selected zero template
+  kernels. On Axion fp32 it matches the unfrozen graph; on x86 bf16 it helps
+  batch 1 only (-22% on the laptop). It costs 2-4x the compile time (61 s +
+  52 s against 20 s + 12 s on the laptop) and picks kernels by timing them, so
+  it is not the default.
+- **Memory**: every frozen graph keeps its own packed copy of the weights.
+  bart-large bf16 (~0.8 GB of weights) grew RSS by ~1.0 GB for the batch>=2
+  graphs and ~0.7 GB more for the batch-1 graphs on x86.
 
 ### 6.1 The landed state (compile_model=True, bf16 CPU) — second round
 
@@ -418,9 +460,7 @@ print(
 #   $ TORCH_LOGS=+output_code python this_script.py 2>&1 | grep -E "_linear_pointwise|_mkl_linear"
 ```
 
-Full experiment scripts (toy grid, engine timing, engine runtime profile) are
-kept in `/tmp/opencode` (`prepack_recipes.py`, `engine_compile.py`,
-`engine_ops.py`); expected results in §4.
+The original experiment scripts were not kept; expected results are in §4 and §6.3.
 
 - Counters meanings: `mkldnn_linear_weight_pack_matcher_count` = one per
   `aten.mm`/`aten.addmm` node rewritten into
@@ -450,14 +490,14 @@ kept in `/tmp/opencode` (`prepack_recipes.py`, `engine_compile.py`,
   executed within `torch.no_grad`", example wrapped in
   `torch.no_grad(), torch.cpu.amp.autocast(bf16)`:
   https://docs.pytorch.org/tutorials/unstable/max_autotune_on_CPU_tutorial.html
-- Source (torch 2.14 layout, same files in the installed wheel):
-  - `torch/_inductor/config.py` (1672: `freezing` default False; 1822:
+- Source (line numbers from the torch 2.15 wheel):
+  - `torch/_inductor/config.py` (1821: `freezing` default False; 1971:
     `cpp.weight_prepack` default True)
-  - `torch/_inductor/compile_fx.py:3181` — the `freezing and not grad_enabled`
-    gate; `:2308` `fw_compiler_freezing`
-  - `torch/_inductor/freezing.py:74-144` — `freeze`/`_freeze`, params→constants
-  - `torch/_inductor/fx_passes/freezing_patterns.py:37-101` — the pass
+  - `torch/_inductor/compile_fx.py:3414` — the `freezing and not grad_enabled`
+    gate; `:2516` `fw_compiler_freezing`
+  - `torch/_inductor/freezing.py:77-147` — `freeze`/`_freeze`, params→constants
+  - `torch/_inductor/fx_passes/freezing_patterns.py:37-102` — the pass
     registration home of weight packing
   - `torch/_inductor/fx_passes/mkldnn_fusion.py` (109-159 op choice; 1288-1370
-    `_is_packable_linear`; 1510-1574 the `addmm`/`mm` patterns)
+    `_is_packable_linear`; 1403 `_register_weight_pack_pass`, the `addmm`/`mm` patterns)
   - `torch/_dynamo/config.py:121` — `recompile_limit = 8`

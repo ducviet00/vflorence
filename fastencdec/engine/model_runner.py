@@ -16,13 +16,10 @@ from ..utils.loader import load_hf_weights
 logger = logging.getLogger(__name__)
 _COMPILED_RUNNERS = 0
 
-# On aarch64 with torch >= 2.15, oneDNN runs a plain (unpacked) weight fastest for
-# one row, so the batch-1 decode graph is compiled without freezing (weight packing).
+# On aarch64, oneDNN runs a plain (unpacked) weight fastest for one row, so the
+# batch-1 decode graph is compiled without freezing (weight packing).
 # Batch 1 is its own graph anyway (Dynamo's 0/1 specialization).
-_UNFROZEN_SINGLE_ROW = (
-    platform.machine().lower() in ("arm64", "aarch64")
-    and torch.torch_version.TorchVersion(torch.__version__) >= "2.15"
-)
+_UNFROZEN_SINGLE_ROW = platform.machine().lower() in ("arm64", "aarch64")
 
 
 class ModelRunner:
@@ -106,10 +103,11 @@ class ModelRunner:
     def _compile(self) -> None:
         global _COMPILED_RUNNERS
         _COMPILED_RUNNERS += 1
-        # Each engine adds ~4 Dynamo cache entries; past the limit Dynamo silently
-        # falls back to eager.
+        # encode and the vision tower share one Dynamo frame: per engine up to 4 encode
+        # graphs (batch 1 / >1, with / without image) + one tower graph per image shape.
+        # Past the limit Dynamo silently falls back to eager.
         torch._dynamo.config.recompile_limit = max(
-            torch._dynamo.config.recompile_limit, 2 * _COMPILED_RUNNERS + 4
+            torch._dynamo.config.recompile_limit, 8 * _COMPILED_RUNNERS
         )
         # Parallel C++ compile workers use GBs of RAM on small machines.
         torch._inductor.config.compile_threads = min(
@@ -151,15 +149,11 @@ class ModelRunner:
             else:
                 misses[key] = seq.pixel_values
                 self.mm_cache_misses += 1
-        # Batch misses of equal shape into one vision-encoder call; different shapes can't be stacked.
-        by_shape = defaultdict(list)
+        # One image per call: the tower graph is static, so every batch size would be
+        # its own ~20 s compile (and batching measured slower per image).
         for key, px in misses.items():
-            by_shape[px.shape].append(key)
-        for keys in by_shape.values():
             with self._inductor_ctx():
-                out = self.image_fn(torch.stack([misses[k] for k in keys]))
-            for key, emb in zip(keys, out):
-                embeds[key] = emb.clone()  # own storage, not a view of the batch
+                embeds[key] = self.image_fn(px.unsqueeze(0))[0]
         # Store everything and evict the least recently used entries beyond the cache size.
         if self.mm_cache_size:
             # Update recency in request order, so hits and misses rank by last use.
