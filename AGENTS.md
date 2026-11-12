@@ -14,7 +14,7 @@ encoder-decoder decoding on CPU:
   batches waste no compute.
 - **Greedy and beam search** on top of the same paged cache.
 - **FP32 and BF16** (`torch.float32`, `torch.bfloat16`).
-- **Frozen `torch.compile` on CPU** paired with [`vllm-cpu-attention`](https://github.com/ducviet00/vllm-cpu-attention) (`vllm_cpu_attn`). One dynamic graph covers decoder + lm head and one the encoder; Inductor weight-freezing packs every GEMM into oneDNN's blocked layouts (BF16 `avx512_core_bf16` / AMX on modern x86, ACL on aarch64), while decoder self- and cross-attention run through opaque `torch.library.custom_op`s backed by `vllm_cpu_attn`.
+- **Frozen `torch.compile` on CPU** paired with [`vllm-cpu-attention`](https://github.com/ducviet00/vllm-cpu-attention) (`vllm_cpu_attn`). One dynamic graph covers decoder + lm head and one the encoder; Inductor weight-freezing packs every GEMM into oneDNN's blocked layouts (BF16 `avx512_core_bf16` / AMX on modern x86, ACL on aarch64), while decoder self- and cross-attention run through opaque `torch.library.custom_op`s backed by `vllm_cpu_attn`. On x86 BF16 the decode graph also compiles with `mode="max-autotune"` (Inductor's C++ GEMM template where it beats oneDNN).
 
 The model (`fastencdec/models/bart.py`) is a near-verbatim copy of the
 HuggingFace BART reference; the attention kernels differ, and the attention

@@ -113,8 +113,17 @@ class ModelRunner:
         torch._inductor.config.compile_threads = min(
             4, torch._inductor.config.compile_threads
         )
+        # x86 bf16 decode: autotune each GEMM between oneDNN and Inductor's C++ template
+        # (12-24% faster per step on a Xeon 8581C, ~2x the compile time). Measured no
+        # gain for the encoder, the vision tower, fp32 on x86, or bf16 on aarch64.
+        autotune = self.dtype == torch.bfloat16 and platform.machine().lower() in (
+            "x86_64",
+            "amd64",
+        )
         # One dynamic graph covers every batch size / encoder length.
-        self.decode_fn = torch.compile(self.model, dynamic=True)
+        self.decode_fn = torch.compile(
+            self.model, dynamic=True, mode="max-autotune" if autotune else None
+        )
         self.encode_fn = torch.compile(self.model.encode, dynamic=True)
         if self.image_fn is not None:
             self.image_fn = torch.compile(self.image_fn, dynamic=False)
