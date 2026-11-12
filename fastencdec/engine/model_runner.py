@@ -81,21 +81,24 @@ class ModelRunner:
             layer.encoder_attn.v_cache = torch.zeros(cross, dtype=self.dtype)
 
         weight_bytes = sum(
-            t.numel() * t.element_size()
-            for t in (*self.model.parameters(), *self.model.buffers())
+            t.nbytes for t in (*self.model.parameters(), *self.model.buffers())
         )
-        kv_bytes = sum(
-            c.numel() * c.element_size()
-            for layer in self.decoder_layers
-            for attn in (layer.self_attn, layer.encoder_attn)
-            for c in (attn.k_cache, attn.v_cache)
+        self_kv, cross_kv = (
+            sum(attn.k_cache.nbytes + attn.v_cache.nbytes for attn in attns)
+            for attns in (
+                [layer.self_attn for layer in self.decoder_layers],
+                [layer.encoder_attn for layer in self.decoder_layers],
+            )
         )
+        mb = 1024**2
         logger.info(
-            "Allocated %.1f MB (weights %.1f MB + KV cache %.1f MB, %d self + %d cross blocks of %d tokens)",
-            (weight_bytes + kv_bytes) / (1024**2),
-            weight_bytes / (1024**2),
-            kv_bytes / (1024**2),
+            "Allocated %.1f MB: weights %.1f MB, self KV %.1f MB (%d blocks), "
+            "cross KV %.1f MB (%d blocks), %d tokens per block",
+            (weight_bytes + self_kv + cross_kv) / mb,
+            weight_bytes / mb,
+            self_kv / mb,
             self.config.num_blocks,
+            cross_kv / mb,
             self.config.num_cross_blocks,
             self.block_size,
         )
