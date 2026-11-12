@@ -12,7 +12,7 @@ from benchmarks import continuous_batching, stage_latency, utils
 
 
 class BenchmarkTests(unittest.TestCase):
-    def test_timed_returns_best_and_last(self):
+    def test_timed_returns_median_and_last(self):
         calls = iter(range(10))
         seconds, last = utils.timed(lambda: next(calls), warmup=2, repeats=3)
         self.assertEqual(last, 4)

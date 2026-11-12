@@ -127,56 +127,70 @@ physical cores) and `c4-standard-8` / `c4-standard-16` (Intel Xeon 8581C,
 (`LD_PRELOAD`, see Installation). Wall times are not like-for-like across Arm and
 x86: at the same vCPU count the Xeon box has half the physical cores.
 
-**Continuous batching** (`benchmarks/continuous_batching.py`): 128 Florence-2-base
-requests (32 COCO images x `<OD>`, `<OCR>`, `<DETAILED_CAPTION>`,
-`<REFERRING_EXPRESSION_SEGMENTATION>`, shuffled), up to 512 tokens each.
+**Continuous batching** (`benchmarks/continuous_batching.py`): 128 Florence-2
+requests (32 COCO images x `<OD>`, `<CAPTION>`, `<DETAILED_CAPTION>`,
+`<REFERRING_EXPRESSION_SEGMENTATION>`, shuffled), up to 512 tokens each, with the
+checkpoint's generation config (`no_repeat_ngram_size=3`, ...) on both backends.
 fast-encdec keeps `--max-num-req` requests in flight and refills a slot as soon as a
 request finishes; its multimodal cache (on by default, cleared before each run)
 runs the vision encoder once per image: 32 misses, 96 hits. HF runs padded batches
-of 8 and encodes every image, and 64-71% of its decoded positions are padding.
-HF takes a long time, so it is only benchmarked at batch size 8 for now; every
-speedup is fast-encdec over HF batch 8 on the same machine, by wall time. Cells are
-wall time and generated tokens/s. Greedy: one timed run after 3 warmup runs;
-beams=4: best of 2 timed runs after 1 warmup run.
+of the same size and encodes every image; 68-81% of its decoded positions are
+padding. Cells are fast-encdec / HF wall time (**speedup**), median of 3 timed runs
+after 1 warmup. With beam search every request runs as 4 sequences, so 64 requests
+with beams=4 decode 256 sequences per step. HF OOM: killed by the kernel on the
+30 GB `c4-standard-8`.
 
-With beam search every request runs as 4 sequences, so `max num seq` 64 with
-beams=4 decodes 64 x 4 = 256 sequences per step, not 64 as with greedy.
+Florence-2-base, greedy:
 
-Greedy:
-
-| max num seq | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
+| max num req | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
 |---|---:|---:|---:|---:|
-| 8 | 26.1 s, 509 tok/s (**4.26x**) | 20.7 s, 649 tok/s (**5.45x**) | 18.3 s, 723 tok/s (**4.50x**) | 14.4 s, 954 tok/s (**4.86x**) |
-| 16 | 23.9 s, 554 tok/s (**4.64x**) | 18.9 s, 719 tok/s (**5.96x**) | 15.6 s, 852 tok/s (**5.28x**) | 12.5 s, 1091 tok/s (**5.60x**) |
-| 32 | 22.4 s, 591 tok/s (**4.95x**) | 17.6 s, 775 tok/s (**6.40x**) | 14.0 s, 946 tok/s (**5.87x**) | 10.5 s, 1287 tok/s (**6.65x**) |
-| 64 | – | – | 13.5 s, 978 tok/s (**6.07x**) | 10.0 s, 1349 tok/s (**6.99x**) |
-| HF, batch 8 | 110.9 s, 123 tok/s | 112.7 s, 119 tok/s | 82.2 s, 166 tok/s | 69.8 s, 192 tok/s |
+| 8 | 27.4 s / 113.6 s (**4.14x**) | 26.2 s / 128.8 s (**4.91x**) | 20.7 s / 90.9 s (**4.39x**) | 15.2 s / 69.5 s (**4.57x**) |
+| 16 | 25.0 s / 97.5 s (**3.89x**) | 21.9 s / 113.4 s (**5.17x**) | 17.7 s / 73.6 s (**4.15x**) | 12.5 s / 65.8 s (**5.27x**) |
+| 32 | 22.7 s / 89.8 s (**3.95x**) | 20.1 s / 117.0 s (**5.81x**) | 15.5 s / 63.2 s (**4.07x**) | 10.9 s / 69.6 s (**6.37x**) |
+| 64 | 23.2 s / 78.9 s (**3.40x**) | 19.3 s / 108.4 s (**5.63x**) | 15.3 s / 50.5 s (**3.30x**) | 10.3 s / 62.1 s (**6.02x**) |
 
-Beams=4 (sequences in flight = 4 x max num seq):
+Florence-2-base, beams=4:
 
-| max num seq | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
+| max num req | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
 |---|---:|---:|---:|---:|
-| 8 | 46.8 s, 392 tok/s (**5.29x**) | 40.7 s, 477 tok/s (**9.37x**) | 34.0 s, 540 tok/s (**5.88x**) | 26.6 s, 736 tok/s (**9.60x**) |
-| 16 | 41.2 s, 445 tok/s (**6.01x**) | 35.6 s, 543 tok/s (**10.70x**) | 26.1 s, 702 tok/s (**7.66x**) | 21.6 s, 888 tok/s (**11.84x**) |
-| 32 | 37.7 s, 486 tok/s (**6.57x**) | 33.4 s, 571 tok/s (**11.40x**) | 23.1 s, 792 tok/s (**8.64x**) | 20.0 s, 951 tok/s (**12.79x**) |
-| 64 | – | – | 21.4 s, 855 tok/s (**9.32x**) | 19.0 s, 1003 tok/s (**13.49x**) |
-| HF, batch 8 | 247.5 s, 80 tok/s | 381.1 s, 51 tok/s | 199.8 s, 100 tok/s | 255.7 s, 75 tok/s |
+| 8 | 41.6 s / 226.6 s (**5.45x**) | 37.0 s / 357.8 s (**9.66x**) | 31.2 s / 190.2 s (**6.09x**) | 21.3 s / 230.4 s (**10.80x**) |
+| 16 | 35.9 s / 207.2 s (**5.76x**) | 32.3 s / 386.6 s (**11.95x**) | 25.0 s / 166.9 s (**6.68x**) | 18.3 s / 237.2 s (**12.93x**) |
+| 32 | 33.5 s / 219.0 s (**6.54x**) | 30.3 s / 441.9 s (**14.57x**) | 22.8 s / 174.1 s (**7.64x**) | 17.2 s / 278.6 s (**16.23x**) |
+| 64 | 32.5 s / 195.6 s (**6.01x**) | 29.2 s / 435.4 s (**14.93x**) | 21.5 s / 138.7 s (**6.44x**) | 16.4 s / 260.6 s (**15.91x**) |
+
+Florence-2-large, greedy:
+
+| max num req | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
+|---|---:|---:|---:|---:|
+| 8 | 72.1 s / 292.8 s (**4.06x**) | 64.1 s / 276.4 s (**4.31x**) | 48.0 s / 195.5 s (**4.08x**) | 34.5 s / 151.5 s (**4.40x**) |
+| 16 | 69.2 s / 285.0 s (**4.12x**) | 55.0 s / 261.8 s (**4.76x**) | 41.6 s / 169.3 s (**4.07x**) | 28.7 s / 139.8 s (**4.87x**) |
+| 32 | 67.9 s / 267.6 s (**3.94x**) | 50.4 s / 270.3 s (**5.36x**) | 38.6 s / 148.4 s (**3.84x**) | 26.2 s / 143.2 s (**5.47x**) |
+| 64 | 69.5 s / 250.5 s (**3.61x**) | 48.5 s / HF OOM | 38.1 s / 129.9 s (**3.41x**) | 24.7 s / 135.1 s (**5.46x**) |
+
+Florence-2-large, beams=4:
+
+| max num req | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
+|---|---:|---:|---:|---:|
+| 8 | 107.2 s / 488.1 s (**4.55x**) | 84.5 s / 746.8 s (**8.84x**) | 63.9 s / 354.9 s (**5.56x**) | 48.0 s / 468.6 s (**9.77x**) |
+| 16 | 93.9 s / 499.5 s (**5.32x**) | 76.9 s / 842.8 s (**10.96x**) | 54.8 s / 336.3 s (**6.14x**) | 41.5 s / 514.8 s (**12.39x**) |
+| 32 | 87.0 s / 558.9 s (**6.42x**) | 73.1 s / 1038.1 s (**14.20x**) | 51.5 s / 352.0 s (**6.83x**) | 39.2 s / 620.9 s (**15.83x**) |
+| 64 | 85.6 s / 532.6 s (**6.22x**) | 73.1 s / HF OOM | 50.6 s / 341.9 s (**6.76x**) | 36.9 s / 629.1 s (**17.05x**) |
 
 **Per stage** (`benchmarks/stage_latency.py`): batch 8; Florence-2-base with
 `<DETAILED_CAPTION>` (590 encoder tokens), BART-large-cnn with 512 encoder tokens.
 The multimodal cache is off here so the vision stage runs every call.
-The decode step is averaged over 128 steps with EOS suppressed. 8-vCPU boxes;
-cells are fast-encdec / HF (speedup).
+The decode step is averaged over 128 steps with EOS suppressed; each number is the
+median of 3 timed runs after 1 warmup. Cells are fast-encdec / HF (speedup).
 
-| stage | c4a-standard-8 | c4-standard-8 |
-|---|---:|---:|
-| Florence-2 vision | 2231 / 2233 ms (1.00x) | 1529 / 2596 ms (1.70x) |
-| Florence-2 encode | 267 / 262 ms (0.98x) | 160 / 182 ms (1.13x) |
-| Florence-2 decode step, greedy | 6.22 / 11.41 ms (1.83x) | 8.02 / 13.08 ms (1.63x) |
-| Florence-2 decode step, beams=4 | 12.65 / 25.40 ms (2.01x) | 15.58 / 50.28 ms (3.23x) |
-| BART encode | 710 / 724 ms (1.02x) | 386 / 418 ms (1.08x) |
-| BART decode step, greedy | 13.36 / 24.39 ms (1.83x) | 18.26 / 28.08 ms (1.54x) |
-| BART decode step, beams=4 | 27.05 / 54.47 ms (2.01x) | 33.72 / 103.74 ms (3.08x) |
+| stage | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
+|---|---:|---:|---:|---:|
+| Florence-2 vision | 2240 / 2412 ms (1.08x) | 1505 / 2582 ms (1.72x) | 1166 / 1176 ms (1.01x) | 703 / 1348 ms (1.92x) |
+| Florence-2 encode | 268 / 280 ms (1.04x) | 160 / 185 ms (1.15x) | 144 / 145 ms (1.01x) | 81.1 / 90.1 ms (1.11x) |
+| Florence-2 decode step, greedy | 6.79 / 11.64 ms (1.71x) | 7.69 / 13.14 ms (1.71x) | 6.16 / 9.93 ms (1.61x) | 4.52 / 7.31 ms (1.62x) |
+| Florence-2 decode step, beams=4 | 13.0 / 25.3 ms (1.95x) | 13.4 / 45.4 ms (3.37x) | 11.6 / 22.0 ms (1.90x) | 7.36 / 28.45 ms (3.87x) |
+| BART encode | 731 / 745 ms (1.02x) | 379 / 422 ms (1.11x) | 375 / 376 ms (1.00x) | 192 / 217 ms (1.13x) |
+| BART decode step, greedy | 13.4 / 25.2 ms (1.88x) | 18.9 / 28.5 ms (1.50x) | 11.4 / 20.9 ms (1.83x) | 9.88 / 16.18 ms (1.64x) |
+| BART decode step, beams=4 | 28.0 / 54.6 ms (1.95x) | 31.4 / 91.0 ms (2.90x) | 19.6 / 45.0 ms (2.30x) | 17.5 / 58.5 ms (3.34x) |
 
 ## Tests & Benchmarks
 

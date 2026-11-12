@@ -1,6 +1,7 @@
 """Image loading and timing shared by the benchmarks."""
 
 import os
+import statistics
 import time
 import urllib.request
 from urllib.parse import urlparse
@@ -9,15 +10,15 @@ from PIL import Image
 
 
 def timed(fn, warmup: int, repeats: int):
-    """Run ``fn`` warmup + repeats times; return (best seconds, last result)."""
+    """Run ``fn`` warmup + repeats times; return (median seconds, last result)."""
     for _ in range(warmup):
         fn()
-    best, result = float("inf"), None
+    times, result = [], None
     for _ in range(repeats):
         start = time.perf_counter()
         result = fn()
-        best = min(best, time.perf_counter() - start)
-    return best, result
+        times.append(time.perf_counter() - start)
+    return statistics.median(times), result
 
 
 def load_image(url: str, cache_dir: str = "/tmp/fastencdec/coco") -> Image.Image:
