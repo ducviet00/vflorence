@@ -1,7 +1,7 @@
 """Continuous batching vs padded batches: Florence-2, 32 real images x 4 tasks.
 
 Requests are shuffled once (seed 42) and mix long tasks (<OD>, segmentation)
-with short ones (<OCR>, <DETAILED_CAPTION>). ``--backend fast`` keeps
+with short ones (<CAPTION>, <DETAILED_CAPTION>). ``--backend fast`` keeps
 ``--max-num-req`` requests in flight and refills a slot as soon as a request
 finishes; ``--backend hf`` runs the same requests as back-to-back padded
 batches of ``--max-num-req``. One backend/config per run -- run twice and compare.
@@ -11,6 +11,8 @@ batches of ``--max-num-req``. One backend/config per run -- run twice and compar
 """
 
 import argparse
+import math
+import platform
 import random
 
 import torch
@@ -52,7 +54,12 @@ IMAGE_URLs = [  # (image URL, referring expression)
     ("http://images.cocodataset.org/val2017/000000002685.jpg", "the woman in black"),
 ]
 
-TASKS = ["<OD>", "<OCR>", "<DETAILED_CAPTION>", "<REFERRING_EXPRESSION_SEGMENTATION>"]
+TASKS = [
+    "<OD>",
+    "<CAPTION>",
+    "<DETAILED_CAPTION>",
+    "<REFERRING_EXPRESSION_SEGMENTATION>",
+]
 
 
 def prepare_inputs(processor, num_requests):
@@ -84,9 +91,14 @@ def prepare_inputs(processor, num_requests):
 def run_fast(args, input_token_ids, pixels, dtype):
     from fastencdec import LLM, Request, SamplingParams
 
+    max_num_seqs = args.max_num_req * args.beamsearch
+    # The default KV cache covers max_position_embeddings per sequence (4096 on
+    # Florence-2-large: ~26 GB at 128 seqs); size it for max_tokens instead.
+    block_size = 16 if platform.machine().lower() in ("arm64", "aarch64") else 32
     llm = LLM(
         args.model,
-        max_num_seqs=args.max_num_req * args.beamsearch,
+        max_num_seqs=max_num_seqs,
+        num_blocks=max_num_seqs * (math.ceil((args.max_tokens + 2) / block_size) + 1),
         dtype=dtype,
         mm_cache_size=args.mm_cache_size,
     )
@@ -176,8 +188,8 @@ def main():
     ap.add_argument(
         "--mm-cache-size", type=int, default=256, help="fast only; 0 disables"
     )
-    ap.add_argument("--warmup", type=int, default=3)
-    ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument("--warmup", type=int, default=1)
+    ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--model", default="florence-community/Florence-2-base")
     args = ap.parse_args()
     if args.num_req < 1 or args.max_num_req < 1 or args.beamsearch < 1:

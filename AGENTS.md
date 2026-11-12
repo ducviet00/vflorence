@@ -205,5 +205,5 @@ PYTHONPATH=. $P benchmarks/continuous_batching.py --backend fast --beamsearch 1 
   benchmarks used to force 0 on both backends), so do not override it to 0 for
   this model. With 3, fast and HF agree on 128 requests (bf16, `c4a-standard-8`,
   2026-11-11): no `<s>` loops, 95/128 rows identical, the rest bf16 near-tie
-  drift. Benchmark numbers recorded before this change used
-  `no_repeat_ngram_size=0` / `early_stopping=False` and need a re-run.
+  drift. The README benchmark numbers (re-run 2026-11-11) use the checkpoint's
+  generation config on both backends.
