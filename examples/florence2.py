@@ -7,8 +7,7 @@ import requests
 import torch
 from PIL import Image
 from transformers import AutoProcessor
-
-from src import LLM, Request, SamplingParams
+from vflorence import LLM, Request, SamplingParams
 
 MODEL = "florence-community/Florence-2-base"
 URL = (
@@ -37,5 +36,5 @@ def main():
 
 if __name__ == "__main__":
     logging.basicConfig(format="%(name)s: %(message)s")
-    logging.getLogger("src").setLevel(logging.INFO)  # memory usage
+    logging.getLogger("vflorence").setLevel(logging.INFO)  # memory usage
     main()

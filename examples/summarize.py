@@ -4,8 +4,7 @@ import logging
 import time
 
 from transformers import AutoTokenizer
-
-from src import LLM, Request, SamplingParams
+from vflorence import LLM, Request, SamplingParams
 
 MODEL = "facebook/bart-large-cnn"
 ARTICLE = (
@@ -38,5 +37,5 @@ def main():
 
 if __name__ == "__main__":
     logging.basicConfig(format="%(name)s: %(message)s")
-    logging.getLogger("src").setLevel(logging.INFO)  # memory usage
+    logging.getLogger("vflorence").setLevel(logging.INFO)  # memory usage
     main()

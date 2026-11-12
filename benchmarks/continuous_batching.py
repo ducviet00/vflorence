@@ -87,7 +87,7 @@ def prepare_inputs(processor, num_requests):
 
 
 def run_fast(args, input_token_ids, pixels, dtype):
-    from src import LLM, Request, SamplingParams
+    from vflorence import LLM, Request, SamplingParams
 
     max_num_seqs = args.max_num_req * args.beamsearch
     # Size both KV pools for this workload, not max_position_embeddings (4096 on Florence-2-large).
