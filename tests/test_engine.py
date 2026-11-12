@@ -8,14 +8,13 @@ import torch
 from transformers import BartConfig, GenerationConfig
 from transformers import BartForConditionalGeneration as HFBart
 from transformers.generation.logits_process import ForcedEOSTokenLogitsProcessor
-
-from src import LLM, Request, RequestOut, SamplingParams
-from src.config import Config
-from src.engine.sequence import Sequence
-from src.layers.logits_processor import LogitsProcessor
-from src.models.bart import BartForConditionalGeneration
-from src.utils.context import get_context, set_context
-from src.utils.loader import load_hf_weights
+from vflorence import LLM, Request, RequestOut, SamplingParams
+from vflorence.config import Config
+from vflorence.engine.sequence import Sequence
+from vflorence.layers.logits_processor import LogitsProcessor
+from vflorence.models.bart import BartForConditionalGeneration
+from vflorence.utils.context import get_context, set_context
+from vflorence.utils.loader import load_hf_weights
 
 
 def model(activation="gelu"):
@@ -115,7 +114,7 @@ class EngineTests(unittest.TestCase):
         llm = self.engine()
         bad1 = Request([3] * 129)  # longer than max_position_embeddings
         bad2 = Request([4] * 130)
-        with self.assertLogs("src.engine.llm_engine", "ERROR") as logs:
+        with self.assertLogs("vflorence.engine.llm_engine", "ERROR") as logs:
             outs = llm.generate([bad1, REQUEST, bad2], SamplingParams(max_tokens=2))
         self.assertEqual(len(logs.output), 2)
         self.assertIn("encoder prompt", logs.output[0])

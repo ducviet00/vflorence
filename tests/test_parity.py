@@ -11,8 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer
-
-from src import LLM, Request, SamplingParams
+from vflorence import LLM, Request, SamplingParams
 
 MODEL = "hf-internal-testing/tiny-random-BartForConditionalGeneration"
 TEXT = "The quick brown fox jumps over the lazy dog."

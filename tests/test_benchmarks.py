@@ -106,7 +106,7 @@ class BenchmarkTests(unittest.TestCase):
             with self.subTest(vision=pixels is not None):
                 llm = Mock(decoder_start_token_id=2)
                 llm.runner._inductor_ctx.side_effect = nullcontext
-                with patch("src.LLM", return_value=llm):
+                with patch("vflorence.LLM", return_value=llm):
                     stages, generate = stage_latency.fast_stages(
                         args, ids, pixels, torch.float32
                     )

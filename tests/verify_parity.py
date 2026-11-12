@@ -24,8 +24,7 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import torch
-
-from src import LLM, Request, SamplingParams
+from vflorence import LLM, Request, SamplingParams
 
 BART = "facebook/bart-large-cnn"
 FLORENCE = "florence-community/Florence-2-base"

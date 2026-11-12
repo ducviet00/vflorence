@@ -68,7 +68,7 @@ def prepare_inputs(args, florence, dtype):
 
 def fast_stages(args, input_token_ids, pixels, dtype):
     """Return {stage: callable} for vflorence."""
-    from src import LLM, Request, SamplingParams
+    from vflorence import LLM, Request, SamplingParams
 
     llm = LLM(
         args.model,

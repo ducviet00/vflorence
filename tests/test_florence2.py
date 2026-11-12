@@ -17,8 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from transformers import AutoConfig, AutoTokenizer
 from transformers import Florence2ForConditionalGeneration as HFFlorence2
-
-from src import LLM, Request, SamplingParams
+from vflorence import LLM, Request, SamplingParams
 
 MODEL = "hf-tiny-v2/tiny-random-Florence2ForConditionalGeneration"
 

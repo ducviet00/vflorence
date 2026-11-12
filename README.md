@@ -12,11 +12,19 @@ A small CPU inference engine for **BART** and **Florence-2**. The code is easy t
 
 ## Installation
 
+Install into your own project's venv (Python >= 3.12). CPU PyTorch and `vllm-cpu-attn`
+go first, because `vllm-cpu-attn` builds against the installed torch:
+
 ```bash
 uv pip install torch==2.15.0 torchvision setuptools --index-url https://download.pytorch.org/whl/cpu
 uv pip install --no-build-isolation git+https://github.com/ducviet00/vllm-cpu-attention.git
-uv pip install --no-build-isolation -e .
+uv pip install --no-build-isolation git+https://github.com/ducviet00/vflorence.git
 ```
+
+Then `from vflorence import LLM, Request, SamplingParams`. To ship a wheel instead, run
+`uv build --wheel --no-build-isolation` here and install `dist/vflorence-*.whl` the same way.
+To work on vflorence itself, replace the last line with `uv pip install --no-build-isolation -e .`
+in a clone.
 
 **On x86, use tcmalloc.** glibc malloc gives large freed buffers back to the OS. Thus each
 Florence-2 vision forward causes the same page faults again. On Xeon (`c4-standard-8`),
@@ -37,7 +45,7 @@ and `mm_cache_size`.
 ```python
 from transformers import AutoTokenizer
 
-from src import LLM, Request, SamplingParams
+from vflorence import LLM, Request, SamplingParams
 
 tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
 llm = LLM("facebook/bart-large-cnn")
@@ -57,7 +65,7 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor
 
-from src import LLM, Request, SamplingParams
+from vflorence import LLM, Request, SamplingParams
 
 processor = AutoProcessor.from_pretrained("florence-community/Florence-2-base")
 llm = LLM(
