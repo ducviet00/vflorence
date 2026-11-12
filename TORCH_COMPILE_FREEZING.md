@@ -377,7 +377,7 @@ ms/step. The laptop numbers are smoke-scale.
 > **Historical.** The cross-attention *layer registry* this section describes
 > (`register_cross_layer`, the weakref table, the int handle) has since been
 > removed, and the op bodies no longer live in `layers/attention.py`. The
-> current design: the ops are in `fastencdec/layers/cpu_ops.py`, the cross op
+> current design: the ops are in `src/layers/cpu_ops.py`, the cross op
 > takes `(query, layer_idx, scale)`, and the staged encoder K/V it reads comes
 > from `Context.cross_staged`, which `ModelRunner.run` builds with
 > `attention.stage_cross` *before* the forward — outside the graph.  The
@@ -386,7 +386,7 @@ ms/step. The laptop numbers are smoke-scale.
 
 The remaining 53 pybind breaks were removed by wrapping the whole vLLM CPU
 attention branch in two opaque `torch.library.custom_op`s
-(`fastencdec::cpu_vllm_self_attention`, `::cpu_vllm_cross_attention`,
+(`vflorence::cpu_vllm_self_attention`, `::cpu_vllm_cross_attention`,
 registered in `layers/attention.py`), each with a `register_fake` that just
 returns `torch.empty_like(query)`:
 

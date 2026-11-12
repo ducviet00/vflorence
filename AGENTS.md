@@ -1,10 +1,10 @@
-# AGENTS.md — fast-encdec handover
+# AGENTS.md — vflorence handover
 
 Guidance for AI agents (and humans) working on this repository.
 
 ## 1. What this is
 
-`fast-encdec` is a **small, readable CPU inference engine for BART and Florence-2**,
+`vflorence` is a **small, readable CPU inference engine for BART and Florence-2**,
 in the spirit of nano-vllm. It implements only what matters for offline
 encoder-decoder decoding on CPU:
 
@@ -16,15 +16,15 @@ encoder-decoder decoding on CPU:
 - **FP32 and BF16** (`torch.float32`, `torch.bfloat16`).
 - **Frozen `torch.compile` on CPU** paired with [`vllm-cpu-attention`](https://github.com/ducviet00/vllm-cpu-attention) (`vllm_cpu_attn`). One dynamic graph covers decoder + lm head and one the encoder; Inductor weight-freezing packs every GEMM into oneDNN's blocked layouts (BF16 `avx512_core_bf16` / AMX on modern x86, ACL on aarch64), while decoder self- and cross-attention run through opaque `torch.library.custom_op`s backed by `vllm_cpu_attn`. On x86 BF16 the decode graph also compiles with `mode="max-autotune"` (Inductor's C++ GEMM template where it beats oneDNN).
 
-The model (`fastencdec/models/bart.py`) is a near-verbatim copy of the
+The model (`src/models/bart.py`) is a near-verbatim copy of the
 HuggingFace BART reference; the attention kernels differ, and the attention
 q/k/v projections are fused into one GEMM (`utils/loader` concatenates the HF
 parts).
 
-**Florence-2** (`fastencdec/models/florence2.py`) reuses that paged BART as its
+**Florence-2** (`src/models/florence2.py`) reuses that paged BART as its
 language model and pairs it with the DaViT vision encoder
 (`Florence2VisionBackbone`) and `Florence2MultiModalProjector`, vendored in the
-same `fastencdec/models/florence2.py` (an optimized copy of the `transformers`
+same `src/models/florence2.py` (an optimized copy of the `transformers`
 reference). Visual tokens are spliced into the encoder input at the `<image>`
 placeholders; the decoder is unchanged.
 
@@ -32,7 +32,7 @@ placeholders; the decoder is unchanged.
 
 - **CPU only** (`float32` and `bfloat16`), **BART and Florence-2 only**, **greedy and beam search only** (no multinomial sampling, no CUDA).
 - No quantization, prefix caching or chunked prefill.
-- **Single external kernel**: [`vllm-cpu-attention`](https://github.com/ducviet00/vllm-cpu-attention) (`vllm_cpu_attn`), wrapped in `fastencdec/layers/attention.py`. Do not add other external kernels or fallback backends without explicit approval.
+- **Single external kernel**: [`vllm-cpu-attention`](https://github.com/ducviet00/vllm-cpu-attention) (`vllm_cpu_attn`), wrapped in `src/layers/attention.py`. Do not add other external kernels or fallback backends without explicit approval.
 
 ## 2. Environment
 
@@ -50,7 +50,7 @@ placeholders; the decoder is unchanged.
 Mirrors nano-vllm's package layout (`engine/`, `layers/`, `models/`, `utils/`).
 
 ```
-fastencdec/
+src/
   __init__.py          package exports (LLM, Request, RequestOut, SamplingParams)
   config.py            Config (engine hyperparameters + HF/text/generation configs)
   llm.py               LLM facade (subclass of LLMEngine)

@@ -15,9 +15,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from transformers import GenerationConfig
 
-from fastencdec.engine.scheduler import Scheduler
-from fastencdec.engine.sequence import Sequence
-from fastencdec.sampling_params import SamplingParams
+from src.engine.scheduler import Scheduler
+from src.engine.sequence import Sequence
+from src.sampling_params import SamplingParams
 
 # Each case is (stopped flags best-first, num_beams, finished ranks, live ranks).
 CASES = [

@@ -21,7 +21,7 @@ def timed(fn, warmup: int, repeats: int):
     return statistics.median(times), result
 
 
-def load_image(url: str, cache_dir: str = "/tmp/fastencdec/coco") -> Image.Image:
+def load_image(url: str, cache_dir: str = "/tmp/vflorence/coco") -> Image.Image:
     path = os.path.join(cache_dir, os.path.basename(urlparse(url).path))
     if not os.path.exists(path):
         os.makedirs(cache_dir, exist_ok=True)

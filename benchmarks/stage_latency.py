@@ -67,8 +67,8 @@ def prepare_inputs(args, florence, dtype):
 
 
 def fast_stages(args, input_token_ids, pixels, dtype):
-    """Return {stage: callable} for fast-encdec."""
-    from fastencdec import LLM, Request, SamplingParams
+    """Return {stage: callable} for vflorence."""
+    from src import LLM, Request, SamplingParams
 
     llm = LLM(
         args.model,
@@ -150,7 +150,7 @@ def hf_stages(args, input_token_ids, pixels, dtype):
             max_new_tokens=tokens,
             min_new_tokens=tokens,  # Suppress EOS so every request generates exactly N tokens.
             num_beams=args.beams,
-            # Everything else is the checkpoint's generation config, as in fast-encdec.
+            # Everything else is the checkpoint's generation config, as in vflorence.
             do_sample=False,
         )
 

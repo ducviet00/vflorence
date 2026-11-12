@@ -1,4 +1,4 @@
-# fast-encdec
+# vflorence
 
 A small CPU inference engine for **BART** and **Florence-2**. The code is easy to read, as in
 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
@@ -37,7 +37,7 @@ and `mm_cache_size`.
 ```python
 from transformers import AutoTokenizer
 
-from fastencdec import LLM, Request, SamplingParams
+from src import LLM, Request, SamplingParams
 
 tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
 llm = LLM("facebook/bart-large-cnn")
@@ -57,7 +57,7 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor
 
-from fastencdec import LLM, Request, SamplingParams
+from src import LLM, Request, SamplingParams
 
 processor = AutoProcessor.from_pretrained("florence-community/Florence-2-base")
 llm = LLM(
@@ -142,9 +142,9 @@ Script: `benchmarks/continuous_batching.py`.
   32 COCO images x `<OD>`, `<CAPTION>`, `<DETAILED_CAPTION>`,
   `<REFERRING_EXPRESSION_SEGMENTATION>`, in random order.
 * The two backends use the checkpoint's generation config (`no_repeat_ngram_size=3`, ...).
-* fast-encdec keeps `--max-num-req` requests in the batch. When a request is complete,
+* vflorence keeps `--max-num-req` requests in the batch. When a request is complete,
   a new request immediately takes its slot.
-* The multimodal cache of fast-encdec is on (the default) and is cleared before each run.
+* The multimodal cache of vflorence is on (the default) and is cleared before each run.
   Thus the vision encoder runs one time for each image: 32 misses, 96 hits.
 * HF runs padded batches of the same size and encodes the image of each request.
   68-81% of its decoded positions are padding.
@@ -153,10 +153,10 @@ Script: `benchmarks/continuous_batching.py`.
 
 How to read the cells:
 
-* Line 1: fast-encdec / HF wall time (**speedup**), the median of 3 timed runs after 1 warmup.
-* Line 2: fast-encdec / HF generated tokens for each second of wall time.
+* Line 1: vflorence / HF wall time (**speedup**), the median of 3 timed runs after 1 warmup.
+* Line 2: vflorence / HF generated tokens for each second of wall time.
 * HF OOM: the kernel stopped the process on the 30 GB `c4-standard-8`.
-* The fast-encdec Florence-2-large numbers on `c4-standard-16` are from 2026-11-12. They
+* The vflorence Florence-2-large numbers on `c4-standard-16` are from 2026-11-12. They
   include the per-image vision tower and the max-autotune decode graph. All other cells
   are older than these two changes.
 
@@ -206,7 +206,7 @@ Script: `benchmarks/stage_latency.py`.
 * The multimodal cache is off. Thus the vision stage runs on each call.
 * The decode step is the average of 128 steps with EOS suppressed.
 * Each number is the median of 3 timed runs after 1 warmup.
-* Each cell shows fast-encdec / HF (speedup).
+* Each cell shows vflorence / HF (speedup).
 
 | stage | c4a-standard-8 | c4-standard-8 | c4a-standard-16 | c4-standard-16 |
 |---|---:|---:|---:|---:|

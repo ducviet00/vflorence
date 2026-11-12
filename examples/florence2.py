@@ -8,7 +8,7 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor
 
-from fastencdec import LLM, Request, SamplingParams
+from src import LLM, Request, SamplingParams
 
 MODEL = "florence-community/Florence-2-base"
 URL = (
@@ -37,5 +37,5 @@ def main():
 
 if __name__ == "__main__":
     logging.basicConfig(format="%(name)s: %(message)s")
-    logging.getLogger("fastencdec").setLevel(logging.INFO)  # memory usage
+    logging.getLogger("src").setLevel(logging.INFO)  # memory usage
     main()

@@ -25,11 +25,11 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import torch
 
-from fastencdec import LLM, Request, SamplingParams
+from src import LLM, Request, SamplingParams
 
 BART = "facebook/bart-large-cnn"
 FLORENCE = "florence-community/Florence-2-base"
-IMAGE = "/tmp/fastencdec/florence2_bench.jpg"
+IMAGE = "/tmp/vflorence/florence2_bench.jpg"
 IMAGE_URL = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
 
 
@@ -149,7 +149,7 @@ def florence(dtype, beams, max_tokens):
             **inputs,
             max_new_tokens=max_tokens,
             num_beams=beams,
-            # Everything else is the checkpoint's generation config, as in fast-encdec.
+            # Everything else is the checkpoint's generation config, as in vflorence.
             do_sample=False,
         )
     ref = []
