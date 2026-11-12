@@ -2,6 +2,7 @@ import logging
 import math
 
 import torch
+from tqdm.auto import tqdm
 
 from ..config import Config
 from ..sampling_params import SamplingParams
@@ -68,6 +69,7 @@ class LLMEngine:
         self,
         requests: Request | list[Request],
         sampling_params: SamplingParams | None = None,
+        use_tqdm: bool = True,
     ) -> list[RequestOut]:
         """Run batched generation on requests and return one RequestOut per request."""
         if isinstance(requests, Request):
@@ -85,9 +87,24 @@ class LLMEngine:
                 logger.error("request rejected: %s", e)
                 slots.append(RequestOut(request.input_ids, [], request.pixel_values))
         outputs: dict[int, RequestOut] = {}
-        while not self.is_finished():
-            for request_id, out in self.step():
-                outputs[request_id] = out
+        num_accepted = sum(isinstance(s, int) for s in slots)
+        with tqdm(
+            total=num_accepted, desc="Generating", unit="req", disable=not use_tqdm
+        ) as pbar:
+            num_output_tokens = 0
+            while not self.is_finished():
+                for request_id, out in self.step():
+                    outputs[request_id] = out
+                    # Like vLLM: tokens of finished requests over elapsed time.
+                    num_output_tokens += len(out.completion_token_ids)
+                    elapsed = pbar.format_dict["elapsed"]
+                    pbar.set_postfix_str(
+                        f"output: {num_output_tokens / elapsed:.1f} tok/s"
+                        if elapsed
+                        else "",
+                        refresh=False,
+                    )
+                    pbar.update()
         self._log_memory()
         return [outputs[s] if isinstance(s, int) else s for s in slots]
 

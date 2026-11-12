@@ -12,6 +12,7 @@ dependencies = [
   "Pillow",
   "torch>=2.4.0",
   "torchvision",
+  "tqdm",
   "vllm-cpu-attn",
   "xxhash",
 ]

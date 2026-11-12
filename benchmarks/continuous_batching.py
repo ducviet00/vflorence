@@ -114,7 +114,10 @@ def run_fast(args, input_token_ids, pixels, dtype):
         # Cold cache each run: only reuse within the batch (4 tasks per image) counts.
         runner.mm_cache.clear()
         runner.mm_cache_hits = runner.mm_cache_misses = 0
-        rows = [o.completion_token_ids for o in llm.generate(requests, params)]
+        rows = [
+            o.completion_token_ids
+            for o in llm.generate(requests, params, use_tqdm=False)
+        ]
         # generate() logs a rejected request and returns it empty; a real one has >= 1 token.
         assert all(rows), "fast-encdec rejected requests; see the log above"
         return rows
