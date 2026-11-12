@@ -105,7 +105,7 @@ def fast_stages(args, input_token_ids, pixels, dtype):
         params = SamplingParams(
             max_tokens=tokens, num_beams=args.beams, min_length=tokens + 1
         )
-        return llm.generate(requests, params)
+        return llm.generate(requests, params, use_tqdm=False)
 
     stages = {"encode": encode}
     if pixels is not None:
