@@ -330,6 +330,16 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max_decoder_len must be"):
             self.engine(max_decoder_len=129)
 
+    def test_small_num_blocks_queues_requests(self):
+        for num_beams in (1, 2):
+            llm = self.engine(max_num_seqs=4, num_blocks=2 * num_beams)
+            n = llm.config.block_size + 4  # two blocks per beam
+            params = SamplingParams(max_tokens=n, min_length=n + 1, num_beams=num_beams)
+            with self.subTest(num_beams=num_beams):
+                outs = llm.generate([REQUEST] * 3, params, use_tqdm=False)
+                self.assertEqual([len(o.completion_token_ids) for o in outs], [n] * 3)
+                self.assert_clean(llm)
+
     def test_shared_beams_fit_two_blocks(self):
         llm = self.engine(max_num_seqs=2)
         params = SamplingParams(max_tokens=3, num_beams=2, min_length=4)

@@ -26,19 +26,24 @@ class Scheduler:
         self.block_manager.deallocate(seq)
 
     def schedule(self) -> tuple[list[Sequence], list[tuple[int, int]]]:
-        """Admit waiting sequences up to max_num_seqs, allocate KV blocks, and return (running, copies)."""
-        used = sum(
-            {
-                seq.request_id: seq.sampling_params.num_beams for seq in self.running
-            }.values()
-        )
+        """Admit waiting sequences up to max_num_seqs and num_blocks, allocate KV blocks, and return (running, copies)."""
+        blocks = self.block_manager
+        # A request can hold num_beams * ceil(max_tokens / block_size) blocks; admitting by
+        # that worst case keeps a small num_blocks from running out mid-request.
+        worst = lambda p: p.num_beams * -(-p.max_tokens // blocks.block_size)
+        requests = {seq.request_id: seq.sampling_params for seq in self.running}
+        used = sum(p.num_beams for p in requests.values())
+        used_blocks = sum(worst(p) for p in requests.values())
         while (
             self.waiting
-            and used + self.waiting[0].sampling_params.num_beams <= self.max_num_seqs
+            and used + (params := self.waiting[0].sampling_params).num_beams
+            <= self.max_num_seqs
+            and used_blocks + worst(params) <= blocks.num_blocks
         ):
             seq = self.waiting.popleft()
             self.running.append(seq)
             used += seq.sampling_params.num_beams
+            used_blocks += worst(seq.sampling_params)
 
         seqs = list(self.running)
         if (
