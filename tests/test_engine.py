@@ -292,6 +292,32 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(len(result.completion_token_ids), expected_len)
                 self.assertEqual(result.completion_token_ids[0], 2)
 
+    def test_failed_generate_leaves_engine_usable(self):
+        llm = self.engine()
+        self.addCleanup(set_context)
+        decode, steps = llm.runner.decode_fn, []
+
+        def flaky(*args):
+            # Fail on the second step: blocks, pages and a queued request in flight.
+            steps.append(args)
+            if len(steps) == 2:
+                raise RuntimeError("decode failed")
+            return decode(*args)
+
+        for num_beams in (1, 2):
+            params = SamplingParams(max_tokens=4, min_length=5, num_beams=num_beams)
+            steps.clear()
+            with (
+                self.subTest(num_beams=num_beams),
+                patch.object(llm.runner, "decode_fn", side_effect=flaky),
+                self.assertRaisesRegex(RuntimeError, "decode failed"),
+            ):
+                llm.generate([REQUEST] * 3, params, use_tqdm=False)
+            self.assert_clean(llm)
+            (out,) = llm.generate([REQUEST], params, use_tqdm=False)
+            self.assertEqual(len(out.completion_token_ids), 4)
+            self.assert_clean(llm)
+
     def test_too_long_inputs_are_rejected_before_running(self):
         llm = self.engine(max_num_seqs=2)
         cases = [

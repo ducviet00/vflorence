@@ -231,6 +231,12 @@ class ModelRunner:
         self._cross_free.extend(int(page) for page in pages)
         self._cross_key = self._cross_staged = None
 
+    def reset(self) -> None:
+        """Return every encoder K/V page to the pool after an aborted batch."""
+        self._cross_pages.clear()
+        self._cross_free = list(range(self.config.num_cross_blocks))
+        self._cross_key = self._cross_staged = None
+
     def _prepare(self, seqs, copies=()):
         """Build input_ids, positions, and Context tensors for the step."""
         block_size = self.block_size
