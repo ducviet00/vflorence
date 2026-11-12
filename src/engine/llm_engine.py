@@ -1,5 +1,6 @@
 import logging
 import math
+from contextlib import contextmanager
 
 import torch
 from tqdm.auto import tqdm
@@ -64,6 +65,20 @@ class LLMEngine:
     def is_finished(self) -> bool:
         return self.scheduler.is_finished()
 
+    @contextmanager
+    def _abort_on_failure(self):
+        """A failed step leaves requests running with their blocks and pages; drop them."""
+        try:
+            yield
+        except BaseException:
+            self.abort()
+            raise
+
+    def abort(self) -> None:
+        """Drop every waiting and running request and release their KV blocks and pages."""
+        self.scheduler.reset()
+        self.runner.reset()
+
     @torch.inference_mode()
     def generate(
         self,
@@ -88,9 +103,10 @@ class LLMEngine:
                 slots.append(RequestOut(request.input_ids, [], request.pixel_values))
         outputs: dict[int, RequestOut] = {}
         num_accepted = sum(isinstance(s, int) for s in slots)
-        with tqdm(
+        pbar = tqdm(
             total=num_accepted, desc="Generating", unit="req", disable=not use_tqdm
-        ) as pbar:
+        )
+        with self._abort_on_failure(), pbar:
             num_output_tokens = 0
             while not self.is_finished():
                 for request_id, out in self.step():
