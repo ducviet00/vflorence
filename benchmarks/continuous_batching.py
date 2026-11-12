@@ -116,7 +116,7 @@ def run_fast(args, input_token_ids, pixels, dtype):
         runner.mm_cache_hits = runner.mm_cache_misses = 0
         rows = [
             o.completion_token_ids
-            for o in llm.generate(requests, params, use_tqdm=False)
+            for o in llm.generate(requests, params, use_tqdm=args.tqdm)
         ]
         # generate() logs a rejected request and returns it empty; a real one has >= 1 token.
         assert all(rows), "fast-encdec rejected requests; see the log above"
@@ -190,6 +190,9 @@ def main():
     )
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument(
+        "--tqdm", action="store_true", help="show the fast backend progress bar"
+    )
     ap.add_argument("--model", default="florence-community/Florence-2-base")
     args = ap.parse_args()
     if args.num_req < 1 or args.max_num_req < 1 or args.beamsearch < 1:

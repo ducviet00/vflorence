@@ -105,7 +105,7 @@ def fast_stages(args, input_token_ids, pixels, dtype):
         params = SamplingParams(
             max_tokens=tokens, num_beams=args.beams, min_length=tokens + 1
         )
-        return llm.generate(requests, params, use_tqdm=False)
+        return llm.generate(requests, params, use_tqdm=args.tqdm)
 
     stages = {"encode": encode}
     if pixels is not None:
@@ -172,6 +172,9 @@ def main():
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=3)
+    ap.add_argument(
+        "--tqdm", action="store_true", help="show the fast backend progress bar"
+    )
     args = ap.parse_args()
     if (
         min(args.batch, args.beams, args.repeats) < 1
