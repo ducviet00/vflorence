@@ -98,7 +98,9 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIsNone(pixels)
 
     def test_fast_stages_use_preprocessed_inputs(self):
-        args = SimpleNamespace(model="unused", batch=2, beams=4, max_tokens=32)
+        args = SimpleNamespace(
+            model="unused", batch=2, beams=4, max_tokens=32, tqdm=False
+        )
         ids = torch.tensor([[0, 4, 2], [0, 5, 2]])
         for pixels in (None, torch.zeros(2, 3, 2, 2)):
             with self.subTest(vision=pixels is not None):
