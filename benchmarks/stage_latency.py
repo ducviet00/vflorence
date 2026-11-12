@@ -73,6 +73,8 @@ def fast_stages(args, input_token_ids, pixels, dtype):
     llm = LLM(
         args.model,
         max_num_seqs=args.batch * args.beams,
+        max_decoder_len=args.max_tokens,
+        max_encoder_len=input_token_ids.shape[1],
         dtype=dtype,
         mm_cache_size=0,  # stages time the vision encoder on every call
     )

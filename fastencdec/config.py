@@ -1,9 +1,13 @@
+import json
 import math
 import platform
 from dataclasses import dataclass, field
 
 import torch
 from transformers import AutoConfig, GenerationConfig, PretrainedConfig
+from transformers.utils import cached_file
+
+from .sampling_params import SamplingParams
 
 
 @dataclass
@@ -15,8 +19,16 @@ class Config:
     dtype: torch.dtype = torch.float32
     compile: bool = True
     mm_cache_size: int = 256  # image embeddings kept across calls; 0 disables
-    num_blocks: int | None = None  # None: enough for max_num_seqs full-length sequences
+    # Decoder positions per sequence (its K/V entries): fits max_tokens <= max_decoder_len,
+    # since the last generated token is never fed. None: the generation_config's max_tokens,
+    # rounded up to whole blocks.
+    max_decoder_len: int | None = None
+    # Longest encoder prompt. None: image tokens + 64 text tokens for Florence-2 (641),
+    # else max_position_embeddings; rounded up to whole blocks.
+    max_encoder_len: int | None = None
+    num_blocks: int | None = None  # None: max_num_seqs sequences of max_decoder_len
     block_size: int = field(init=False)
+    num_cross_blocks: int = field(init=False)
     hf_config: PretrainedConfig = field(init=False)
     text_config: PretrainedConfig = field(init=False)
     generation_config: GenerationConfig = field(init=False)
@@ -37,9 +49,49 @@ class Config:
             self.generation_config = GenerationConfig.from_pretrained(self.model)
         except OSError:
             self.generation_config = GenerationConfig()
+        max_positions = self.text_config.max_position_embeddings
+        # Defaults fill their last block: those slots are allocated anyway.
+        bs = self.block_size
+        whole_blocks = lambda n: min(
+            -(-min(n, max_positions) // bs) * bs, max_positions
+        )
+        if self.max_decoder_len is None:
+            self.max_decoder_len = whole_blocks(
+                SamplingParams.from_generation_config(self.generation_config).max_tokens
+            )
+        if self.max_encoder_len is None:
+            self.max_encoder_len = whole_blocks(_image_seq_length(self.model))
+        for name in ("max_decoder_len", "max_encoder_len"):
+            if not 0 < getattr(self, name) <= max_positions:
+                raise ValueError(
+                    f"{name} must be in [1, max_position_embeddings={max_positions}]"
+                )
+        # Fixed pools, allocated once: self-attn per sequence, encoder K/V per request.
         if self.num_blocks is None:
             self.num_blocks = self.max_num_seqs * math.ceil(
-                self.text_config.max_position_embeddings / self.block_size
+                self.max_decoder_len / self.block_size
             )
+        self.num_cross_blocks = self.max_num_seqs * math.ceil(
+            self.max_encoder_len / self.block_size
+        )
         if self.num_blocks <= 0:
             raise ValueError("num_blocks must be positive")
+
+
+# Text tokens allowed next to the image in the default max_encoder_len.
+# shortcut: fixed budget for task prompt + free text; pass max_encoder_len for longer text.
+_TEXT_PROMPT_BUDGET = 64
+
+
+def _image_seq_length(model: str) -> float:
+    """Visual tokens + text budget for an image checkpoint (Florence-2: 577 + 64); else no limit."""
+    path = cached_file(
+        model, "preprocessor_config.json", _raise_exceptions_for_missing_entries=False
+    )
+    if path is None:
+        return math.inf
+    with open(path) as f:
+        image_seq_length = json.load(f).get("image_seq_length")
+    return (
+        math.inf if image_seq_length is None else image_seq_length + _TEXT_PROMPT_BUDGET
+    )

@@ -74,6 +74,7 @@ def bart(dtype, beams, max_tokens):
     llm = LLM(
         BART,
         max_num_seqs=len(BART_TEXTS) * beams,
+        max_decoder_len=max_tokens,
         dtype=dtype,
     )
     tokenizer = AutoTokenizer.from_pretrained(BART)
@@ -116,6 +117,7 @@ def florence(dtype, beams, max_tokens):
     llm = LLM(
         FLORENCE,
         max_num_seqs=len(FLORENCE_PROMPTS) * beams,
+        max_decoder_len=max_tokens,
         dtype=dtype,
     )
     processor = AutoProcessor.from_pretrained(FLORENCE)
