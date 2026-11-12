@@ -18,6 +18,13 @@ class Scheduler:
     def is_finished(self) -> bool:
         return not self.waiting and not self.running
 
+    def reset(self) -> None:
+        """Drop every request and release every KV block after an aborted batch."""
+        self.waiting.clear()
+        self.running.clear()
+        self._finished_beams.clear()
+        self.block_manager.reset()
+
     def add(self, seq: Sequence) -> None:
         self.waiting.append(seq)
 
