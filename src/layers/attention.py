@@ -40,7 +40,7 @@ def stage_cross(layers, pages, enc_lens, block_size: int, isa: str):
 
 
 @torch.library.custom_op(
-    "fastencdec::self_attention", mutates_args={"k_cache", "v_cache"}
+    "vflorence::self_attention", mutates_args={"k_cache", "v_cache"}
 )
 def decoder_self_attention(
     query: torch.Tensor,
@@ -85,7 +85,7 @@ def _(
     return torch.empty_like(query)
 
 
-@torch.library.custom_op("fastencdec::cross_attention", mutates_args={})
+@torch.library.custom_op("vflorence::cross_attention", mutates_args={})
 def decoder_cross_attention(
     query: torch.Tensor,
     layer_idx: int,

@@ -19,8 +19,8 @@ from transformers.generation.logits_process import (
     SuppressTokensLogitsProcessor,
 )
 
-from fastencdec.layers.logits_processor import LogitsProcessor
-from fastencdec.sampling_params import SamplingParams
+from src.layers.logits_processor import LogitsProcessor
+from src.sampling_params import SamplingParams
 
 VOCAB = 37
 DEFAULTS = SamplingParams.from_generation_config(GenerationConfig())

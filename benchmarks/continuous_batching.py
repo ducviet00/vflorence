@@ -87,7 +87,7 @@ def prepare_inputs(processor, num_requests):
 
 
 def run_fast(args, input_token_ids, pixels, dtype):
-    from fastencdec import LLM, Request, SamplingParams
+    from src import LLM, Request, SamplingParams
 
     max_num_seqs = args.max_num_req * args.beamsearch
     # Size both KV pools for this workload, not max_position_embeddings (4096 on Florence-2-large).
@@ -119,7 +119,7 @@ def run_fast(args, input_token_ids, pixels, dtype):
             for o in llm.generate(requests, params, use_tqdm=args.tqdm)
         ]
         # generate() logs a rejected request and returns it empty; a real one has >= 1 token.
-        assert all(rows), "fast-encdec rejected requests; see the log above"
+        assert all(rows), "vflorence rejected requests; see the log above"
         return rows
 
     seconds, rows = timed(once, args.warmup, args.repeats)
@@ -152,7 +152,7 @@ def run_hf(args, input_token_ids, pixels, dtype, tokenizer):
                 **batch,
                 max_new_tokens=args.max_tokens,
                 num_beams=args.beamsearch,
-                # Everything else is the checkpoint's generation config, as in fast-encdec.
+                # Everything else is the checkpoint's generation config, as in vflorence.
                 do_sample=False,
             )
             for batch in batches
@@ -162,7 +162,7 @@ def run_hf(args, input_token_ids, pixels, dtype, tokenizer):
     rows, padding = [], []
     for output in outputs:
         for row in output.tolist():
-            # HF includes the decoder start token; fast-encdec does not.
+            # HF includes the decoder start token; vflorence does not.
             tokens = row[1:]
             length = len(tokens)
             while tokens and tokens[-1] == tokenizer.pad_token_id:
