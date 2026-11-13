@@ -85,11 +85,6 @@ parsed = processor.post_process_generation(text, task="<OD>", image_size=image.s
 
 ## How It Works
 
-Read the code in this sequence: `engine/sequence.py` -> `engine/block_manager.py` ->
-`engine/scheduler.py` -> `engine/model_runner.py` -> `engine/llm_engine.py` ->
-`layers/attention.py` -> `models/bart.py`.
-[AGENTS.md section 4](AGENTS.md#4-how-a-step-works) gives the procedure for one step.
-
 ```mermaid
 sequenceDiagram
     participant U as User
