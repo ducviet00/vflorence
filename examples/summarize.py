@@ -4,6 +4,7 @@ import logging
 import time
 
 from transformers import AutoTokenizer
+
 from vflorence import LLM, Request, SamplingParams
 
 MODEL = "facebook/bart-large-cnn"
