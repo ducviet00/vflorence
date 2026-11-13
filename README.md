@@ -1,7 +1,13 @@
-# vflorence
+<p align="center">
+  <picture>
+    <img alt="vLLM" src="https://raw.githubusercontent.com/ducviet00/vflorence/main/assets/logo.png" width=60%>
+  </picture>
+</p>
 
 A small CPU inference engine for **BART** and **Florence-2**. The code is easy to read, as in
 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
+
+---
 
 ## Features
 
