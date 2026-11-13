@@ -40,9 +40,7 @@ placeholders; the decoder is unchanged.
 - Dev CPU: AMD Ryzen 7 7840H (Zen 4) — has `avx512_bf16`, **no** AMX, **no** `avx512_fp16`. Prefer `bfloat16` or `float32`; never `float16`. Do not run heavy full benchmarks on this laptop (smoke tests / unit tests only); run full benchmarks on disposable GCP spot VMs (`spot-bench-gcp` skill: `bench-start axion` for `c4a-standard-8` and `bench-start xeon` for `c4-standard-8`, then `bench-stop` immediately when done).
 - Install in a Python 3.12+ venv (the package is `vflorence/`; without an install, `PYTHONPATH=.` from the repo root works too):
   ```bash
-  uv pip install torch==2.15.0 torchvision setuptools --index-url https://download.pytorch.org/whl/cpu
-  uv pip install --no-build-isolation git+https://github.com/ducviet00/vllm-cpu-attention.git
-  uv pip install --no-build-isolation -e .
+  uv pip install -e .   # [tool.uv.sources]: CPU torch index + vllm-cpu-attn from git
   ```
 
 ## 3. Layout
