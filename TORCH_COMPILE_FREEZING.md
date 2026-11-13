@@ -345,9 +345,38 @@ ms/step. The laptop numbers are smoke-scale.
 | Zen 4 laptop bf16 | 8 | 21.1 | 15.8 | same | 15.6 |
 | Zen 4 laptop bf16 | 1 | 13.9 | 13.3 | same | 10.3 |
 
-- **Unfrozen batch-1 decode on aarch64** (`_UNFROZEN_SINGLE_ROW` in
-  `engine/model_runner.py`): a packed weight is slower than a plain one for a
-  single row under ACL, so that graph compiles with `freezing=False`.
+- **Unfrozen graphs** (`ModelRunner._inductor_ctx` in
+  `engine/model_runner.py`; the rule table is in `AGENTS.md` §4). A frozen graph
+  keeps its own packed weights and batch 1 is its own graph, so a graph compiles
+  with `freezing=False` (plain weights, no copy) wherever packing does not pay:
+  fp32 encode at every batch size, fp32 batch-1 decode, and aarch64 bf16 batch-1
+  decode. Measured 2026-11-13 on `c4-standard-8` (Xeon 8581C, 4 threads) and
+  `c4a-standard-8` (Axion, 8 threads), frozen -> unfrozen, median of 3-5 runs:
+
+  | fp32 | Xeon F2-large | Xeon bart-large | Axion F2-large | Axion bart-large |
+  |---|---:|---:|---:|---:|
+  | encode, batch 1 (ms) | 342 -> 346 | 132 -> 143 | 368 -> 342 | 134 -> 143 |
+  | encode, batch 8 (ms) | 2820 -> 2921 | 1062 -> 1052 | 2620 -> 2648 | 1061 -> 1063 |
+  | decode, batch 1 (ms/step) | 20.1 -> 19.2 | 19.6 -> 19.0 | unfrozen already | unfrozen already |
+  | decode, batch 8 (ms/step) | 36.4 -> 57.6 | 31.7 -> 49.3 | 22.5 -> 27.5 | 19.7 -> 23.5 |
+  | vision, 1 image (ms) | 2754 -> 3193 | - | 2487 -> 2587 | - |
+  | vision, 8 images (ms) | 23144 -> 23014 | - | 19592 -> 19897 | - |
+
+  So batch >= 2 decode and the tower stay frozen. RSS after warmup,
+  Florence-2-large fp32 at batch 8, everything frozen -> encode + decode
+  unfrozen -> tower unfrozen too: 7.6-8.3 -> 6.0-6.3 -> 4.8 GB on the Xeon,
+  8.6 -> 6.3 -> 4.8 GB on Axion.
+
+  x86 bf16 batch 1 stays frozen (+ max-autotune on decode), frozen + max-autotune
+  -> unfrozen: Florence-2-large encode 73.2 -> 86.4 ms, decode 11.71 -> 13.28
+  ms/step; bart-large-cnn encode 29.8 -> 40.7 ms, decode 11.21 -> 12.86 ms/step.
+  Unfrozen + max-autotune and eager were no faster than unfrozen in either
+  dtype. aarch64 bf16 encode unfrozen is not measured.
+
+  fp32 stays token-exact vs HF (`verify_parity.py --dtype float32`, 12/12 on
+  both boxes), and equal-length prompts batched together give the single-request
+  tokens (the batch >= 2 encode graph; `verify_parity`'s prompts differ in
+  length, so it only reaches batch-1 encode).
 - **`mode="max-autotune"`** (Inductor's C++ GEMM template, autotuned per GEMM
   against the packed op) does not replace that: torch 2.15 has NEON/SVE
   micro-kernels for fp32 only, and the Axion bf16 run selected zero template

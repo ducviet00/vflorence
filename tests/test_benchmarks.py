@@ -115,7 +115,8 @@ class BenchmarkTests(unittest.TestCase):
                     {"vision", "encode"} if pixels is not None else {"encode"},
                 )
                 stages["encode"]()
-                self.assertIs(llm.runner.encode_fn.call_args.args[0], ids)
+                encoded = llm.runner.encode_fn.call_args.args[0]
+                self.assertEqual(encoded.tolist(), ids.tolist())
                 generate(7)
                 requests, params = llm.generate.call_args.args
                 self.assertEqual(requests[0].input_ids, [0, 4, 2])

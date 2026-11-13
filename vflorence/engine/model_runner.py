@@ -1,5 +1,6 @@
 import logging
 import platform
+import time
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
 
@@ -12,14 +13,12 @@ from ..layers.logits_processor import LogitsProcessor
 from ..sampling_params import SamplingParams
 from ..utils.context import set_context
 from ..utils.loader import load_hf_weights
+from .sequence import Sequence
 
 logger = logging.getLogger(__name__)
 _COMPILED_RUNNERS = 0
 
-# On aarch64, oneDNN runs a plain (unpacked) weight fastest for one row, so the
-# batch-1 decode graph is compiled without freezing (weight packing).
-# Batch 1 is its own graph anyway (Dynamo's 0/1 specialization).
-_UNFROZEN_SINGLE_ROW = platform.machine().lower() in ("arm64", "aarch64")
+_AARCH64 = platform.machine().lower() in ("arm64", "aarch64")
 
 
 class ModelRunner:
@@ -59,6 +58,8 @@ class ModelRunner:
         self._logits_processor: LogitsProcessor | None = None
         self._sampling_params: SamplingParams | None = None
         self.allocate_kv_cache()
+        if config.compile:
+            self._warmup()
 
     def allocate_kv_cache(self) -> None:
         # Separate tensors per layer: views of one shared tensor break Inductor codegen.
@@ -128,6 +129,40 @@ class ModelRunner:
         if self.image_fn is not None:
             self.image_fn = torch.compile(self.image_fn, dynamic=False)
 
+    def _warmup(self) -> None:
+        """Compile at startup, as vLLM does: one decode step of dummy requests per graph."""
+        config, text = self.config, self.config.text_config
+        start = time.perf_counter()
+        params = SamplingParams.from_generation_config(
+            config.generation_config, text.eos_token_id
+        )
+        encoder_ids = [text.eos_token_id] * min(2, config.max_encoder_len)
+        pixel_values = None
+        # shortcut: a Florence-2 engine warms up only image requests (its usual load);
+        # text-only prompts and other image sizes still compile on first use.
+        if (
+            self.image_fn is not None
+            and None not in (config.image_size, config.image_seq_length)
+            and config.image_seq_length + len(encoder_ids) <= config.max_encoder_len
+        ):
+            image_tokens = [config.hf_config.image_token_id] * config.image_seq_length
+            encoder_ids = image_tokens + encoder_ids
+            pixel_values = torch.zeros(3, *config.image_size)
+        # Batch 1 is its own graph (Dynamo's 0/1 specialization); batch 2 covers the rest.
+        for batch in range(1, min(2, config.max_num_seqs, config.num_blocks) + 1):
+            seqs = []
+            for i in range(batch):
+                seq = Sequence(
+                    i, [text.decoder_start_token_id], encoder_ids, params, pixel_values
+                )
+                seq.block_table = [i]
+                seqs.append(seq)
+            self.run(seqs)
+            self.reset()
+        self.mm_cache.clear()
+        self.mm_cache_hits = self.mm_cache_misses = 0
+        logger.info("Compiled and warmed up in %.1f s", time.perf_counter() - start)
+
     def _copy_blocks(self, copies: list[tuple[int, int]]) -> None:
         """Copy-on-write: copy KV blocks src -> dst in every decoder layer, one op per cache."""
         src, dst = (torch.tensor(ids) for ids in zip(*copies))
@@ -173,7 +208,6 @@ class ModelRunner:
                     self.mm_cache.popitem(last=False)
         return embeds
 
-    @torch.no_grad()
     def _encode(self, seqs) -> None:
         """Batch fresh sequences by (encoder_len, image_shape) and page their cross-attn K/V."""
         # Vision tower first (Florence-2 only): its output is spliced into the encoder input.
@@ -192,7 +226,7 @@ class ModelRunner:
                 [seq.encoder_token_ids for seq in group], dtype=torch.long
             )
             # Encoder forward: the hidden states are what every decoder layer cross-attends to.
-            with self._inductor_ctx():
+            with self._inductor_ctx("encode"):
                 if group[0].pixel_values is None:
                     hidden = self.encode_fn(input_ids)
                 else:
@@ -376,7 +410,7 @@ class ModelRunner:
             del candidates[beams_to_keep:]
         return dict(topk_candidates)
 
-    @torch.no_grad()
+    @torch.inference_mode()  # one mode for every caller: Dynamo guards on it
     def run(self, seqs, copies=()):
         """Encode any fresh sequences, run one decoder step, and return `_sample`'s result ([] if no seqs)."""
         if not seqs:
@@ -389,14 +423,21 @@ class ModelRunner:
         # The context is global, so always reset it, even if the forward raises.
         try:
             input_ids, positions = self._prepare(seqs, copies)
-            with self._inductor_ctx(len(seqs) > 1 or not _UNFROZEN_SINGLE_ROW):
+            with self._inductor_ctx("decode", len(seqs)):
                 logits = self.decode_fn(input_ids, positions)
         finally:
             set_context()
         return self._sample(seqs, logits)
 
-    def _inductor_ctx(self, freeze=True):
-        """Freezing lets Inductor pack weights into oneDNN layouts; it only applies when compiled."""
+    def _inductor_ctx(self, graph="tower", rows=2):
+        """Freezing lets Inductor pack weights into oneDNN layouts; AGENTS.md section 4
+        explains which graphs skip it. It only applies when compiled."""
         if not self.compiled:
             return nullcontext()
+        fp32 = self.dtype == torch.float32
+        freeze = {
+            "tower": True,
+            "encode": not fp32,
+            "decode": rows > 1 or not (_AARCH64 or fp32),
+        }[graph]
         return torch._inductor.config.patch(freezing=freeze)

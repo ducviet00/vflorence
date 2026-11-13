@@ -29,6 +29,9 @@ class Config:
     num_blocks: int | None = None  # None: max_num_seqs sequences of max_decoder_len
     block_size: int = field(init=False)
     num_cross_blocks: int = field(init=False)
+    # From preprocessor_config.json; None for text-only checkpoints.
+    image_seq_length: int | None = field(init=False)
+    image_size: tuple[int, int] | None = field(init=False)
     hf_config: PretrainedConfig = field(init=False)
     text_config: PretrainedConfig = field(init=False)
     generation_config: GenerationConfig = field(init=False)
@@ -59,8 +62,18 @@ class Config:
             self.max_decoder_len = whole_blocks(
                 SamplingParams.from_generation_config(self.generation_config).max_tokens
             )
+        preprocessor = _preprocessor_config(self.model)
+        self.image_seq_length = preprocessor.get("image_seq_length")
+        size = preprocessor.get("crop_size") or preprocessor.get("size")
+        has_size = isinstance(size, dict) and {"height", "width"} <= size.keys()
+        self.image_size = (size["height"], size["width"]) if has_size else None
         if self.max_encoder_len is None:
-            self.max_encoder_len = whole_blocks(_image_seq_length(self.model))
+            # Visual tokens + text budget (Florence-2: 577 + 64); else no limit.
+            self.max_encoder_len = whole_blocks(
+                math.inf
+                if self.image_seq_length is None
+                else self.image_seq_length + _TEXT_PROMPT_BUDGET
+            )
         for name in ("max_decoder_len", "max_encoder_len"):
             if not 0 < getattr(self, name) <= max_positions:
                 raise ValueError(
@@ -83,15 +96,12 @@ class Config:
 _TEXT_PROMPT_BUDGET = 64
 
 
-def _image_seq_length(model: str) -> float:
-    """Visual tokens + text budget for an image checkpoint (Florence-2: 577 + 64); else no limit."""
+def _preprocessor_config(model: str) -> dict:
+    """The checkpoint's preprocessor_config.json; {} if it has none (text-only)."""
     path = cached_file(
         model, "preprocessor_config.json", _raise_exceptions_for_missing_entries=False
     )
     if path is None:
-        return math.inf
+        return {}
     with open(path) as f:
-        image_seq_length = json.load(f).get("image_seq_length")
-    return (
-        math.inf if image_seq_length is None else image_seq_length + _TEXT_PROMPT_BUDGET
-    )
+        return json.load(f)
