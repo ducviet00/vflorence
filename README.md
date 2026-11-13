@@ -22,7 +22,9 @@ uv pip install --no-build-isolation git+https://github.com/ducviet00/vflorence.g
 ```
 
 Then `from vflorence import LLM, Request, SamplingParams`. To ship a wheel instead, run
-`uv build --wheel --no-build-isolation` here and install `dist/vflorence-*.whl` the same way.
+`uv build --wheel --no-build-isolation` here and install `dist/vflorence-*.whl` in place of
+the last line. The first two lines are still needed on the target machine: the wheel only
+names `vllm-cpu-attn` and does not know to build it from git.
 To work on vflorence itself, replace the last line with `uv pip install --no-build-isolation -e .`
 in a clone.
 

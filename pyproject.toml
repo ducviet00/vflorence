@@ -30,7 +30,5 @@ name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
-# the import name is `vflorence`; the code lives in src/
-[tool.setuptools]
-package-dir = { vflorence = "src" }
-packages = ["vflorence", "vflorence.engine", "vflorence.layers", "vflorence.models", "vflorence.utils"]
+[tool.setuptools.packages.find]
+include = ["vflorence*"]

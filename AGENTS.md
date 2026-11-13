@@ -16,15 +16,15 @@ encoder-decoder decoding on CPU:
 - **FP32 and BF16** (`torch.float32`, `torch.bfloat16`).
 - **Frozen `torch.compile` on CPU** paired with [`vllm-cpu-attention`](https://github.com/ducviet00/vllm-cpu-attention) (`vllm_cpu_attn`). One dynamic graph covers decoder + lm head and one the encoder; Inductor weight-freezing packs every GEMM into oneDNN's blocked layouts (BF16 `avx512_core_bf16` / AMX on modern x86, ACL on aarch64), while decoder self- and cross-attention run through opaque `torch.library.custom_op`s backed by `vllm_cpu_attn`. On x86 BF16 the decode graph also compiles with `mode="max-autotune"` (Inductor's C++ GEMM template where it beats oneDNN).
 
-The model (`src/models/bart.py`) is a near-verbatim copy of the
+The model (`vflorence/models/bart.py`) is a near-verbatim copy of the
 HuggingFace BART reference; the attention kernels differ, and the attention
 q/k/v projections are fused into one GEMM (`utils/loader` concatenates the HF
 parts).
 
-**Florence-2** (`src/models/florence2.py`) reuses that paged BART as its
+**Florence-2** (`vflorence/models/florence2.py`) reuses that paged BART as its
 language model and pairs it with the DaViT vision encoder
 (`Florence2VisionBackbone`) and `Florence2MultiModalProjector`, vendored in the
-same `src/models/florence2.py` (an optimized copy of the `transformers`
+same `vflorence/models/florence2.py` (an optimized copy of the `transformers`
 reference). Visual tokens are spliced into the encoder input at the `<image>`
 placeholders; the decoder is unchanged.
 
@@ -32,13 +32,13 @@ placeholders; the decoder is unchanged.
 
 - **CPU only** (`float32` and `bfloat16`), **BART and Florence-2 only**, **greedy and beam search only** (no multinomial sampling, no CUDA).
 - No quantization, prefix caching or chunked prefill.
-- **Single external kernel**: [`vllm-cpu-attention`](https://github.com/ducviet00/vllm-cpu-attention) (`vllm_cpu_attn`), wrapped in `src/layers/attention.py`. Do not add other external kernels or fallback backends without explicit approval.
+- **Single external kernel**: [`vllm-cpu-attention`](https://github.com/ducviet00/vllm-cpu-attention) (`vllm_cpu_attn`), wrapped in `vflorence/layers/attention.py`. Do not add other external kernels or fallback backends without explicit approval.
 
 ## 2. Environment
 
 - Python env: `.venv/bin/python` (Python >= 3.12, CPU PyTorch, `vllm-cpu-attn`, `transformers`, `safetensors`, `Pillow`, `xxhash`).
 - Dev CPU: AMD Ryzen 7 7840H (Zen 4) — has `avx512_bf16`, **no** AMX, **no** `avx512_fp16`. Prefer `bfloat16` or `float32`; never `float16`. Do not run heavy full benchmarks on this laptop (smoke tests / unit tests only); run full benchmarks on disposable GCP spot VMs (`spot-bench-gcp` skill: `bench-start axion` for `c4a-standard-8` and `bench-start xeon` for `c4-standard-8`, then `bench-stop` immediately when done).
-- Install in a Python 3.12+ venv (import name `vflorence`; `pyproject.toml` maps it to `src/`):
+- Install in a Python 3.12+ venv (the package is `vflorence/`; without an install, `PYTHONPATH=.` from the repo root works too):
   ```bash
   uv pip install torch==2.15.0 torchvision setuptools --index-url https://download.pytorch.org/whl/cpu
   uv pip install --no-build-isolation git+https://github.com/ducviet00/vllm-cpu-attention.git
@@ -50,7 +50,7 @@ placeholders; the decoder is unchanged.
 Mirrors nano-vllm's package layout (`engine/`, `layers/`, `models/`, `utils/`).
 
 ```
-src/
+vflorence/
   __init__.py          package exports (LLM, Request, RequestOut, SamplingParams)
   config.py            Config (engine hyperparameters + HF/text/generation configs)
   llm.py               LLM facade (subclass of LLMEngine)

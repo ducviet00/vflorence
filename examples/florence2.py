@@ -7,6 +7,7 @@ import requests
 import torch
 from PIL import Image
 from transformers import AutoProcessor
+
 from vflorence import LLM, Request, SamplingParams
 
 MODEL = "florence-community/Florence-2-base"
