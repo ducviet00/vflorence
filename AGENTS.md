@@ -14,7 +14,7 @@ encoder-decoder decoding on CPU:
   batches waste no compute.
 - **Greedy and beam search** on top of the same paged cache.
 - **FP32 and BF16** (`torch.float32`, `torch.bfloat16`).
-- **Frozen `torch.compile` on CPU** paired with [`vllm-cpu-attention`](https://github.com/ducviet00/vllm-cpu-attention) (`vllm_cpu_attn`). One dynamic graph covers decoder + lm head and one the encoder; Inductor weight-freezing packs every GEMM into oneDNN's blocked layouts (BF16 `avx512_core_bf16` / AMX on modern x86, ACL on aarch64), while decoder self- and cross-attention run through opaque `torch.library.custom_op`s backed by `vllm_cpu_attn`. On x86 BF16 the decode graph also compiles with `mode="max-autotune"` (Inductor's C++ GEMM template where it beats oneDNN).
+- **Frozen `torch.compile` on CPU** paired with [`vllm-cpu-attention`](https://github.com/ducviet00/vllm-cpu-attention) (`vllm_cpu_attn`). One dynamic graph covers decoder + lm head and one the encoder; Inductor weight-freezing packs the GEMMs of the frozen graphs (§4 lists which) into oneDNN's blocked layouts (BF16 `avx512_core_bf16` / AMX on modern x86, ACL on aarch64), while decoder self- and cross-attention run through opaque `torch.library.custom_op`s backed by `vllm_cpu_attn`. On x86 BF16 the decode graph also compiles with `mode="max-autotune"` (Inductor's C++ GEMM template where it beats oneDNN).
 
 The model (`vflorence/models/bart.py`) is a near-verbatim copy of the
 HuggingFace BART reference; the attention kernels differ, and the attention
@@ -96,6 +96,47 @@ ModelRunner.run(seqs)
     decoder forward               # compiled decoder + lm_head; custom ops call vllm_cpu_attn
 LLMEngine.step()                  # argmax (greedy) or beam-expand; append; free finished
 ```
+
+`ModelRunner.__init__` ends with `_warmup()` when `Config.compile` is set (as
+vLLM does at startup): it runs one decode step of dummy requests at batch 1 and
+batch 2, so every graph is compiled before the first `generate`. A Florence-2
+engine warms up image requests of the preprocessor's `crop_size` only; text-only
+prompts and other image shapes still compile on first use (and without a usable
+`preprocessor_config.json` it warms up text-only instead). The warmup builds
+graphs a workload may never hit (batch-1 decode under beam search, batch >= 2
+encode when prompts never share a length), each with its packed copy if frozen.
+
+**Which graphs are frozen.** Freezing packs the weights into oneDNN's layout,
+and every frozen graph keeps its own packed copy; an unfrozen graph runs on the
+model's plain weights and adds none. Batch 1 is always its own graph (Dynamo's
+0/1 specialization). The rule (`ModelRunner._inductor_ctx`):
+
+| Graph | bf16 x86 | bf16 aarch64 | fp32 (both) |
+|---|---|---|---|
+| Decode, batch 1 | frozen + max-autotune | unfrozen | unfrozen |
+| Decode, batch >= 2 | frozen + max-autotune | frozen | frozen |
+| Encode, any batch | frozen | frozen | unfrozen |
+| Vision tower | frozen | frozen | frozen |
+
+Why (2026-11-13, Xeon 8581C `c4-standard-8` and Axion `c4a-standard-8`, frozen
+-> unfrozen; full tables in `TORCH_COMPILE_FREEZING.md` §6.3):
+
+- Batch-1 decode: level on x86 fp32 (20.1 -> 19.2 ms/step, Florence-2-large);
+  on aarch64 a plain weight is the fast path for one row (fp32 12.0 -> 8.0,
+  bf16 9.3 -> 6.4, bart-large-cnn).
+- fp32 encode: 7% faster to 8% slower at batch 1, within 0-4% at batch 8.
+- fp32 batch >= 2 decode stays frozen: unfrozen is ~55% slower on x86 and ~20%
+  on aarch64.
+- x86 bf16 stays frozen: unfrozen batch 1 is 13-37% slower (decode 11.7 -> 13.3
+  ms/step, encode 73 -> 86 ms), and max-autotune only helps a frozen graph.
+- The tower stays frozen: one image (how the engine always runs it) is 16%
+  slower unfrozen on x86 fp32.
+- Memory after warmup, bart-large-cnn fp32 on the dev laptop: about 5.5 GB with
+  every graph frozen (the RSS at which it was OOM-killed) against 3.3 GB with
+  this rule.
+- One grad mode: `ModelRunner.run` is `torch.inference_mode()`, because Dynamo
+  guards on the mode. Under `no_grad` the `step()` API recompiled every graph
+  that `generate()` and the warmup had built (a second set of packed copies).
 
 `LLMEngine.run()` loops `step()` until `is_finished()`.
 `LLMEngine.generate(requests, params)` is the offline entrypoint: it adds the

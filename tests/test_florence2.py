@@ -8,6 +8,7 @@ image instead of going through the processor.
 Run with:  PYTHONPATH=. python tests/test_florence2.py
 """
 
+import json
 import os
 import sys
 from tempfile import TemporaryDirectory
@@ -17,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import torch
 from transformers import AutoConfig, AutoTokenizer
 from transformers import Florence2ForConditionalGeneration as HFFlorence2
+
 from vflorence import LLM, Request, SamplingParams
 
 MODEL = "hf-tiny-v2/tiny-random-Florence2ForConditionalGeneration"
@@ -83,6 +85,25 @@ def main():
         print(
             f"[{'OK' if hidden_diff <= tol else 'MISMATCH'}] encoder hidden: maxdiff={hidden_diff}"
         )
+
+        # With a preprocessor config the warmup compiles the image graphs:
+        # image requests must then compile nothing new.
+        preprocessor = os.path.join(tmpdir, "preprocessor_config.json")
+        with open(preprocessor, "w") as f:
+            json.dump({"crop_size": {"height": 32, "width": 32}}, f)
+        LLM(tmpdir, max_num_seqs=8)  # no image_seq_length: text-only warmup, no crash
+        with open(preprocessor, "w") as f:
+            size = {"height": 32, "width": 32}
+            json.dump({"crop_size": size, "image_seq_length": num_image_tokens}, f)
+        graphs = lambda: torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        engine = LLM(tmpdir, max_num_seqs=8)
+        warm = graphs()
+        image_request = Request(encoder_token_ids, pixel_values[0])
+        for requests in ([image_request], [image_request] * 3):
+            engine.generate(requests, SamplingParams(max_tokens=3), use_tqdm=False)
+        assert graphs() == warm, "an image request compiled a graph the warmup missed"
+        os.remove(preprocessor)  # the rest of the test builds its inputs by hand
+        print("[OK] image warmup compiled every graph")
 
         # Greedy/beam generation parity through the paged engine.
         for beams in (1, 2, 4):

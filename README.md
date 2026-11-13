@@ -52,7 +52,7 @@ export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4
 ## Quick Start
 
 The `examples/` directory contains scripts that you can run. `LLM` has these parameters:
-`dtype` (`torch.float32` or `torch.bfloat16`), `max_num_seqs`, `compile` (default `True`)
+`dtype` (`torch.float32` or `torch.bfloat16`), `max_num_seqs`, `compile` (default `True`; `LLM(...)` then compiles and warms up before it returns)
 and `mm_cache_size`.
 
 ```python

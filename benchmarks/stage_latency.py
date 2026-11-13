@@ -80,19 +80,23 @@ def fast_stages(args, input_token_ids, pixels, dtype):
     )
     runner = llm.runner
 
-    @torch.no_grad()
+    @torch.inference_mode()  # the engine's mode, so the stages reuse its graphs
     def vision():
         with runner._inductor_ctx():
             return runner.image_fn(pixels)
 
     image_embeds = vision() if pixels is not None else None
+    # Dynamo guards on inference vs normal tensors, and the engine builds its ids in
+    # inference mode: copy them there once, so encode() reuses the engine's graphs.
+    with torch.inference_mode():
+        encoder_ids = input_token_ids.clone()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def encode():
-        with runner._inductor_ctx():
+        with runner._inductor_ctx("encode"):
             if pixels is not None:
-                return runner.encode_fn(input_token_ids, image_embeds=image_embeds)
-            return runner.encode_fn(input_token_ids)
+                return runner.encode_fn(encoder_ids, image_embeds=image_embeds)
+            return runner.encode_fn(encoder_ids)
 
     requests = [
         Request(row.tolist(), pixels[i] if pixels is not None else None)
@@ -193,7 +197,9 @@ def main():
     transformers.logging.set_verbosity_error()
     florence = AutoConfig.from_pretrained(args.model).model_type == "florence2"
     dtype = getattr(torch, args.dtype)
-    input_token_ids, pixels = prepare_inputs(args, florence, dtype)
+    # vflorence takes the processor's float32 pixels (its tower casts); HF needs them cast.
+    pixel_dtype = torch.float32 if args.backend == "fast" else dtype
+    input_token_ids, pixels = prepare_inputs(args, florence, pixel_dtype)
     if args.backend == "fast":
         stages, generate = fast_stages(args, input_token_ids, pixels, dtype)
     else:
