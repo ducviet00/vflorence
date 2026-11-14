@@ -254,17 +254,19 @@ Script: `benchmarks/stage_latency.py`.
 
 ## Tests & Benchmarks
 
+`uv run` installs the locked environment into `.venv` on first use.
+
 ```bash
-PYTHONPATH=. python tests/test_parity.py            # vs transformers, tiny random BART
-PYTHONPATH=. python tests/test_florence2.py         # vs transformers, tiny random Florence-2
-PYTHONPATH=. python tests/test_beam.py              # beam candidate selection
-PYTHONPATH=. python tests/test_logits_processor.py  # LogitsProcessor parity vs transformers
-PYTHONPATH=. python tests/test_engine.py            # lifetime, cache budgets, validation, loading
-PYTHONPATH=. python tests/test_benchmarks.py        # benchmark helpers
-PYTHONPATH=. python tests/verify_parity.py          # real checkpoints (BART + Florence-2)
+uv run tests/test_parity.py            # vs transformers, tiny random BART
+uv run tests/test_florence2.py         # vs transformers, tiny random Florence-2
+uv run tests/test_beam.py              # beam candidate selection
+uv run tests/test_logits_processor.py  # LogitsProcessor parity vs transformers
+uv run tests/test_engine.py            # lifetime, cache budgets, validation, loading
+uv run tests/test_benchmarks.py        # benchmark helpers
+uv run tests/verify_parity.py          # real checkpoints (BART + Florence-2)
 
 # one backend per run; run with --backend fast and --backend hf and compare
-PYTHONPATH=. python benchmarks/stage_latency.py --backend fast         # Florence-2: vision / encode / decode-step ms
-PYTHONPATH=. python benchmarks/stage_latency.py --backend fast --model facebook/bart-large-cnn
-PYTHONPATH=. python benchmarks/continuous_batching.py --backend fast   # 128 mixed Florence-2 requests, 8 in flight (hf: padded batches of 8)
+uv run -m benchmarks.stage_latency --backend fast  # Florence-2: vision / encode / decode-step ms
+uv run -m benchmarks.stage_latency --backend fast --model facebook/bart-large-cnn
+uv run -m benchmarks.continuous_batching --backend fast  # 128 mixed Florence-2 requests, 8 in flight (hf: padded batches of 8)
 ```
