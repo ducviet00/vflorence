@@ -168,6 +168,8 @@ class BenchmarkTests(unittest.TestCase):
             verify_parity._check_tokens([1, 2], [1, 3], torch.float32)
         with self.assertRaises(AssertionError):
             verify_parity._check_tokens([1, 2], [1], torch.bfloat16)
+        with self.assertRaises(AssertionError):  # BF16 wrong from the first token
+            verify_parity._check_tokens([1, 9], [1, 2], torch.bfloat16, min_prefix=2)
         self.assertIn(
             "BF16 token differences",
             verify_parity._check_tokens([1, 2], [1, 3], torch.bfloat16),

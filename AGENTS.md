@@ -225,7 +225,7 @@ PYTHONPATH=. $P tests/test_logits_processor.py
 PYTHONPATH=. $P tests/test_engine.py
 PYTHONPATH=. $P tests/test_benchmarks.py
 
-# real-checkpoint parity (fp32 exact; bf16 same length)
+# real-checkpoint parity (fp32 exact; bf16 same length; BART also a shared first quarter)
 PYTHONPATH=. $P tests/verify_parity.py --dtype bfloat16
 TORCHINDUCTOR_COMPILE_THREADS=1 PYTHONPATH=. $P tests/verify_parity.py --dtype float32
 

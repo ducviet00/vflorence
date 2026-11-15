@@ -24,6 +24,7 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import torch
+
 from vflorence import LLM, Request, SamplingParams
 
 BART = "facebook/bart-large-cnn"
@@ -56,7 +57,7 @@ BART_TEXTS = [
 FLORENCE_PROMPTS = ["<CAPTION>", "<OD>", "<REFERRING_EXPRESSION_SEGMENTATION>the car"]
 
 
-def _check_tokens(a, b, dtype):
+def _check_tokens(a, b, dtype, min_prefix=0):
     if a == b:
         return "OK"
     n = min(len(a), len(b))
@@ -64,6 +65,8 @@ def _check_tokens(a, b, dtype):
     message = f"len {len(a)} vs {len(b)}, first diff at {first}"
     assert len(a) == len(b), message
     assert dtype != torch.float32, message
+    # BF16 may drift at a near-tie, but only after min_prefix shared tokens.
+    assert first >= min_prefix, message
     return f"BF16 token differences ({message})"
 
 
@@ -105,7 +108,11 @@ def bart(dtype, beams, max_tokens):
     ref = [row.tolist()[1:] for row in ref]  # drop decoder-start
     assert len(ours) == len(ref), (len(ours), len(ref))
     for i, (a, b) in enumerate(zip(ours, ref)):
-        print(f"[{_check_tokens(a, b, dtype)}] bart beams={beams} seq={i}")
+        # EOS is suppressed, so equal lengths prove nothing here: require a shared
+        # first quarter. (Florence-2 stops at EOS, and its <loc> bins drift from the
+        # first token in BF16, so it keeps the length check alone.)
+        status = _check_tokens(a, b, dtype, min_prefix=max_tokens // 4)
+        print(f"[{status}] bart beams={beams} seq={i}")
 
 
 def florence(dtype, beams, max_tokens):
@@ -185,7 +192,8 @@ def main():
                 f"--beams={beams}",
             ]
             env = dict(
-                os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(__file__))
+                os.environ,
+                PYTHONPATH=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             )
             if subprocess.run(cmd, check=False, env=env).returncode:
                 raise SystemExit(f"phase {kind} beams={beams} failed")
