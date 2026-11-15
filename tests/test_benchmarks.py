@@ -106,6 +106,7 @@ class BenchmarkTests(unittest.TestCase):
             with self.subTest(vision=pixels is not None):
                 llm = Mock(decoder_start_token_id=2)
                 llm.runner._inductor_ctx.side_effect = nullcontext
+                llm.runner.image_fn.side_effect = lambda px: torch.zeros(len(px), 1, 4)
                 with patch("vflorence.LLM", return_value=llm):
                     stages, generate = stage_latency.fast_stages(
                         args, ids, pixels, torch.float32
@@ -114,6 +115,11 @@ class BenchmarkTests(unittest.TestCase):
                     set(stages),
                     {"vision", "encode"} if pixels is not None else {"encode"},
                 )
+                if (
+                    pixels is not None
+                ):  # one image per call, as the engine runs the tower
+                    calls = llm.runner.image_fn.call_args_list
+                    self.assertEqual([len(c.args[0]) for c in calls], [1, 1])
                 stages["encode"]()
                 encoded = llm.runner.encode_fn.call_args.args[0]
                 self.assertEqual(encoded.tolist(), ids.tolist())

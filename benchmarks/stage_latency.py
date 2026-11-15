@@ -3,7 +3,8 @@
 One backend per run (``--backend fast`` or ``--backend hf``); run twice and
 compare.  Works for Florence-2 (all three stages) and BART (no vision stage).
 
-* vision  -- DaViT + projector on ``--batch`` images (Florence-2 only)
+* vision  -- DaViT + projector on ``--batch`` images (Florence-2 only); vflorence
+             runs them one per call, as its engine does
 * encode  -- BART encoder (Florence-2: image tokens spliced into the prompt)
 * decode  -- one decoder step for the whole batch, measured as
              (generate N tokens - generate 1 token) / (N - 1) with EOS suppressed,
@@ -82,8 +83,10 @@ def fast_stages(args, input_token_ids, pixels, dtype):
 
     @torch.inference_mode()  # the engine's mode, so the stages reuse its graphs
     def vision():
+        # One image per call, as ModelRunner._image_embeds does: the tower graph is
+        # static, so a batched call would compile and time a graph the engine never runs.
         with runner._inductor_ctx():
-            return runner.image_fn(pixels)
+            return torch.cat([runner.image_fn(px.unsqueeze(0)) for px in pixels])
 
     image_embeds = vision() if pixels is not None else None
     # Dynamo guards on inference vs normal tensors, and the engine builds its ids in
@@ -103,7 +106,6 @@ def fast_stages(args, input_token_ids, pixels, dtype):
         for i, row in enumerate(input_token_ids)
     ]
 
-    @torch.no_grad()
     def generate(tokens):
         # min_length > max_tokens masks EOS for the whole run -> exactly ``tokens``
         params = SamplingParams(
