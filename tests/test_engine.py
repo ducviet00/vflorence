@@ -85,6 +85,13 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "KV cache is full"):
             llm.scheduler.schedule()
 
+    def test_fresh_sequence_is_not_finished(self):
+        params = SamplingParams(max_tokens=3, eos_token_id=2).with_defaults(DEFAULTS)
+        seq = Sequence(0, [2], [3], params)  # decoder start token == EOS, as in BART
+        self.assertFalse(seq.is_finished)
+        seq.append_token(2)
+        self.assertTrue(seq.is_finished)
+
     def test_mixed_sampling_params_rejected(self):
         llm = self.engine(max_num_seqs=4)
         llm.add_request(REQUEST, SamplingParams(max_tokens=2))

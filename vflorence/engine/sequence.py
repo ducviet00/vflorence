@@ -67,7 +67,8 @@ class Sequence:
 
     @property
     def is_finished(self) -> bool:
-        return (
+        # The decoder start token is EOS for BART: only a generated EOS finishes.
+        return self.num_generated > 0 and (
             self.token_ids[-1] in self.sampling_params.eos_ids()
             or self.num_generated >= self.sampling_params.max_tokens
         )
