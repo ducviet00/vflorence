@@ -20,7 +20,7 @@ class RequestOut:
     pixel_values: torch.Tensor | None = None
 
 
-@dataclass
+@dataclass(eq=False)  # identity: comparing fields would compare pixel_values tensors
 class Sequence:
     """State and paged KV-cache bookkeeping for a single decoder hypothesis."""
 
