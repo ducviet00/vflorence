@@ -220,8 +220,8 @@ class BartEncoder(nn.Module):
 
     def forward(
         self,
+        positions: torch.Tensor,
         input_ids: torch.Tensor | None = None,
-        positions: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode token IDs or precomputed embeddings into encoder hidden states."""
@@ -306,7 +306,7 @@ class BartForConditionalGeneration(nn.Module):
             .unsqueeze(0)
             .expand_as(encoder_token_ids)
         )
-        return self.model.encoder(encoder_token_ids, positions)
+        return self.model.encoder(positions, input_ids=encoder_token_ids)
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Run one decoder step and return logits [B, vocab] (the compiled decode graph)."""
