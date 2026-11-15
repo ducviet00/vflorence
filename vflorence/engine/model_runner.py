@@ -1,6 +1,5 @@
 import logging
 import math
-import platform
 import time
 from collections import OrderedDict, defaultdict
 from contextlib import nullcontext
@@ -8,7 +7,7 @@ from contextlib import nullcontext
 import torch
 import vllm_cpu_attn
 
-from ..config import Config
+from ..config import AARCH64, Config
 from ..layers import attention
 from ..layers.logits_processor import LogitsProcessor
 from ..sampling_params import SamplingParams
@@ -18,8 +17,6 @@ from .sequence import Sequence
 
 logger = logging.getLogger(__name__)
 _COMPILED_RUNNERS = 0
-
-_AARCH64 = platform.machine().lower() in ("arm64", "aarch64")
 
 
 class ModelRunner:
@@ -105,9 +102,10 @@ class ModelRunner:
     def _compile(self) -> None:
         global _COMPILED_RUNNERS
         _COMPILED_RUNNERS += 1
-        # encode and the vision tower share one Dynamo frame: per engine up to 4 encode
-        # graphs (batch 1 / >1, with / without image) + one tower graph per image shape.
-        # Past the limit Dynamo silently falls back to eager.
+        # Dynamo counts recompiles per code object, which every engine in the process
+        # shares: each engine adds up to 4 encode graphs (batch 1 / >1, with / without
+        # image) and one tower graph per image shape. Past the limit Dynamo silently
+        # falls back to eager.
         torch._dynamo.config.recompile_limit = max(
             torch._dynamo.config.recompile_limit, 8 * _COMPILED_RUNNERS
         )
@@ -118,10 +116,7 @@ class ModelRunner:
         # x86 bf16 decode: autotune each GEMM between oneDNN and Inductor's C++ template
         # (12-24% faster per step on a Xeon 8581C, ~2x the compile time). Measured no
         # gain for the encoder, the vision tower, fp32 on x86, or bf16 on aarch64.
-        autotune = self.dtype == torch.bfloat16 and platform.machine().lower() in (
-            "x86_64",
-            "amd64",
-        )
+        autotune = self.dtype == torch.bfloat16 and not AARCH64
         # One dynamic graph covers every batch size / encoder length.
         self.decode_fn = torch.compile(
             self.model, dynamic=True, mode="max-autotune" if autotune else None
@@ -174,8 +169,11 @@ class ModelRunner:
     def _allocate_cross_pages(self, num_pages: int) -> list[int]:
         """Take pages from the fixed encoder K/V pool."""
         if num_pages > len(self._cross_free):
-            raise RuntimeError("encoder K/V pool is full; increase max_encoder_len")
-        # A slice, not pops: keeps a request's pages in ascending memory order.
+            raise RuntimeError(
+                "encoder K/V pool is full; increase max_num_seqs or max_encoder_len"
+            )
+        # A slice, not pops: a request's pages keep the free list's order (ascending
+        # memory order until finished requests return theirs).
         pages = self._cross_free[-num_pages:]
         del self._cross_free[-num_pages:]
         return pages
@@ -449,6 +447,6 @@ class ModelRunner:
         freeze = {
             "tower": True,
             "encode": not fp32,
-            "decode": rows > 1 or not (_AARCH64 or fp32),
+            "decode": rows > 1 or not (AARCH64 or fp32),
         }[graph]
         return torch._inductor.config.patch(freezing=freeze)
