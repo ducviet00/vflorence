@@ -1,4 +1,5 @@
 import logging
+import math
 import platform
 import time
 from collections import OrderedDict, defaultdict
@@ -243,7 +244,9 @@ class ModelRunner:
             # Each request owns ceil(enc_len / block_size) pages; slots are its tokens' places.
             enc_len, block_size = input_ids.shape[1], self.block_size
             pages = torch.tensor(
-                self._allocate_cross_pages(len(group) * -(-enc_len // block_size)),
+                self._allocate_cross_pages(
+                    len(group) * math.ceil(enc_len / block_size)
+                ),
                 dtype=torch.int32,
             ).view(len(group), -1)
             token = torch.arange(enc_len)

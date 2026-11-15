@@ -15,6 +15,7 @@ compare.  Works for Florence-2 (all three stages) and BART (no vision stage).
 """
 
 import argparse
+import math
 
 import torch
 
@@ -58,7 +59,7 @@ def prepare_inputs(args, florence, dtype):
     # Repeat token IDs directly, reserving space for BART's BOS and EOS tokens.
     paragraph_ids = tokenizer(PARAGRAPH, add_special_tokens=False)["input_ids"]
     content_length = args.enc_len - 2
-    copies = (content_length + len(paragraph_ids) - 1) // len(paragraph_ids)
+    copies = math.ceil(content_length / len(paragraph_ids))
     token_ids = [
         tokenizer.bos_token_id,
         *(paragraph_ids * copies)[:content_length],

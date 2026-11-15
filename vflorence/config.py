@@ -56,7 +56,7 @@ class Config:
         # Defaults fill their last block: those slots are allocated anyway.
         bs = self.block_size
         whole_blocks = lambda n: min(
-            -(-min(n, max_positions) // bs) * bs, max_positions
+            math.ceil(min(n, max_positions) / bs) * bs, max_positions
         )
         if self.max_decoder_len is None:
             self.max_decoder_len = whole_blocks(
