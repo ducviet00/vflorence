@@ -93,6 +93,12 @@ class LLMEngine:
             requests = list(requests)
         if not requests:
             return []
+        # generate() runs the engine dry and returns only its own requests.
+        if not self.is_finished():
+            raise RuntimeError(
+                "generate() needs an idle engine; finish the add_request() "
+                "requests with step() first"
+            )
 
         slots: list[int | RequestOut] = []
         for request in requests:

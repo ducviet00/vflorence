@@ -95,6 +95,18 @@ class EngineTests(unittest.TestCase):
             llm.step()
         self.assert_clean(llm)
 
+    def test_generate_needs_idle_engine(self):
+        llm = self.engine()
+        request_id = llm.add_request(REQUEST, SamplingParams(max_tokens=2))
+        with self.assertRaisesRegex(RuntimeError, "idle engine"):
+            llm.generate([REQUEST], SamplingParams(max_tokens=2))
+        # The earlier request is untouched and still finishes through step().
+        outputs = []
+        while not llm.is_finished():
+            outputs += llm.step()
+        self.assertEqual([rid for rid, _ in outputs], [request_id])
+        self.assert_clean(llm)
+
     def test_mutated_sampling_params_rebuild_processor(self):
         llm = self.engine()
         params = SamplingParams(max_tokens=2, min_length=10, forced_eos_token_id=2)
