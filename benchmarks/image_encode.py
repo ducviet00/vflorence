@@ -1,7 +1,8 @@
 """Time Florence-2 image encoding: pixel values -> visual tokens for the BART encoder.
 
 Covers the DaViT vision tower and the multimodal projector, one image per call as
-the engine runs it (``ModelRunner._image_embeds``).  Preprocessing (resize /
+the engine runs it (``ModelRunner._image_embeds``), or ``--batch-sizes`` images per
+call (each batch size is its own static compiled graph).  Preprocessing (resize /
 normalize) and the BART encoder are outside the timed region.
 
 Prints the compiled-engine latency over ``--images`` images, then an eager
@@ -24,7 +25,7 @@ from benchmarks.utils import load_image
 
 
 def time_each(fn, pixels) -> list[float]:
-    """Seconds per image for ``fn`` on each [1, 3, H, W] image."""
+    """Seconds per call for ``fn`` on each [B, 3, H, W] batch."""
     times = []
     for px in pixels:
         start = time.perf_counter()
@@ -69,6 +70,9 @@ def main():
     ap.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument(
+        "--batch-sizes", default="1", help="comma-separated images per call"
+    )
+    ap.add_argument(
         "--profile-images", type=int, default=10, help="0 skips the profile"
     )
     args = ap.parse_args()
@@ -84,29 +88,33 @@ def main():
     images = [load_image(url) for url, _ in IMAGE_URLs[: args.images]]
     pixel_values = image_processor(images, return_tensors="pt")["pixel_values"]
     pixels = [pixel_values[i % len(images)][None] for i in range(args.images)]
+    batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
 
     llm = LLM(args.model, max_num_seqs=2, dtype=getattr(torch, args.dtype))
     runner = llm.runner
 
-    with torch.inference_mode(), runner._inductor_ctx():  # the engine's mode and graph
-        for px in pixels[: args.warmup]:
-            embeds = runner.image_fn(px)
-        assert embeds.shape[:2] == (1, runner.config.image_seq_length), embeds.shape
-        times = time_each(runner.image_fn, pixels)
-        eager = profile_stages(runner.model, pixels[: args.profile_images])
-
-    ms = sorted(t * 1e3 for t in times)
     print(
         f"\nmodel={args.model}  dtype={args.dtype}  threads={torch.get_num_threads()}  "
-        f"image={tuple(pixel_values.shape[1:])}  tokens/image={embeds.shape[1]}\n"
+        f"image={tuple(pixel_values.shape[1:])}\n"
     )
     print(
-        f"{args.images} images: {sum(times):.2f} s  ({args.images / sum(times):.1f} images/s)"
+        f"{'batch':>6}{'total s':>10}{'images/s':>10}{'ms/image':>10}{'ms/call p50':>13}{'min':>8}{'max':>8}"
     )
-    print(
-        f"per image: mean {statistics.mean(ms):.1f} ms  median {statistics.median(ms):.1f}  "
-        f"p90 {ms[int(0.9 * (len(ms) - 1))]:.1f}  min {ms[0]:.1f}  max {ms[-1]:.1f}"
-    )
+    with torch.inference_mode(), runner._inductor_ctx():  # the engine's mode and graph
+        for bs in batch_sizes:
+            batches = [torch.cat(pixels[i : i + bs]) for i in range(0, args.images, bs)]
+            for px in batches[: args.warmup]:
+                embeds = runner.image_fn(px)
+            assert embeds.shape[1] == runner.config.image_seq_length, embeds.shape
+            times = time_each(runner.image_fn, batches)
+            ms, total = sorted(t * 1e3 for t in times), sum(times)
+            print(
+                f"{bs:>6}{total:>10.2f}{args.images / total:>10.1f}{total * 1e3 / args.images:>10.1f}"
+                f"{statistics.median(ms):>13.1f}{ms[0]:>8.1f}{ms[-1]:>8.1f}",
+                flush=True,
+            )
+        eager = profile_stages(runner.model, pixels[: args.profile_images])
+
     if eager:
         total = sum(eager.values())
         print(
