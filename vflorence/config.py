@@ -9,6 +9,8 @@ from transformers.utils import cached_file
 
 from .sampling_params import SamplingParams
 
+AARCH64 = platform.machine().lower() in ("arm64", "aarch64")
+
 
 @dataclass
 class Config:
@@ -37,9 +39,7 @@ class Config:
     generation_config: GenerationConfig = field(init=False)
 
     def __post_init__(self) -> None:
-        self.block_size = (
-            16 if platform.machine().lower() in ("arm64", "aarch64") else 32
-        )
+        self.block_size = 16 if AARCH64 else 32
         if self.max_num_seqs <= 0:
             raise ValueError("max_num_seqs must be positive")
         if self.mm_cache_size < 0:
