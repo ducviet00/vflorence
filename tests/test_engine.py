@@ -1,5 +1,6 @@
 """Engine lifetime, cache budgets, input validation, and model-loading regressions."""
 
+import math
 import unittest
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -346,9 +347,9 @@ class EngineTests(unittest.TestCase):
     def test_kv_pools_are_fixed_by_decoder_and_encoder_len(self):
         llm = self.engine(max_num_seqs=2, max_decoder_len=40, max_encoder_len=10)
         bs = llm.config.block_size
-        self.assertEqual(llm.config.num_blocks, 2 * -(-40 // bs))
+        self.assertEqual(llm.config.num_blocks, 2 * math.ceil(40 / bs))
         pool = llm.runner.decoder_layers[0].encoder_attn.k_cache
-        self.assertEqual(pool.shape[0], 2 * -(-10 // bs))
+        self.assertEqual(pool.shape[0], 2 * math.ceil(10 / bs))
         llm.generate([Request([3] * 10)] * 3, SamplingParams(max_tokens=40))
         self.assertIs(llm.runner.decoder_layers[0].encoder_attn.k_cache, pool)
         self.assert_clean(llm)
