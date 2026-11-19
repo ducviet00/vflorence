@@ -122,7 +122,6 @@ class Florence2VisionWindowAttention(nn.Module):
                 num_windows, ws * ws, 3, self.num_heads, embed_dim // self.num_heads
             )
             .permute(2, 0, 3, 1, 4)
-            .contiguous()
         )
         query, key, value = qkv.unbind(0)
         windows = F.scaled_dot_product_attention(query, key, value, scale=self.scale)
