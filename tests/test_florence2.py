@@ -98,6 +98,43 @@ def main():
             f"[{'OK' if hidden_diff <= tol else 'MISMATCH'}] encoder hidden: maxdiff={hidden_diff}"
         )
 
+        # Channel attention fast/fallback branches (multi-group, around 1.5*C cutoff, bias/no-bias, B>1).
+        from types import SimpleNamespace
+
+        from vflorence.models.florence2 import Florence2VisionChannelAttention
+
+        dim, groups = 32, 4
+        for qkv_bias in (True, False):
+            attn = Florence2VisionChannelAttention(
+                SimpleNamespace(
+                    embed_dim=[dim], num_groups=[groups], qkv_bias=qkv_bias
+                ),
+                0,
+            ).eval()
+            for shape in ((1, 64, dim), (1, 48, dim), (1, 32, dim), (2, 64, dim)):
+                x = torch.randn(shape)
+                with torch.no_grad():
+                    got = attn(x)
+                    B, N, C = shape
+                    q, k, v = (
+                        attn.qkv(x)
+                        .reshape(B, N, 3, groups, C // groups)
+                        .permute(2, 0, 3, 4, 1)
+                        .unbind(0)
+                    )
+                    ref = attn.proj(
+                        torch.nn.functional.scaled_dot_product_attention(
+                            q, k, v, scale=N**-0.5
+                        )
+                        .view(B, C, N)
+                        .transpose(1, 2)
+                    )
+                diff = (got - ref).abs().max().item()
+                assert diff <= tol, (qkv_bias, shape, diff)
+        print(
+            "[OK] channel attention branches (N>=1.5C, N<1.5C, B=2, qkv_bias=True/False)"
+        )
+
         # With a preprocessor config the warmup compiles the image graphs:
         # image requests must then compile nothing new.
         preprocessor = os.path.join(tmpdir, "preprocessor_config.json")

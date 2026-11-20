@@ -6,6 +6,10 @@ from torch import nn
 
 from .bart import BartModel
 
+# Alignment (elements) for the bias-augmented K dimension in channel attention
+# (64 B in bf16, 128 B in fp32).
+_AUG_K_ALIGN = 32
+
 
 def _dwconv_residual(
     conv: nn.Conv2d, hidden_states: torch.Tensor, center: torch.Tensor
@@ -87,11 +91,70 @@ class Florence2VisionChannelAttention(nn.Module):
         self.groups = config.num_groups[stage_idx]
         self.qkv = nn.Linear(self.dim, self.dim * 3, bias=config.qkv_bias)
         self.proj = nn.Linear(self.dim, self.dim)
+        if config.qkv_bias:
+            # Pad K = dim + pad to a multiple of _AUG_K_ALIGN so W_aug = [W_qk, b_qk, 0..0]
+            # stays 64B-aligned in bf16. A buffer (rather than F.pad on X) keeps
+            # norm1's fused cat kernel unmasked SIMD.
+            pad = _AUG_K_ALIGN - (self.dim % _AUG_K_ALIGN)
+            assert (self.dim + pad) % _AUG_K_ALIGN == 0
+            x_tail = torch.zeros(1, pad)
+            x_tail[0, 0] = 1.0
+            self.register_buffer("_x_tail", x_tail, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run grouped channel self-attention over the head_dim axis."""
         batch_size, num_tokens, hidden_size = hidden_states.shape
         head_dim = hidden_size // self.groups
+        if batch_size == 1 and num_tokens * 2 >= hidden_size * 3:
+            # Empirical cutoff (N >= 1.5*C on Xeon AMX and Axion Neoverse-V2;
+            # 1.0*C loses slightly due to unpacked GEMMs, 1.5*C+ wins): compute
+            # only Q/K (2C) in [..., N] order, then re-associate V + proj into
+            # one (N, C) @ (C, C) GEMM with W_comb = (W_proj @ P) @ W_v (packed
+            # mkldnn on constant W_v). Freezing constant-folds w_aug/w_proj;
+            # eager mode (compile=False) rebuilds them per call.
+            w_qk = self.qkv.weight[: 2 * hidden_size]
+            b_qk = (
+                self.qkv.bias[: 2 * hidden_size] if self.qkv.bias is not None else None
+            )
+            w_v = self.qkv.weight[2 * hidden_size :]
+            if b_qk is not None:
+                pad = self._x_tail.shape[1]
+                w_aug = F.pad(torch.cat([w_qk, b_qk.unsqueeze(1)], dim=1), (0, pad - 1))
+                x_aug = torch.cat(
+                    [hidden_states[0], self._x_tail.expand(num_tokens, -1)], dim=1
+                )
+                qk = torch.mm(w_aug, x_aug.transpose(0, 1))
+                # Reuse x_aug's prefix so norm1 writes one buffer instead of two.
+                x_use = x_aug[:, :hidden_size]
+            else:
+                qk = torch.mm(w_qk, hidden_states[0].transpose(0, 1))
+                x_use = hidden_states[0]
+            query, key = qk.view(2, self.groups, head_dim, num_tokens).unbind(0)
+            scores = torch.bmm(query, key.transpose(1, 2)).float()
+            probs = (scores * (num_tokens**-0.5)).softmax(-1).to(hidden_states.dtype)
+            w_proj = (
+                self.proj.weight.view(hidden_size, self.groups, head_dim)
+                .transpose(0, 1)
+                .contiguous()
+            )
+            m_cc = (
+                torch.bmm(w_proj, probs)
+                .transpose(0, 1)
+                .contiguous()
+                .view(hidden_size, hidden_size)
+            )
+            w_comb = F.linear(m_cc, w_v.transpose(0, 1))
+            out = torch.mm(x_use, w_comb.transpose(0, 1)).unsqueeze(0)
+            b_comb = (
+                torch.mv(m_cc, self.qkv.bias[2 * hidden_size :])
+                if self.qkv.bias is not None
+                else None
+            )
+            if self.proj.bias is not None:
+                b_comb = self.proj.bias if b_comb is None else b_comb + self.proj.bias
+            return out + b_comb if b_comb is not None else out
+
+        # N < 1.5*C or batched: keep packed mkldnn weights on both qkv and proj.
         qkv = (
             self.qkv(hidden_states)
             .reshape(batch_size, num_tokens, 3, self.groups, head_dim)
