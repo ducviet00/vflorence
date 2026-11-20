@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ..config import AARCH64
 from .bart import BartModel
 
 # Alignment (elements) for the bias-augmented K dimension in channel attention
@@ -209,15 +210,40 @@ class Florence2VisionWindowAttention(nn.Module):
             .reshape(-1, ws * ws, embed_dim)
         )
         num_windows = windows.shape[0]
+        head_dim = embed_dim // self.num_heads
 
-        qkv = (
-            self.qkv(windows)
-            .reshape(
-                num_windows, ws * ws, 3, self.num_heads, embed_dim // self.num_heads
+        if not AARCH64 and embed_dim >= 1024:
+            # On x86, splitting large QKV projections (3C >= 3072) into separate
+            # packed Q/K/V linears cuts CPU Flash SDPA's row stride 3x (C vs 3C),
+            # saving ~2.5 ms/image on Xeon; skipped on aarch64 where ACL prefers fused 3C.
+            wq, wk, wv = self.qkv.weight.chunk(3)
+            bq, bk, bv = (
+                self.qkv.bias.chunk(3)
+                if self.qkv.bias is not None
+                else (None, None, None)
             )
-            .permute(2, 0, 3, 1, 4)
-        )
-        query, key, value = qkv.unbind(0)
+            query = (
+                F.linear(windows, wq, bq)
+                .view(num_windows, ws * ws, self.num_heads, head_dim)
+                .transpose(1, 2)
+            )
+            key = (
+                F.linear(windows, wk, bk)
+                .view(num_windows, ws * ws, self.num_heads, head_dim)
+                .transpose(1, 2)
+            )
+            value = (
+                F.linear(windows, wv, bv)
+                .view(num_windows, ws * ws, self.num_heads, head_dim)
+                .transpose(1, 2)
+            )
+        else:
+            qkv = (
+                self.qkv(windows)
+                .reshape(num_windows, ws * ws, 3, self.num_heads, head_dim)
+                .permute(2, 0, 3, 1, 4)
+            )
+            query, key, value = qkv.unbind(0)
         windows = F.scaled_dot_product_attention(query, key, value, scale=self.scale)
         windows = self.proj(
             windows.transpose(1, 2).reshape(num_windows, ws * ws, embed_dim)

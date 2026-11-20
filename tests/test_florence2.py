@@ -135,6 +135,40 @@ def main():
             "[OK] channel attention branches (N>=1.5C, N<1.5C, B=2, qkv_bias=True/False)"
         )
 
+        # Window attention split-QKV branch (embed_dim >= 1024 on x86, bias/no-bias).
+        from vflorence.models.florence2 import Florence2VisionWindowAttention
+
+        w_dim, w_heads, ws = 1024, 32, 4
+        for qkv_bias in (True, False):
+            wattn = Florence2VisionWindowAttention(
+                SimpleNamespace(
+                    embed_dim=[w_dim],
+                    num_heads=[w_heads],
+                    window_size=ws,
+                    qkv_bias=qkv_bias,
+                ),
+                0,
+            ).eval()
+            x = torch.randn(1, ws, ws, w_dim)
+            with torch.no_grad():
+                got = wattn(x)
+                q, k, v = (
+                    wattn.qkv(x.view(1, ws * ws, w_dim))
+                    .reshape(1, ws * ws, 3, w_heads, w_dim // w_heads)
+                    .permute(2, 0, 3, 1, 4)
+                    .unbind(0)
+                )
+                ref = wattn.proj(
+                    torch.nn.functional.scaled_dot_product_attention(
+                        q, k, v, scale=wattn.scale
+                    )
+                    .transpose(1, 2)
+                    .reshape(1, ws * ws, w_dim)
+                )
+            diff = (got - ref).abs().max().item()
+            assert diff <= tol, (qkv_bias, diff)
+        print("[OK] window attention split-QKV branch (dim=1024, qkv_bias=True/False)")
+
         # With a preprocessor config the warmup compiles the image graphs:
         # image requests must then compile nothing new.
         preprocessor = os.path.join(tmpdir, "preprocessor_config.json")
