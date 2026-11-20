@@ -76,11 +76,23 @@ def main():
 
         feat_diff = (feat_ref - feat_our).abs().max().item()
         hidden_diff = (hidden_ref - hidden_our).abs().max().item()
+        pixel_batch = torch.randn(2, 3, 32, 32)
+        with torch.no_grad():
+            batch_diff = (
+                (
+                    hf.get_image_features(pixel_batch).pooler_output
+                    - ours.get_image_features(pixel_batch)
+                )
+                .abs()
+                .max()
+                .item()
+            )
         tol = 1e-5
         assert feat_diff <= tol, feat_diff
+        assert batch_diff <= tol, batch_diff
         assert hidden_diff <= tol, hidden_diff
         print(
-            f"[{'OK' if feat_diff <= tol else 'MISMATCH'}] image features: maxdiff={feat_diff}"
+            f"[{'OK' if feat_diff <= tol else 'MISMATCH'}] image features: maxdiff={feat_diff} (B=2: {batch_diff})"
         )
         print(
             f"[{'OK' if hidden_diff <= tol else 'MISMATCH'}] encoder hidden: maxdiff={hidden_diff}"

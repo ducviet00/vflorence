@@ -102,8 +102,12 @@ class Florence2VisionChannelAttention(nn.Module):
         hidden_states = F.scaled_dot_product_attention(
             query, key, value, scale=num_tokens**-0.5
         )
-        hidden_states = hidden_states.permute(0, 3, 1, 2).reshape(
-            batch_size, num_tokens, hidden_size
+        # Explicit contiguous() lets Inductor fuse proj bias and residual add
+        # into mkldnn._linear_pointwise.binary (reshape on permute blocked it).
+        hidden_states = (
+            hidden_states.view(batch_size, hidden_size, num_tokens)
+            .transpose(1, 2)
+            .contiguous()
         )
         return self.proj(hidden_states)
 
