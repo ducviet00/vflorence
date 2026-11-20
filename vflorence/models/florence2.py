@@ -7,6 +7,33 @@ from torch import nn
 from .bart import BartModel
 
 
+def _dwconv_residual(
+    conv: nn.Conv2d, hidden_states: torch.Tensor, center: torch.Tensor
+) -> torch.Tensor:
+    """Fold the identity residual into a 3x3 depthwise conv's center tap.
+
+    oneDNN depthwise conv does not fuse a binary add post-op and falls back to
+    an eager aten::add_ per call; adding a constant center tap folds into the
+    frozen conv weight at Inductor compile time.
+    """
+    assert (
+        conv.kernel_size == (3, 3)
+        and conv.stride == (1, 1)
+        and conv.padding == (1, 1)
+        and conv.dilation == (1, 1)
+        and conv.groups == conv.in_channels == conv.out_channels
+    )
+    return F.conv2d(
+        hidden_states,
+        conv.weight + center,
+        conv.bias,
+        conv.stride,
+        conv.padding,
+        conv.dilation,
+        conv.groups,
+    )
+
+
 class Florence2VisionMLP(nn.Module):
     def __init__(self, config, stage_idx: int):
         super().__init__()
@@ -156,12 +183,15 @@ class Florence2VisionSpatialBlock(nn.Module):
         self.conv2 = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = Florence2VisionMLP(config, stage_idx)
+        center = torch.zeros(1, 1, 3, 3)
+        center[0, 0, 1, 1] = 1.0
+        self.register_buffer("_dw_center", center, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run depthwise conv + local window attention + FFN on spatial features."""
         batch_size, embed_dim, height, width = hidden_states.shape
 
-        hidden_states = self.conv1(hidden_states) + hidden_states
+        hidden_states = _dwconv_residual(self.conv1, hidden_states, self._dw_center)
         residual = hidden_states.flatten(2).transpose(1, 2)
         hidden_states = self.window_attn(
             self.norm1(residual).view(batch_size, height, width, embed_dim)
@@ -172,7 +202,7 @@ class Florence2VisionSpatialBlock(nn.Module):
             .view(batch_size, embed_dim, height, width)
         )
 
-        hidden_states = self.conv2(hidden_states) + hidden_states
+        hidden_states = _dwconv_residual(self.conv2, hidden_states, self._dw_center)
         residual = hidden_states.flatten(2).transpose(1, 2)
         hidden_states = self.ffn(self.norm2(residual))
         return (
@@ -192,12 +222,15 @@ class Florence2VisionChannelBlock(nn.Module):
         self.conv2 = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim)
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = Florence2VisionMLP(config, stage_idx)
+        center = torch.zeros(1, 1, 3, 3)
+        center[0, 0, 1, 1] = 1.0
+        self.register_buffer("_dw_center", center, persistent=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run depthwise conv + grouped channel attention + FFN on spatial features."""
         batch_size, embed_dim, height, width = hidden_states.shape
 
-        hidden_states = self.conv1(hidden_states) + hidden_states
+        hidden_states = _dwconv_residual(self.conv1, hidden_states, self._dw_center)
         residual = hidden_states.flatten(2).transpose(1, 2)
         hidden_states = self.channel_attn(self.norm1(residual))
         hidden_states = (
@@ -206,7 +239,7 @@ class Florence2VisionChannelBlock(nn.Module):
             .view(batch_size, embed_dim, height, width)
         )
 
-        hidden_states = self.conv2(hidden_states) + hidden_states
+        hidden_states = _dwconv_residual(self.conv2, hidden_states, self._dw_center)
         residual = hidden_states.flatten(2).transpose(1, 2)
         hidden_states = self.ffn(self.norm2(residual))
         return (
